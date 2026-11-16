@@ -54,7 +54,12 @@ When you need approval, stop and post: what you want to do, why, what changes, a
 ## 2. Git workflow
 
 - One ticket = one branch = one pull request. Branch from the latest `main`. Name branches `<ticket-key>-<short-topic>` in lowercase, e.g. `sav-11-instagram-webhook`. Tickets live in the Multica workspace "SavedAgent" (ticket keys `SAV-N`), project "SavedAgent: Instagram saved-posts agent".
-- Agent flow in Multica: Jarvis plans and assigns, Developer builds, Reviewer reviews. Developer commits locally, asks the owner to approve the push, pushes only after that approval, then hands the branch to Reviewer. The pull request is opened only after the review passes and the owner approves it, and only the owner merges.
+- **Team loop in Multica** (details in SAV-22 §7 and SAV-24). Jarvis orchestrates, the Developer builds and the Reviewer reviews:
+  1. The Developer commits locally (no push) and hands the exact SHA, the base SHA and its local repo path to the Reviewer.
+  2. The Reviewer reviews that SHA locally and replies APPROVE or CHANGES REQUESTED.
+  3. Jarvis runs the fix and re-review rounds. After APPROVE, Jarvis asks the owner once to approve the push and the pull request.
+  4. Only then the Developer pushes and opens the pull request, and only the owner merges.
+- **Handoffs happen only by mention.** Agents start work when a comment mentions them; a finished run wakes nobody up. Every handoff or stop is a comment that mentions the next agent and Jarvis.
 - **Commit locally as often as you like.** Pushing needs approval (see §1).
 - Commit messages use [Conventional Commits](https://www.conventionalcommits.org/): `feat:`, `fix:`, `refactor:`, `docs:`, `test:`, `chore:`. The first line is ≤ 72 characters and in the imperative mood.
 - Before asking for approval to push, report on the ticket: the branch, head commit SHA, a short summary of changes, the test and lint results, and anything left open.
