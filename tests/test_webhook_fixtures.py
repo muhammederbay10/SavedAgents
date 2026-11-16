@@ -13,12 +13,12 @@ REAL_DM_FIXTURES = sorted(FIXTURE_DIR.glob("instagram_*.json"))
 
 FAKE_BOT_ID = "17840000000000001"
 FAKE_SENDER_ID = "1000000000000001"
-FAKE_MEDIA_ID = re.compile(r"^18000000000000\d{3}$")
+FAKE_MEDIA_ID = re.compile(r"^1800000000000\d{4}$")
 FAKE_MID = re.compile(r"^aWdfZAGFAKEMID\d{4}A*$")
 FAKE_REEL_URL = re.compile(r"^https://www\.instagram\.com/reel/FAKEREEL\d{3}/$")
 FAKE_POST_URL = re.compile(
     r"^https://lookaside\.fbsbx\.com/ig_messaging_cdn/"
-    r"\?asset_id=(18000000000000\d{3})&signature=FAKE_SIGNATURE_\d{3}$"
+    r"\?asset_id=(1800000000000\d{4})&signature=FAKE_SIGNATURE_\d{3}$"
 )
 
 
@@ -56,6 +56,10 @@ def test_fixture_media_links_are_fake(path: Path) -> None:
             if attachment["type"] == "ig_reel":
                 assert FAKE_MEDIA_ID.match(payload["reel_video_id"])
                 assert FAKE_REEL_URL.match(payload["url"])
+            elif attachment["type"] == "unsupported_type":
+                # Reels saved to a collaborative collection: only a CDN link to the video file.
+                assert set(payload) == {"url"}
+                assert FAKE_POST_URL.match(payload["url"])
             else:
                 assert attachment["type"] == "ig_post"
                 link = FAKE_POST_URL.match(payload["url"])
