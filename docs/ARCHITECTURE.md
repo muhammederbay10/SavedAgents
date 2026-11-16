@@ -317,6 +317,7 @@ savedagent/
   app/
     main.py                 # FastAPI app
     config.py
+    logging_config.py       # structured (JSON) logging setup
     adapters/
       base.py
       instagram.py          # webhook parsing → CaptureEvent / ChatMessage
@@ -366,8 +367,13 @@ savedagent/
   extension/                # Phase 2 browser extension
   tests/
     fixtures/webhooks/      # real (anonymized) webhook payloads
+  docker/postgres/          # Postgres 16 image with PostGIS + pgvector
   docker-compose.yml
+  Dockerfile                # API image
+  Makefile                  # fmt, lint, typecheck, test, up
+  pyproject.toml
   docs/ARCHITECTURE.md
+  docs/decisions/           # decision records
 ```
 
 ## 7. Platform reality check
