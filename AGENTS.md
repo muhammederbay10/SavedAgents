@@ -2,9 +2,35 @@
 
 Rules for every AI agent (and human) working on this project. If anything here conflicts with a ticket description, **this file wins**. Ask the project owner if you're unsure.
 
-## Project in one paragraph
+## About the project
 
-**SavedAgent** indexes posts a user saves on Instagram (later TikTok, X, Facebook) and lets them search by chat: places by district or "near me", movies by genre or streaming platform, study material by subject, and more. The full design is in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). **Read it before starting any task**, and treat it as the source of truth.
+### The problem
+People save posts on Instagram all the time: a restaurant to try, a movie to watch, a study tip, a recipe. Instagram lets you sort saves into collections (Food, Movies, Studying), but it doesn't let you search or filter inside them. You can't stand in Beşiktaş and ask "which restaurants did I save around here?", or ask "which of my saved horror movies are on Netflix?". The saves pile up and get forgotten, so saving loses its point.
+
+### What we're building
+**SavedAgent** is a chat agent for the things you save.
+1. You share a post or reel to our Instagram bot by DM, as easily as tapping Save.
+2. SavedAgent works out what the post is about (a place, a movie, a study tip, anything). It looks up the real thing behind it, such as the restaurant on Google Maps or the movie on TMDB, and indexes it once.
+3. Later you ask in plain language, in Turkish or English: "restaurants in Beşiktaş in my Food collection", "horror movies on Netflix I saved", "the maths study videos". It answers from your own saves, with links.
+
+Instagram comes first. TikTok, X and Facebook follow through the same backend.
+
+### Why it's worth building
+- **It solves a real, daily problem.** Collections are where saves go to be forgotten. Being able to filter by place, genre, platform or subject turns them into something useful.
+- **It works for any kind of content**, not just food. Places, movies, study material and other content types are plug-ins in one pipeline.
+- **It understands the video**, not just the caption. Many reels only say the restaurant's name out loud.
+- **It stays on the right side of the platforms.** It uses official APIs only and never asks for a user's password, so it can't get users' accounts banned.
+- **It's cheap to run.** Each post is analyzed once, when it's saved, so answering a question costs almost nothing.
+
+### What it isn't
+- Not a scraper, and not a tool that logs in to anyone's account.
+- Not a general chatbot. It answers questions about the user's own saves.
+- Not a social feature. Nothing a user saves is shown to other users.
+
+### Where things are
+- **Design (the source of truth):** [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). **Read it before starting any task.**
+- **Shared contract for all tickets:** SAV-22 in the Multica workspace "SavedAgent". It holds owner-approved decisions that may be newer than this file.
+- **Owner:** Muhammed. Only he approves pushes, pull requests and merges.
 
 ## 1. Approval gates (never skip these)
 
