@@ -1,0 +1,426 @@
+# Architecture: Saved-Posts Agent
+
+> Working name: **SavedAgent** (placeholder). You save a post (Instagram first, then TikTok, X, Facebook…). The system works out **what it is**: a restaurant, a movie, a study tip, a recipe, anything. Then you can ask things like *"what restaurants did I save in Beşiktaş?"*, *"horror movies from my Movies collection that are on Netflix"* or *"the spaced-repetition tips I saved for studying"*.
+
+## 1. Principles
+
+1. **Capture where the user already is.** Sharing a post to the bot should take one tap, the same as tapping Save.
+2. **Official integrations only on the server.** We never store a user's social-media password or log in as them. Grey-area import tools run on the user's own device, are opt-in, and are never required.
+3. **One brain, many adapters.** Each platform is a small adapter that turns its input into a common `CaptureEvent`. Everything after that doesn't depend on the platform.
+4. **Any kind of content.** Places, movies, study material, recipes, products… are **content types** in a registry (§3.4). Adding a new type means adding a schema and, optionally, a resolver. The pipeline doesn't change.
+5. **Analyze once, search many times.** Videos are understood when they're saved, never when the user asks a question.
+6. **Ask when unsure.** If we can't confidently identify something, the bot asks ("Is this *Kronotrop Bebek* or *Kronotrop Karaköy*?", "*Dune* (2021) or *Dune: Part Two*?") instead of guessing.
+
+## 2. System overview
+
+```mermaid
+flowchart LR
+  subgraph Capture["Capture adapters"]
+    IG["Instagram DM bot<br/>(Messaging API webhook)"]
+    SE["Mobile share extension<br/>(phase 3)"]
+    BX["Browser extension import<br/>(phase 2, optional)"]
+    XT["X Bookmarks / TikTok<br/>Data Portability (later)"]
+  end
+
+  subgraph Core["Backend (FastAPI)"]
+    ING["Ingestion API<br/>verify + normalize"]
+    Q[("Job queue")]
+    W["Indexing workers<br/>(parallel fan-out)"]
+    AG["Response agent<br/>(DeepSeek + tools)"]
+    DL["Deep-look subagents<br/>(parallel, on demand)"]
+    MEM["Memory service<br/>(short + long term)"]
+  end
+
+  subgraph Data["Storage"]
+    PG[("Postgres<br/>+ PostGIS + pgvector")]
+    OBJ[("Object storage<br/>videos / thumbnails")]
+    RD[("Redis<br/>queue + session state")]
+  end
+
+  subgraph Ext["Models & external services"]
+    DEC["Gemini Decision 1<br/>(typed decisions, multimodal)"]
+    STT["Speech-to-text"]
+    TXT["Text model<br/>(DeepSeek V4.1 Flash)"]
+    MM["Multimodal model<br/>(rare escalation)"]
+    EMB["Embedding model"]
+    RES["Resolvers<br/>Google Places · TMDB · Open Library"]
+  end
+
+  IG & SE & BX & XT --> ING --> Q --> W
+  W --> DEC & STT & TXT & MM & EMB & RES
+  W --> PG & OBJ
+  IG <-->|"chat messages"| AG
+  AG -->|"tools: SQL + vector search"| PG
+  AG <--> MEM
+  MEM --> PG & RD
+  AG --> DL
+  DL --> DEC
+  DL -->|"write back findings"| PG
+```
+
+## 3. Components
+
+### 3.1 Capture adapters
+Every adapter outputs the same object:
+
+```python
+class CaptureEvent(BaseModel):
+    user_id: UUID              # our user
+    platform: Literal["instagram", "tiktok", "x", "facebook", "youtube"]
+    source: Literal["dm", "share_ext", "browser_import", "api"]
+    post_url: str
+    platform_post_id: str | None
+    caption: str | None        # if the platform sends it
+    media_url: str | None      # video or image URL if provided
+    media_type: Literal["reel", "post", "carousel", "video", "tweet"] | None
+    collection_hint: str | None  # e.g. "Movies", from an import or the user's message
+    received_at: datetime
+```
+
+**Instagram DM bot (Phase 1).** The user shares a post or reel by DM to our Instagram professional account (`@savedagent`). Meta then sends a `messages` webhook:
+- Reels arrive as an `ig_reel` attachment with `title` (the caption), `url` and `video_id`.
+- Posts arrive as `ig_post`. Meta is replacing the old `share` type during 2026, so the adapter should accept both.
+- Plain text messages ("what's in Beşiktaş?") are routed to the **Response agent**, not the indexing pipeline. A text sent right after a share (e.g. "for my Movies collection") is attached as the `collection_hint`.
+- Replies use the Send API. Instagram only allows replies within **24 hours** of the user's last message. That's fine for chat, but it means the bot **cannot send proactive alerts**, which need the mobile app (Phase 3).
+
+**Browser extension import (Phase 2, optional).** Adds a "Sync my saved" button on `instagram.com/<me>/saved`. It reads collections (with their names: Food, Movies, Studying…) and post links from the page in the user's own logged-in session, at human speed, and sends them to `/import`. This is a grey area under Instagram's Terms, so it's opt-in and runs only on the user's device.
+
+**Mobile share extension (Phase 3).** The iOS/Android share sheet works the same way from Instagram, TikTok, X and YouTube. It's our universal connector across platforms.
+
+### 3.2 Ingestion API
+- `GET /webhooks/instagram`: Meta's verification handshake (`hub.mode`, `hub.verify_token`, `hub.challenge`).
+- `POST /webhooks/instagram`: verify the `X-Hub-Signature-256` HMAC, check for duplicates by message id, map to a `CaptureEvent` or a chat message, **enqueue, and return 200 immediately**. Meta retries slow webhooks.
+- `POST /import`: batch endpoint for the browser extension and data-export uploads.
+- Upsert by `(user_id, platform, platform_post_id)`, so sharing the same post twice doesn't create a duplicate.
+
+### 3.3 Indexing pipeline (heavy work, runs once per saved item)
+
+**Rule: videos are analyzed once, when they're saved or imported, never when the user asks a question.** Questions are then answered from the index in milliseconds, at almost no cost, with the same answer every time.
+
+**Parallel fan-out.** A single share is processed as soon as it arrives. A bulk import (e.g. a 500-reel collection) is split into batches across N parallel workers (e.g. 10 × 50). The provider's rate limits set the maximum speed. The bot sends progress updates ("Imported 230/500… 61 places, 40 movies, 25 study posts so far").
+
+```mermaid
+flowchart TD
+  A[CaptureEvent] --> B[1. Fetch<br/>caption, location tag, media URL<br/>→ download thumbnail + video now, links expire]
+  B --> C[2. Classify + route — Gemini Decision 1 on the video, one pass<br/>choice: content type — place · movie/series · book · study · recipe · product · workout · other<br/>choice: subtype + tags for that type<br/>yes/no: has speech? · is it a list of several things?]
+  C --> T[3. Speech-to-text<br/>only if has speech]
+  T --> X[4. Extract — text model with the type's schema<br/>caption + location tag + transcript<br/>→ entity candidates · type fields · summary]
+  X --> X2{Type needs an entity<br/>and none was found?}
+  X2 -- "yes (e.g. silent reel)" --> V[Escalate: multimodal generative model<br/>watches the video itself]
+  V --> F
+  X2 -- no --> F[5. Resolve — the type's resolver<br/>place → Google Places · movie → TMDB · book → Open Library<br/>study / recipe / other → no resolver]
+  F --> G[Gemini Decision 1 choice:<br/>video + resolver candidates → which one? + confidence]
+  G --> G2{Confident?}
+  G2 -- yes --> I[6. Store entity/entities + link to saved item]
+  G2 -- no --> J[Ask user in DM<br/>with top 2–3 options]
+  J --> I
+  I --> K[7. Embed summary + transcript<br/>+ confirmation DM:<br/>'Saved: Inception 2010 · Sci-fi · on Netflix 🎬']
+```
+
+Notes:
+- **Why two model types.** Gemini Decision 1 only gives typed answers (yes/no, choice, score, with calibrated probabilities). It can't write text or pull an open-ended name like "Kronotrop" or "Inception" out of a video. Because it **takes video directly**, though, it makes the fixed decisions while looking at the video (steps 2 and 5).
+- **Video → text first, then a cheap text model.** We turn speech into text and let a cheap text model (DeepSeek V4.1 Flash) do the extraction. The video model is only an escalation, for posts where the caption and speech weren't enough.
+- **No OCR.** Silent reels whose only information is a text overlay go to the video-model escalation. We track the escalation rate. If it's high for some types (common for food reels), revisit this.
+- **One pass, many questions.** Each decision call sends the video once with all its questions. Google says it handles up to 1,000 questions per pass.
+- **List posts.** "5 movies to watch this weekend" or "3 cafés in Kadıköy" is one post with **several entities**. The extractor returns a list, and each entity is resolved and linked to the same saved item.
+- **The user's collection is a hint, not the type.** A "Food" collection can hold a restaurant and a recipe. The collection name is stored and used as a search filter and as a hint during classification, but the type is decided per post.
+- **Cost control.** If the caption (or the location tag, for places) already identifies the entity, skip speech-to-text.
+
+### 3.4 Content-type registry
+Each type is a small plug-in: an extraction schema, the decision questions to ask, an optional resolver, and the filters it offers to search.
+
+| Type | Extracted by the text model | Resolver → enriched fields | Search filters |
+|---|---|---|---|
+| **place** (restaurant, café, bar, shop, attraction) | venue name(s), area hints, cuisine | Google Places → district (*ilçe*), neighbourhood (*mahalle*), coordinates, hours, price, rating | district, near me, open now, cuisine, price |
+| **movie / series** | title(s), year hints | TMDB → year, genres, runtime, rating, **where to stream in Turkey** (TMDB watch providers) | genre, year, streaming platform, watched / not watched |
+| **book** | title(s), author | Open Library / Google Books → author, genre, pages | genre, author, read / not read |
+| **study** (tips, tutorials, explanations, courses) | subject, topic, key points, resources mentioned | none | subject (maths, English, programming…), topic, format (tip, tutorial, explainer), exam (YKS, YDS, IELTS…) |
+| **recipe** | dish, main ingredients, time, diet | none | ingredient, cuisine, time, diet |
+| **product** | product, brand, price mentioned | none (later: shopping links) | category, brand, price |
+| **workout** | exercise, muscle group, equipment | none | muscle group, equipment, duration |
+| **other** | summary + tags | none | tags, plus meaning search |
+
+**Phase 1 types:** place, movie/series, study and other (matching your Food, Movies and Studying collections). The rest are added later as config, without changing the pipeline.
+
+### 3.5 Answering questions (light work, every message)
+
+The **response agent** (DeepSeek V4.1 Flash) never searches by itself and never watches videos. It understands the message, calls tools, and writes the reply. The tools do the searching. Subagents only run for the rare questions the index can't answer.
+
+```mermaid
+flowchart TD
+  U["User: 'horror movies in my<br/>Movies collection on netflx'"] --> M[Memory: load short-term context<br/>+ relevant long-term memories]
+  M --> R[Response agent — DeepSeek<br/>picks tool + arguments]
+  R --> N[Normalize args — Gemini Decision choice<br/>against the type's known values<br/>'netflx' → Netflix · 'beşilktaş' → Beşiktaş]
+  N --> S[Hybrid retrieval<br/>SQL/PostGIS filters + vector similarity]
+  S --> Q{Can stored fields<br/>answer it?}
+  Q -- "yes (most questions)" --> W[Response agent writes reply<br/>user's language, with links]
+  Q -- "no: 'which ones had<br/>a twist ending?'" --> D[Deep look — parallel subagents<br/>on the retrieved candidates only, ≤ ~30]
+  D --> D1[Gemini Decision 1 yes/no per candidate<br/>on the stored video itself, in parallel]
+  D1 --> WB[Write findings back to<br/>saved_item.attributes → next time is free]
+  WB --> W
+  W --> ME[Memory: update session state<br/>+ async long-term extraction]
+```
+
+**Hybrid retrieval (this is our RAG):**
+- **Structured filters** for hard facts: collection, type, and the type's filters (district, genre, streaming platform, subject…), plus distance (`ST_DWithin`) for places. Exact, fast and free.
+- **Vector search** for fuzzy requests: "cozy date-night place", "that mind-bending sci-fi movie", "the video explaining recursion simply". These match the embeddings of what was said and summarized in each post.
+- The two are combined: filter first, then rank by similarity. Long-term memories also affect ranking (§3.7).
+
+**Tools available to the response agent:**
+
+| Tool | What it does |
+|---|---|
+| `search_items(collection?, type?, filters?, text?, platform?, saved_after?)` | Hybrid search. `filters` is checked against the type's schema (e.g. `{"district": "Beşiktaş"}`, `{"genre": "horror", "streaming": "Netflix"}`, `{"subject": "maths"}`) |
+| `near(lat, lng, radius_m, subtype?, open_now?)` | PostGIS search around a point (places only) |
+| `deep_look(item_ids, question)` | Fans out parallel subagents (see diagram) for questions the index can't answer |
+| `get_item(id)` | Full details: entity info, original post link, why we matched it |
+| `update_item(id, fields)` | Fix mistakes ("no, it's the Bebek branch"), add notes |
+| `set_status(entity_id, status)` | Mark as visited / watched / read / done, or "want to" |
+| `resolve_choice(item_id, option)` | Handles the user's answer to a "which one?" question |
+| `list_memories()` / `forget_memory(id)` | "What do you remember about me?" / "Forget that" (§3.7) |
+
+Location for places in Phase 1: the user can type an area ("I'm in Beşiktaş") or share their location in the DM. Real "near me" alerts come with the mobile app.
+
+### 3.6 Search fallback ladder
+Normal search should answer almost everything. The fallback covers two different situations:
+- **Error:** part of search is broken (vector index down, database timeout, embedding API error).
+- **Empty or suspicious result:** search worked but found nothing, or the user says "that's not all of them".
+
+"Nothing found" is often the **true** answer (you never saved a restaurant in that district), so we climb the ladder one step at a time instead of jumping to the expensive levels. We stop at the first level that answers.
+
+| Level | When | What happens | Cost / speed |
+|---|---|---|---|
+| **L0 Normal** | Always first | Hybrid retrieval: SQL/PostGIS filters + vector ranking | Free, ~1 s |
+| **L1 Degraded retrieval** | Vector search or embeddings fail | SQL filters + Postgres full-text keyword search on caption, summary and transcript | Free, ~1 s |
+| **L2 Relax and catch up** | 0 or very few results | Loosen filters (neighbouring districts, related genres or subjects, drop secondary filters). Also include items **not fully indexed yet** (`pending`, `failed`, `needs_user`) | Free, ~1 s |
+| **L3 Decision scan over text** | Still nothing, or the database is unreachable | **Gemini Decision 1 does the search temporarily:** it checks each item's stored text against the question ("is this a horror movie?") in batched, parallel calls | Cents, a few seconds |
+| **L4 Decision scan over video** (last resort) | Items with no usable text (indexing failed) | Gemini Decision 1 on the stored videos themselves, **capped** (e.g. the 50 most recent), in parallel | Most expensive, ~5–10 s |
+
+Rules:
+- **Time budget:** about 10 s in total. Answer with what we have, and tell the user when results may be incomplete ("Search is in backup mode right now, so this list may be missing some items").
+- **Self-healing:** anything found at L2–L4 is queued for re-indexing, so the next search finds it at L0.
+- **Works without the database:** a per-user snapshot (JSON of each item's id, text fields and entity info) is kept in object storage and updated on every change. L3 can use it even if Postgres is down.
+- **Don't let it hide bugs:** every fallback is logged with its level and reason, and we get an alert if L1+ happens often.
+
+### 3.7 Memory
+The agent has three kinds of memory:
+
+| Layer | What it holds | Where | Lifetime |
+|---|---|---|---|
+| **Content memory** | Everything the user saved, indexed (§3.3) | Postgres | Permanent |
+| **Short-term memory** | The conversation so far + the **working set** | Redis | ~24 h (matches Instagram's reply window) |
+| **Long-term memory (LTM)** | Facts and preferences about the user | Postgres (`MEMORY` table + embeddings) | Until changed or deleted |
+
+**Short-term memory** makes follow-ups work:
+- The last ~20 messages go into the response agent's context.
+- The **working set** is the last result list with numbers and the filters that produced it. That lets "the second one", "show more", "only the cheap ones" or "which of those are on Netflix?" refine the previous search instead of starting over.
+
+**Long-term memory: extract → gate → consolidate → retrieve** (Mem0-style). This runs **asynchronously after each reply**, so it never slows the chat.
+
+```mermaid
+flowchart TD
+  A[Latest exchange<br/>+ user actions: marked watched / visited] --> B[1. Extract — text model<br/>candidate facts:<br/>'is vegetarian' · 'lives in Beşiktaş'<br/>'preparing for YDS' · 'already watched Interstellar']
+  B --> C[2. Gate — Gemini Decision 1 yes/no<br/>durable fact or preference?<br/>'I'm hungry now' → no]
+  C -- yes --> D[3. Find similar memories<br/>vector search, top 5]
+  D --> E[4. Consolidate — Gemini Decision 1 choice<br/>ADD · UPDATE existing · REPLACE contradicted · IGNORE duplicate]
+  E --> F[(MEMORY table<br/>old versions kept via superseded_by)]
+  F --> G[5. Retrieve on every turn<br/>always-on profile ≈10 facts<br/>+ top-k memories similar to the message<br/>score = similarity × recency × confidence]
+```
+
+How memory is used:
+- **Ranking and filtering:** a vegetarian user gets vegetarian places boosted, movies already watched are hidden or moved down, and "for my exam" means YDS.
+- **Fewer questions:** "near home" resolves to the stored home district.
+- **User control:** `list_memories` and `forget_memory` from chat, and everything is deleted with "delete my data". Sensitive categories (health, religion, etc.) are never stored. The gate rejects them.
+
+### 3.8 Notifications (Phase 3)
+- **Places:** the mobile app uses a geofence. Entering an area with N saved places that are open now triggers a push notification.
+- **Movies/series:** "A movie you saved is now on Netflix" (TMDB watch-provider changes).
+- Users can set rate limits and quiet hours.
+
+### 3.9 Model roles
+Every model sits behind a small provider interface (`generator.generate`, `classifier.decide`, `transcriber.transcribe`, `embedder.embed`). Each role is set in config, so models can be swapped and compared on our own labeled saves.
+
+| Role | Model | Why | Watch out for |
+|---|---|---|---|
+| **Fixed decisions:** content type, subtype/tags, has-speech, is-list, which resolver candidate, filter normalization, deep-look yes/no, memory gate + consolidation | **Gemini Decision 1** (Google, `gemini-decision-1`, launched 11 Nov 2026) | Takes **text, images, audio, video and PDFs directly**. Typed outputs with calibrated probabilities, up to 1,000 questions per pass, ~50–100 ms model time (Google's figures), $0.10/M input tokens, output free | Brand new, and all benchmarks are Google's own. Video is still token-heavy, so cost scales with video length. Do counting, maths and dates in code |
+| **Speech-to-text** (posts with speech only) | Whisper-class model (e.g. faster-whisper large-v3 self-hosted, or a hosted STT API) | Many reels say the name out loud. Good Turkish support | Background music lowers accuracy. Keep word timestamps for debugging |
+| **Open-ended extraction** (entity names, type fields, summary) and **memory extraction** | DeepSeek V4.1 Flash (same provider as the response agent) | Names and summaries aren't fixed choices, so a decision model can't produce them. Text in, so it's cheap | Only as good as the caption + transcript it receives |
+| **Escalation:** watch the video when the text gave no entity | A multimodal generative model with native video + audio (e.g. Gemini Flash class) | Catches what the caption and speech missed (silent reels with text overlays, recognisable storefronts or movie scenes) | Most expensive per call. Track the escalation rate per type |
+| **Response agent** (understands the message, calls tools, writes the reply) | **DeepSeek V4.1 Flash** | Cheap, fast, good enough for tool calling + short replies | Check tool-call reliability and Turkish quality on our own tests. The first-party API is hosted in China, so consider another host for user data |
+| **Embeddings** | A multilingual embedding model | Turkish + English queries over Turkish captions | Re-embed everything if we switch models |
+
+> **Fallback:** TypeSafe's **Jev** offers the same three question types and is cheaper ($0.042/M input), but its public docs describe text/structured input only. It's a good backup for text-only decisions (e.g. filter normalization, memory gate) behind the same `Classifier` interface.
+
+**Evaluation set:** label ~100 of your real saves across your collections (type, entity, key fields) in Phase 1. Every model or prompt change is scored against it before switching.
+
+## 4. Data model
+
+```mermaid
+erDiagram
+  USER ||--o{ PLATFORM_ACCOUNT : links
+  USER ||--o{ SAVED_ITEM : owns
+  SAVED_ITEM ||--o{ ITEM_ENTITY : mentions
+  ENTITY ||--o{ ITEM_ENTITY : "mentioned in"
+  USER ||--o{ USER_ENTITY : "status per entity"
+  ENTITY ||--o{ USER_ENTITY : ""
+  SAVED_ITEM ||--o{ ENRICHMENT_RUN : "processed by"
+  USER ||--o{ MEMORY : "long-term memory"
+  USER ||--o{ CONVERSATION_MSG : has
+
+  USER { uuid id  text display_name  text home_city  text language  timestamptz created_at }
+  PLATFORM_ACCOUNT { uuid id  uuid user_id  text platform  text platform_user_id  text username }
+  SAVED_ITEM {
+    uuid id  uuid user_id  text platform  text platform_post_id  text post_url
+    text media_type  text caption  text transcript  text summary
+    text type  text subtype  text[] tags  text collection  jsonb fields  jsonb attributes
+    text status  vector embedding  timestamptz saved_at
+  }
+  ENTITY {
+    uuid id  text type  text source  text external_id  text name  jsonb data
+    geography location  text district  text city  timestamptz refreshed_at
+  }
+  ITEM_ENTITY { uuid saved_item_id  uuid entity_id  int position  float confidence }
+  USER_ENTITY { uuid user_id  uuid entity_id  text status  text note  int rating }
+  ENRICHMENT_RUN { uuid id  uuid saved_item_id  text step  text status  jsonb output  text error }
+  MEMORY {
+    uuid id  uuid user_id  text kind  text content  vector embedding  float confidence
+    uuid source_msg_id  uuid superseded_by  timestamptz created_at  timestamptz updated_at
+  }
+  CONVERSATION_MSG { uuid id  uuid user_id  text role  text content  timestamptz at }
+```
+
+- **`ENTITY`** is the real-world thing: a restaurant, a movie, a book. It's shared across all users, one record per `(source, external_id)`, e.g. `(google_places, ChIJ…)` or `(tmdb, 27205)`. Types without a resolver (study, recipe…) have no entity, and their info lives in `SAVED_ITEM.fields`.
+- `location`, `district` and `city` are only filled for places (PostGIS GIST index). Type-specific data goes in `data` (GIN index), e.g. genres and streaming providers for movies.
+- **`ITEM_ENTITY`** is many-to-many, because one list post can mention several entities.
+- **`USER_ENTITY.status`**: `want | done` (visited / watched / read), per user. Memory and ranking use it.
+- `SAVED_ITEM.fields` holds the extracted type fields (e.g. `{"subject": "maths", "topic": "integrals", "format": "tutorial"}`). `attributes` holds facts learned later by deep look.
+- `SAVED_ITEM.status` goes `pending → enriching → needs_user → done | failed`.
+- Opening hours, ratings and streaming availability go out of date, so refresh `ENTITY.data` regularly (e.g. every 30 days), and also when the user asks for `open_now` or a platform.
+
+## 5. Tech stack
+
+| Layer | Choice | Why |
+|---|---|---|
+| API | Python 3.12 + FastAPI | Async, good for webhooks, easy validation with Pydantic |
+| Queue / workers | `arq` on Redis | Simple, async, retries built in. Redis also holds short-term memory |
+| DB | Postgres 16 + PostGIS + pgvector | One database for location queries, JSON filters and semantic search |
+| Models | Gemini Decision 1 for decisions, faster-whisper for speech, DeepSeek V4.1 Flash for extraction + replies, multimodal model for rare escalations, multilingual embeddings | See §3.9 |
+| Media | ffmpeg (downscale stored videos, thumbnails, audio extraction) | Standard tool |
+| Resolvers | Google Places API (New) · TMDB API · Open Library / Google Books | Best coverage in each area. TMDB includes streaming availability for Turkey |
+| Hosting | Fly.io / Railway / Render to start | Public HTTPS URL for Meta's webhooks, and cheap |
+| Local dev | Docker Compose + ngrok/cloudflared tunnel | Meta needs a public HTTPS webhook URL |
+
+## 6. Repository layout
+
+```
+savedagent/
+  app/
+    main.py                 # FastAPI app
+    config.py
+    adapters/
+      base.py
+      instagram.py          # webhook parsing → CaptureEvent / ChatMessage
+    api/
+      webhooks.py
+      imports.py
+    models/
+      base.py               # Generator / Classifier / Transcriber / Embedder interfaces
+      decision.py           # Gemini Decision 1 client
+      transcriber.py        # speech-to-text provider
+      deepseek.py           # text model: extraction + response agent
+      multimodal.py         # video model for escalations
+      embeddings.py
+    types/                  # content-type registry — one module per type
+      registry.py
+      place.py              # schema, decision questions, filters, resolver
+      movie.py
+      study.py
+      other.py
+    resolvers/
+      google_places.py
+      tmdb.py
+      open_library.py
+    pipeline/
+      fetch.py              # download media before links expire
+      classify.py           # decision model on the video: type, tags, has-speech, is-list
+      transcribe.py         # speech-to-text (only if has speech)
+      extract.py            # text model with the type's schema; escalates to video model
+      resolve.py            # type's resolver + decision-model candidate choice
+      embed.py
+      worker.py             # parallel fan-out for bulk imports
+    agent/
+      agent.py              # response-agent loop
+      tools.py              # search_items, near, deep_look, set_status…
+      retrieval.py          # hybrid SQL + vector search
+      deep_look.py          # parallel subagents + write-back
+      fallback.py           # L1–L4 fallback ladder, time budget, logging
+      messenger.py          # send DM replies
+    memory/
+      session.py            # short-term: history + working set (Redis)
+      longterm.py           # extract → gate → consolidate → retrieve
+    db/
+      models.py
+      migrations/
+  evals/
+    labeled_saves.jsonl     # ~100 hand-labeled saves for model comparison
+  extension/                # Phase 2 browser extension
+  tests/
+    fixtures/webhooks/      # real (anonymized) webhook payloads
+  docker-compose.yml
+  docs/ARCHITECTURE.md
+```
+
+## 7. Platform reality check
+
+| Platform | Official access to *saves*? | Our capture path |
+|---|---|---|
+| Instagram | ❌ No API for saved posts or collections | DM bot (official) → browser-extension import (optional) → share extension |
+| Facebook | ❌ | Messenger bot, share extension |
+| TikTok | ❌ In general. The Data Portability API may include favorites but needs approval and may be region-limited | Share extension. Check whether the portability API covers Turkey |
+| X | ✅ Bookmarks API (paid tier) | OAuth + periodic sync |
+| YouTube | Partial (playlists via the Data API) | Share extension or playlist sync |
+
+### Spike: collaborative collections
+Instagram supports **collaborative collections**: you create a new collection, switch on *Collaborative*, and add a person or group chat from your DMs. Collaborators can't be added to an existing collection. So the bot account *could* be a collaborator, but:
+- No official API exposes collections or sends events when something is saved to one, so the bot would be "in" the collection with no official way to read it.
+- Reading it would mean logging into the bot account unofficially. At scale (one bot account in thousands of collections) that account would be banned quickly.
+
+**Worth a one-hour test:** a collaborative collection is attached to a DM thread. Save a post to a collection shared with `@savedagent` and check whether a `messages` webhook fires. If it does, that's an official, zero-extra-effort capture path ("just save to your collection shared with the bot"). If not, we use DM sharing.
+
+## 8. Roadmap
+
+**Phase 0: setup and test (days)**
+- Meta developer app, Instagram professional account for the bot, webhook pointed at a tunnel.
+- Record real `ig_reel` / `ig_post` payloads as test fixtures.
+- Run the collaborative-collection test.
+
+**Phase 1: Instagram DM MVP (1–2 weeks)**
+- Ingestion → indexing pipeline (decision model on the video → speech-to-text → text-model extraction → resolver) → confirmation DM.
+- Content types: **place, movie/series, study, other**, with Google Places and TMDB resolvers.
+- Response agent (DeepSeek) with `search_items`, `near`, `set_status`, hybrid SQL + vector retrieval, and fallback levels L1–L2.
+- Short-term memory (history + working set) and a basic always-on profile (home district, language).
+- "Which one?" follow-up when we're not sure.
+- Label ~100 real saves as the evaluation set.
+- Runs in development mode, for your own account and testers.
+
+**Phase 2: old saves, deep look, full memory**
+- Browser-extension import and data-export ZIP import, using parallel fan-out indexing.
+- `deep_look` tool with write-back.
+- Full long-term memory (extract → gate → consolidate → retrieve), plus `list_memories` / `forget_memory`.
+- Fallback levels L3–L4 and the per-user snapshot.
+- More types: book, recipe, product, workout.
+- Simple web app: map of places, movie watchlist, study library.
+
+**Phase 3: mobile and more platforms**
+- iOS/Android app: share extension (TikTok, X, YouTube), geofence and "now streaming" notifications.
+- Meta app review, so other users can use the Instagram bot.
+
+## 9. Risks and open questions
+- **Meta app review** for `instagram_business_manage_messages` is needed before the public can use the bot. Plan screenshots and a privacy policy early.
+- **Webhook payload changes:** `share` → `ig_post` is happening during 2026. Keep the adapter tolerant of both and keep a set of recorded test payloads.
+- **Media URL lifetime:** CDN links in payloads may expire. Download right away and keep a downscaled copy (e.g. 360p) so deep look can re-watch it. Deleted together with the user's data.
+- **No OCR:** silent reels with only text overlays must go to the video model. If the escalation rate is high, cost per item rises. Measure it in Phase 1.
+- **Privacy:** store only what we need, never store sensitive categories in memory, and support "delete my data" from day one.
+- **Cost per saved item:** aim for under about $0.01. Video-model escalations are the main cost risk.
+- **Decision models are very new** (Gemini Decision 1 launched 11 Nov 2026; Jev in Sept 2026), and their numbers are vendor-reported. Use the probabilities with thresholds, measure them on our eval set, and keep a fallback classifier behind the same interface.
+- **Model churn:** every model role is swappable through config. Never hard-code a provider in the pipeline or agent code.
