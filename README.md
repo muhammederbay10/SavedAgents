@@ -6,7 +6,7 @@ SavedAgent indexes posts you save on Instagram (later TikTok, X and Facebook) an
 - Rules for contributors and agents: [`AGENTS.md`](AGENTS.md)
 - Decision records: [`docs/decisions/`](docs/decisions/)
 
-This repository currently holds the project skeleton: a FastAPI app with a health endpoint, a local Docker stack and the development tooling.
+This repository currently holds the project skeleton (a FastAPI app with a health endpoint, a local Docker stack and the development tooling) and the content-type registry.
 
 ## Requirements
 
@@ -121,6 +121,49 @@ What the logging setup does for you:
 - There is no access log. Uvicorn's access records hold the client's address and the full query string, so they are switched off. To see a request in the logs, log it from the application code, without personal data.
 - The API is started with `--ws none`. It has no WebSocket endpoints, and uvicorn would otherwise log the address and query string of every WebSocket handshake.
 
+## Content types
+
+A content type is what a saved post is about. Each type is one module in `app/types/` that declares a `ContentType`, and [`app/types/registry.py`](app/types/registry.py) lists them. The rest of the code asks the registry and reads the declaration. It never checks for a type by name, and a test (`tests/test_content_type_registry.py`) fails if it does.
+
+| Type | Subtypes | Resolver | Search filters |
+|---|---|---|---|
+| `place` | restaurant, cafe, bar, shop, attraction | `google_places` | `district`, `near`, `open_now`, `cuisine`, `price` |
+| `movie` (also series) | movie, series | `tmdb` | `genre`, `year`, `streaming`, `watched` |
+| `study` | tip, tutorial, explainer, course | none | `subject`, `topic`, `format`, `exam` |
+| `other` | none | none | `tags` |
+
+```python
+from app.types.registry import CONTENT_TYPES
+
+place = CONTENT_TYPES.get("place")
+place.extraction_schema.model_validate(text_model_output)   # raises on bad output
+[search_filter.name for search_filter in place.search_filters]
+```
+
+A declaration has these parts (all defined in [`app/types/base.py`](app/types/base.py)):
+
+| Part | What it is |
+|---|---|
+| `name`, `description` | The name stored on a saved item, and the text the decision model sees when it picks a post's type |
+| `extraction_schema` | The Pydantic model the text model fills in. Unknown keys and values outside a closed list are rejected |
+| `subtype_question`, `tag_questions` | The choice question and the yes/no questions the decision model answers |
+| `resolver` | The name of the resolver in `app/resolvers/` that looks up the type's entities, or `None` |
+| `search_filters` | The filters the type offers to search. A `choice` filter lists its allowed values |
+
+### How to add a new type
+
+Example: a `recipe` type.
+
+1. **Create `app/types/recipe.py`.** Copy `study.py` for a type without a resolver, or `movie.py` for one with a resolver.
+2. **Write the extraction schema.** Extend `Extraction` (it already has `summary`) and give every field a `description`, because the text model reads it. If a post points at real-world things that a resolver looks up, extend `EntityExtraction` instead and put them in `entities`, with a mention class that extends `EntityMention`.
+3. **Put closed lists in a `StrEnum`** (diets, cuisines…) and use the enum as the field's type. Pass the same enum to the filter with `values_of(...)`, so the schema and the filter can't drift apart.
+4. **Declare the `ContentType`:** the name, a one-line description, the subtype question, the tag questions, the resolver name (or `None`) and the search filters.
+5. **Register it:** add it to `CONTENT_TYPES` in `app/types/registry.py`. This is the only existing file you change.
+6. **Test it:** add a good example and bad examples to `tests/test_content_type_schemas.py`, and the expected subtypes, resolver and filters to `tests/test_content_type_registry.py`.
+7. **Update the docs:** the table above and `docs/ARCHITECTURE.md` §3.4.
+
+A declaration that can't work fails when the module is imported, with a `ContentTypeDefinitionError`: a repeated tag, filter or type name, a `choice` filter without allowed values, or a resolver on a type whose schema has no `entities`.
+
 ## Project layout
 
 ```
@@ -128,6 +171,7 @@ app/
   main.py             # FastAPI app factory and GET /health
   config.py           # settings from environment variables
   logging_config.py   # JSON logging setup
+  types/              # content-type registry: one module per type
 tests/                # pytest suite
 docker/postgres/      # Postgres 16 image with PostGIS and pgvector
 docker-compose.yml    # local stack: db, redis, api
