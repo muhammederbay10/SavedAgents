@@ -1,0 +1,31 @@
+{
+  "object": "instagram",
+  "entry": [
+    {
+      "time": 1768481207458,
+      "id": "17840000000000001",
+      "messaging": [
+        {
+          "sender": {
+            "id": "1000000000000001"
+          },
+          "recipient": {
+            "id": "17840000000000001"
+          },
+          "timestamp": 1768481205372,
+          "message": {
+            "mid": "aWdfZAGFAKEMID0008AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "attachments": [
+              {
+                "type": "unsupported_type",
+                "payload": {
+                  "url": "https://lookaside.fbsbx.com/ig_messaging_cdn/?asset_id=18000000000000801&signature=FAKE_SIGNATURE_008"
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}
