@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "savedagent"
+version = "0.1.0"
+description = "Indexes posts saved on social platforms and lets users search them by chat."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastapi>=0.163",
+    "pydantic>=2.14",
+    "pydantic-settings>=2.16",
+    "uvicorn[standard]>=0.54",
+]
+
+[project.optional-dependencies]
+dev = [
+    "httpx>=0.28",
+    "mypy>=2.4",
+    "pytest>=9.2",
+    "pytest-asyncio>=1.5",
+    "ruff>=0.17",
+]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+# Ruff also formats Python code blocks in Markdown. Docs keep their hand-aligned examples.
+extend-exclude = ["*.md"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # import order
+    "N",   # naming
+    "UP",  # modern syntax
+    "B",   # likely bugs
+    "D",   # docstrings
+    "ANN", # type hints
+    "ASYNC", # blocking calls in async code
+    "BLE", # blind except
+    "T20", # print statements
+    "ERA", # commented-out code
+    "SIM", # simplifications
+    "RUF", # ruff-specific rules
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+# Test names describe behaviour, so tests do not need docstrings.
+"tests/**" = ["D"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["pydantic.mypy"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "--strict-markers --strict-config"

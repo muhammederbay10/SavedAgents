@@ -1,0 +1,12 @@
+# Keep secrets, local state and everything the image does not need out of the build context.
+.env
+.git
+.venv
+__pycache__
+*.egg-info
+.mypy_cache
+.pytest_cache
+.ruff_cache
+docs
+tests
+docker
