@@ -4,7 +4,8 @@ Usage:
     logger = logging.getLogger(__name__)
     logger.info("item_indexed", extra={"item_id": str(item.id), "step": "extract"})
 
-Never log secrets, tokens, raw webhook bodies or personal data.
+Never log secrets, tokens, raw webhook bodies or personal data. Uvicorn's access
+log is switched off for that reason: it holds client addresses and query strings.
 """
 
 import json
@@ -19,9 +20,14 @@ from app.config import LogLevel
 # `message` and `asctime` are only set while a record is being formatted.
 _STANDARD_RECORD_ATTRIBUTES = frozenset({*logging.makeLogRecord({}).__dict__, "message", "asctime"})
 
-# Uvicorn installs its own plain-text handlers on these loggers. They are routed
-# through the root logger instead, so server logs are JSON too.
-_UVICORN_LOGGER_NAMES = ("uvicorn", "uvicorn.error", "uvicorn.access")
+# Uvicorn gives these loggers their own plain-text handlers and their own level.
+# They are routed through the root logger instead, at the configured level, so
+# server logs are JSON too and obey `LOG_LEVEL`.
+_UVICORN_SERVER_LOGGER_NAMES = ("uvicorn", "uvicorn.error")
+
+# Access records carry the client's address and the full request line, including
+# query strings. Both can be personal data or secrets, so they are never written.
+_UVICORN_ACCESS_LOGGER_NAME = "uvicorn.access"
 
 
 class JsonLogFormatter(logging.Formatter):
@@ -54,7 +60,11 @@ class JsonLogFormatter(logging.Formatter):
 
 
 def configure_logging(level: LogLevel, stream: TextIO = sys.stdout) -> None:
-    """Send all logs, including uvicorn's, to one JSON handler on the root logger.
+    """Send logs to one JSON handler on the root logger, at one minimum severity.
+
+    The level is enforced on the handler, so it also holds for libraries that set
+    a level on their own loggers. Uvicorn's server logs go through the same
+    handler, and its access log is switched off.
 
     Calling it again replaces the previous handler, so it is safe to call once
     per application start.
@@ -65,12 +75,27 @@ def configure_logging(level: LogLevel, stream: TextIO = sys.stdout) -> None:
     """
     handler = logging.StreamHandler(stream)
     handler.setFormatter(JsonLogFormatter())
+    handler.setLevel(level)
 
     root_logger = logging.getLogger()
     root_logger.handlers = [handler]
     root_logger.setLevel(level)
 
-    for name in _UVICORN_LOGGER_NAMES:
-        uvicorn_logger = logging.getLogger(name)
-        uvicorn_logger.handlers = []
-        uvicorn_logger.propagate = True
+    for name in _UVICORN_SERVER_LOGGER_NAMES:
+        server_logger = logging.getLogger(name)
+        server_logger.handlers = []
+        server_logger.propagate = True
+        server_logger.setLevel(level)
+
+    _disable_uvicorn_access_log()
+
+
+def _disable_uvicorn_access_log() -> None:
+    """Leave the access logger with no handler to reach.
+
+    This is the state uvicorn's own `--no-access-log` option produces, and
+    uvicorn then skips building access records at all.
+    """
+    access_logger = logging.getLogger(_UVICORN_ACCESS_LOGGER_NAME)
+    access_logger.handlers = []
+    access_logger.propagate = False

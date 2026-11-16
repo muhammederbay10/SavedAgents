@@ -53,3 +53,29 @@ def test_database_url_must_be_a_postgres_url(environment: pytest.MonkeyPatch) ->
 
     with pytest.raises(ValidationError, match="database_url"):
         load_settings_from_environment_only()
+
+
+SYNTHETIC_PASSWORD = "synthetic-pw-9f2c"
+
+
+# The URLs are short on purpose: Pydantic shortens long rejected values, which
+# would hide the password by accident and let this test pass without the fix.
+@pytest.mark.parametrize(
+    ("variable", "malformed_url"),
+    [
+        ("DATABASE_URL", f"postgresql://u:{SYNTHETIC_PASSWORD}@h:not-a-port/d"),
+        ("DATABASE_URL", f"mysql://u:{SYNTHETIC_PASSWORD}@h/d"),
+        ("REDIS_URL", f"redis://u:{SYNTHETIC_PASSWORD}@h:not-a-port/0"),
+    ],
+)
+def test_validation_error_names_the_field_but_hides_the_rejected_value(
+    environment: pytest.MonkeyPatch, variable: str, malformed_url: str
+) -> None:
+    environment.setenv(variable, malformed_url)
+
+    with pytest.raises(ValidationError) as error:
+        load_settings_from_environment_only()
+
+    assert variable.lower() in str(error.value)
+    assert SYNTHETIC_PASSWORD not in str(error.value)
+    assert "input_value" not in str(error.value)

@@ -26,7 +26,7 @@ check: ## Run every check that must pass before asking for a push
 	pytest
 
 run: ## Run the API on this machine with auto-reload (reads .env)
-	uvicorn app.main:create_app --factory --reload
+	uvicorn app.main:create_app --factory --ws none --reload
 
 up: ## Build and start Postgres, Redis and the API in Docker
 	docker compose up --build --detach --wait

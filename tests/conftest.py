@@ -14,14 +14,19 @@ TEST_DATABASE_URL = "postgresql+asyncpg://test_user:test_password@localhost:5432
 TEST_REDIS_URL = "redis://localhost:6379/0"
 
 
+LOGGERS_CHANGED_BY_LOGGING_SETUP = ("", "uvicorn", "uvicorn.error", "uvicorn.access")
+
+
 @pytest.fixture(autouse=True)
-def restore_root_logging() -> Iterator[None]:
-    """Undo `configure_logging` after each test so tests do not affect each other."""
-    root_logger = logging.getLogger()
-    handlers, level = list(root_logger.handlers), root_logger.level
+def restore_logging() -> Iterator[None]:
+    """Undo `configure_logging` and uvicorn's own setup after each test."""
+    loggers = [logging.getLogger(name) for name in LOGGERS_CHANGED_BY_LOGGING_SETUP]
+    saved = [(list(logger.handlers), logger.level, logger.propagate) for logger in loggers]
     yield
-    root_logger.handlers = handlers
-    root_logger.setLevel(level)
+    for logger, (handlers, level, propagate) in zip(loggers, saved, strict=True):
+        logger.handlers = handlers
+        logger.setLevel(level)
+        logger.propagate = propagate
 
 
 @pytest.fixture

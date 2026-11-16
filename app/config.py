@@ -21,13 +21,20 @@ class Settings(BaseSettings):
     has a default: a missing variable fails at startup instead of running with
     a guessed value.
 
+    Validation errors name the field that is wrong but never repeat its value,
+    because a rejected URL can contain a password.
+
     Attributes:
         log_level: Minimum severity that is written to the log (`LOG_LEVEL`).
         database_url: Postgres connection URL (`DATABASE_URL`).
         redis_url: Redis connection URL (`REDIS_URL`).
     """
 
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        extra="ignore",
+        hide_input_in_errors=True,
+    )
 
     log_level: LogLevel
     database_url: PostgresDsn

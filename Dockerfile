@@ -15,4 +15,6 @@ USER savedagent
 
 EXPOSE 8000
 
-CMD ["uvicorn", "app.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000"]
+# The API serves no WebSockets. With the protocol left on, uvicorn logs the client
+# address and query string of every WebSocket handshake, so it is switched off.
+CMD ["uvicorn", "app.main:create_app", "--factory", "--ws", "none", "--host", "0.0.0.0", "--port", "8000"]

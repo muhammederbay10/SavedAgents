@@ -100,7 +100,7 @@ All configuration comes from environment variables. Locally they live in `.env`,
 | `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` | Docker Compose | Credentials and database name for the `db` container |
 | `API_PORT`, `POSTGRES_PORT`, `REDIS_PORT` | Docker Compose | Ports published on `127.0.0.1` |
 
-The API settings are defined in [`app/config.py`](app/config.py). None of them has a default, so the API refuses to start when one is missing. Under Docker Compose, `DATABASE_URL` and `REDIS_URL` are built in `docker-compose.yml` from the `POSTGRES_*` values, so the two in `.env` are only used by `make run`.
+The API settings are defined in [`app/config.py`](app/config.py). None of them has a default, so the API refuses to start when one is missing or invalid. The error names the variable but never prints its value, because a URL can contain a password. Under Docker Compose, `DATABASE_URL` and `REDIS_URL` are built in `docker-compose.yml` from the `POSTGRES_*` values, so the two in `.env` are only used by `make run`.
 
 ## Logging
 
@@ -114,6 +114,12 @@ logger.info("item_indexed", extra={"item_id": str(item.id), "step": "extract"})
 ```
 
 Never log secrets, tokens, raw webhook bodies or personal data.
+
+What the logging setup does for you:
+
+- `LOG_LEVEL` applies to every logger, including uvicorn's and other libraries'.
+- There is no access log. Uvicorn's access records hold the client's address and the full query string, so they are switched off. To see a request in the logs, log it from the application code, without personal data.
+- The API is started with `--ws none`. It has no WebSocket endpoints, and uvicorn would otherwise log the address and query string of every WebSocket handshake.
 
 ## Project layout
 

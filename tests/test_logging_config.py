@@ -2,11 +2,18 @@ import io
 import json
 import logging
 
+import uvicorn
+
 from app.logging_config import configure_logging
 
 
 def read_log_lines(stream: io.StringIO) -> list[dict[str, object]]:
     return [json.loads(line) for line in stream.getvalue().splitlines()]
+
+
+def apply_uvicorn_logging_configuration() -> None:
+    """Let uvicorn install its own handlers and levels, as it does before loading the app."""
+    uvicorn.Config("app.main:create_app", factory=True)
 
 
 def test_log_record_is_written_as_one_json_object_with_extra_fields() -> None:
@@ -36,6 +43,18 @@ def test_records_below_the_configured_level_are_dropped() -> None:
     assert [entry["message"] for entry in read_log_lines(stream)] == ["kept"]
 
 
+def test_configured_level_also_applies_to_loggers_that_set_their_own_level() -> None:
+    library_logger = logging.getLogger("some_library")
+    library_logger.setLevel(logging.DEBUG)
+    stream = io.StringIO()
+    configure_logging("ERROR", stream=stream)
+
+    library_logger.info("ignored")
+    library_logger.error("kept")
+
+    assert [entry["message"] for entry in read_log_lines(stream)] == ["kept"]
+
+
 def test_exception_traceback_is_included() -> None:
     stream = io.StringIO()
     configure_logging("INFO", stream=stream)
@@ -50,18 +69,50 @@ def test_exception_traceback_is_included() -> None:
     assert "ValueError: resolver returned no candidates" in str(entry["exception"])
 
 
-def test_uvicorn_logs_go_through_the_json_handler() -> None:
-    uvicorn_logger = logging.getLogger("uvicorn.error")
-    uvicorn_logger.addHandler(logging.NullHandler())
-    uvicorn_logger.propagate = False
+def test_uvicorn_server_logs_go_through_the_json_handler() -> None:
+    apply_uvicorn_logging_configuration()
     stream = io.StringIO()
-
     configure_logging("INFO", stream=stream)
-    uvicorn_logger.info("server_started")
+
+    logging.getLogger("uvicorn.error").info("server_started")
 
     (entry,) = read_log_lines(stream)
     assert entry["logger"] == "uvicorn.error"
-    assert uvicorn_logger.handlers == []
+    assert entry["message"] == "server_started"
+
+
+def test_error_level_drops_uvicorn_info_records_and_keeps_error_records() -> None:
+    apply_uvicorn_logging_configuration()
+    stream = io.StringIO()
+    configure_logging("ERROR", stream=stream)
+
+    for name in ("uvicorn", "uvicorn.error"):
+        logging.getLogger(name).info("ignored")
+        logging.getLogger(name).error("kept")
+
+    assert [(entry["logger"], entry["message"]) for entry in read_log_lines(stream)] == [
+        ("uvicorn", "kept"),
+        ("uvicorn.error", "kept"),
+    ]
+
+
+def test_uvicorn_access_records_are_never_written() -> None:
+    apply_uvicorn_logging_configuration()
+    stream = io.StringIO()
+    configure_logging("DEBUG", stream=stream)
+
+    logging.getLogger("uvicorn.access").info(
+        '%s - "%s %s HTTP/%s" %d',
+        "203.0.113.7:51000",
+        "GET",
+        "/health?token=synthetic-query-token-41d7",
+        "1.1",
+        200,
+    )
+
+    assert stream.getvalue() == ""
+    # Uvicorn skips building access records at all when this is false.
+    assert not logging.getLogger("uvicorn.access").hasHandlers()
 
 
 def test_configuring_twice_does_not_duplicate_log_lines() -> None:
