@@ -1,13 +1,14 @@
 import pytest
 from pydantic import ValidationError
 
-from app.config import Settings
+from app.config import MAX_EMBEDDING_DIMENSION, Settings
 from tests.conftest import TEST_DATABASE_URL, TEST_REDIS_URL
 
 REQUIRED_VARIABLES = {
     "LOG_LEVEL": "WARNING",
     "DATABASE_URL": TEST_DATABASE_URL,
     "REDIS_URL": TEST_REDIS_URL,
+    "EMBEDDING_DIMENSION": "1024",
 }
 
 
@@ -29,6 +30,7 @@ def test_settings_are_read_from_environment_variables(environment: pytest.Monkey
     assert settings.log_level == "WARNING"
     assert str(settings.database_url) == TEST_DATABASE_URL
     assert str(settings.redis_url) == TEST_REDIS_URL
+    assert settings.embedding_dimension == 1024
 
 
 @pytest.mark.parametrize("missing_variable", sorted(REQUIRED_VARIABLES))
@@ -53,6 +55,24 @@ def test_database_url_must_be_a_postgres_url(environment: pytest.MonkeyPatch) ->
 
     with pytest.raises(ValidationError, match="database_url"):
         load_settings_from_environment_only()
+
+
+@pytest.mark.parametrize("dimension", ["0", "-8", str(MAX_EMBEDDING_DIMENSION + 1), "large"])
+def test_embedding_dimension_the_vector_index_cannot_hold_is_rejected(
+    environment: pytest.MonkeyPatch, dimension: str
+) -> None:
+    environment.setenv("EMBEDDING_DIMENSION", dimension)
+
+    with pytest.raises(ValidationError, match="embedding_dimension"):
+        load_settings_from_environment_only()
+
+
+def test_largest_indexable_embedding_dimension_is_accepted(
+    environment: pytest.MonkeyPatch,
+) -> None:
+    environment.setenv("EMBEDDING_DIMENSION", str(MAX_EMBEDDING_DIMENSION))
+
+    assert load_settings_from_environment_only().embedding_dimension == MAX_EMBEDDING_DIMENSION
 
 
 SYNTHETIC_PASSWORD = "synthetic-pw-9f2c"

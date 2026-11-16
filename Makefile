@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help install fmt lint typecheck test check run up down
+.PHONY: help install fmt lint typecheck test check run migrate up down
 
 help: ## List the available commands
 	@grep -E '^[a-z]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  %-10s %s\n", $$1, $$2}'
@@ -27,6 +27,9 @@ check: ## Run every check that must pass before asking for a push
 
 run: ## Run the API on this machine with auto-reload (reads .env)
 	uvicorn app.main:create_app --factory --ws none --reload
+
+migrate: ## Apply the database migrations to the database in .env
+	alembic upgrade head
 
 up: ## Build and start Postgres, Redis and the API in Docker
 	docker compose up --build --detach --wait
