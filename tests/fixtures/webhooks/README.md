@@ -10,7 +10,7 @@ and [`docs/decisions/0003-collaborative-collections.md`](../../../docs/decisions
 |---|---|
 | `instagram_reel_share.json` | A reel, with a long Turkish caption |
 | `instagram_post_share_photo.json` | A photo post with a short caption |
-| `instagram_post_share_carousel.json` | A carousel post (several photos) without a caption |
+| `instagram_post_share_carousel.json` | A carousel post. It had a caption, but the webhook delivered one image and no `title` |
 | `instagram_text_short.json` | The text "Test" |
 | `instagram_text_question.json` | The text "Restaurants in beşiktaş" (lowercase "b", as typed) |
 | `instagram_reel_with_hint_1_reel.json` | A reel ... |

@@ -34,15 +34,17 @@ Every save arrived as an ordinary `messages` webhook in the 1:1 chat between the
 ### Why it works
 Muhammed confirmed that **every save into the collaborative collection is automatically posted into his DM chat with the bot**. A collaborative collection is tied to that chat, so each save becomes a message, and the message triggers the webhook. The two reel events were two saves.
 
-### The API can't add the missing caption
-With Muhammed's approval, we made read-only Graph API calls (`graph.facebook.com`) with the bot's Unified-login token (`EAA…`) to see whether the API returns more than the webhook:
-- Reading a message directly by the webhook's `mid` failed twice with `500 "An unknown error has occurred"`.
-- Listing the bot's conversations (`/{ig-user-id}/conversations?platform=instagram` with `messages{id,created_time,is_unsupported,attachments,shares}`) worked. It marked **every shared post as `is_unsupported: true` and returned no attachments and no shares for them**: the collection saves and the DM shares of reels, photos and carousels alike. Only plain texts (`is_unsupported: false`) and one directly sent photo (with `image_data`) came back normally.
+The bot didn't have to accept anything. When Muhammed logged in as the bot, the collection **didn't appear in the bot's own saved collections**, and he couldn't save into it from the bot's side. So the bot isn't a visible member of the collection; capture works only because each save is posted into the shared chat.
 
-So the **webhook is the richest source**: the API gives less, not more. A reel saved to the collection has to be understood from its video (and audio) alone.
+### What a first Graph API check showed (inconclusive)
+With Muhammed's approval, we made a few read-only Graph API calls (`graph.facebook.com`) with the bot's Unified-login token (`EAA…`), to see whether the API returns more than the webhook. These are observations for this one account and these requests only:
+- Reading a message directly by the webhook's `mid` failed twice with `500 "An unknown error has occurred"`. That leaves **direct message lookup inconclusive**: it may need another id, version, field set or permission.
+- Listing the bot's conversations (`/{ig-user-id}/conversations?platform=instagram` with `messages{id,created_time,is_unsupported,attachments,shares}`) worked. It marked the shared posts we tested as `is_unsupported: true`, with no attachments and no shares: the collection saves and the DM shares of reels, photos and carousels alike. Plain texts (`is_unsupported: false`) and one directly sent photo (with `image_data`) came back normally.
+
+In these tests **no missing caption was recovered**, and the **webhook was the richest source we tested**. Other official routes, such as other fields, API versions, or a media lookup by `reel_video_id`, were **not tested**. Until one is shown to work, plan for a collection-saved reel being understood from its video and audio alone.
 
 ## Open points
-1. **Did the bot have to accept anything** (an invite to the collection)? To confirm.
+1. **Official enrichment routes are not settled.** Direct message lookup returned HTTP 500, and other routes weren't tried (see above). A follow-up can test them before SAV-11/SAV-14 rule them out.
 2. **`unsupported_type` is undocumented.** Meta sends it but doesn't describe it, so its shape can change or disappear without notice.
 3. **Link lifetime:** the MP4 and JPEG links worked minutes after the save. Their lifetime is unknown; download right away (as in 0002).
 4. **New users:** not tested with an account that never chatted with the bot, nor outside development mode.
@@ -52,7 +54,7 @@ So the **webhook is the richest source**: the API gives less, not more. A reel s
 Use this as a **second, optional capture path** next to the DM share, not as a replacement. Muhammed decides.
 
 - **Why:** it's the zero-effort path the design hoped for. Better still, it delivers the reel's **video file**, which DM shares don't (0002, consequence 1). It's an official webhook and an official CDN link, so it is not scraping.
-- **What it can't do:** no caption, no link back to the original reel, no collection name, and the Graph API doesn't fill these in either (see above). A reel saved this way has to be understood from the video alone (Gemini Decision 1 + speech-to-text), and the confirmation DM can't link to the original post. When the bot isn't confident, it asks the user in the chat, as §1 "Ask when unsure" already says.
+- **What it can't do:** no caption, no link back to the original reel, no collection name. The Graph API calls we tried didn't fill these in, but that check was inconclusive (see above and open point 1). A reel saved this way has to be understood from the video alone (Gemini Decision 1 + speech-to-text), and the confirmation DM can't link to the original post. When the bot isn't confident, it asks the user in the chat, as §1 "Ask when unsure" already says.
 - **How it could work:** the adapter (SAV-11) maps `unsupported_type` with an MP4 link to a `CaptureEvent` with `media_type="reel"`, `media_url` = the MP4, no caption and no `post_url`. The pipeline downloads the video at once. Users are told: "Create a collection, switch on Collaborative, add @savedagent2026. Everything you save there is indexed." One shared collection per user is enough, because the collection name doesn't arrive anyway.
 - **A combination worth testing later:** for a reel, a DM share gives the caption and page link, and the collection gives the video. If a user does both, the two could be matched on timing, but there's no shared id, so this is best-effort only.
-- **Before relying on it:** re-test open points 1 and 4 with a second tester. Put it behind a setting, so it can be switched off if Meta changes `unsupported_type`. Keep the DM share as the documented main path for App Review.
+- **Before relying on it:** re-test open point 4 with a second tester, and settle open point 1. Put it behind a setting, so it can be switched off if Meta changes `unsupported_type`. Keep the DM share as the documented main path for App Review.

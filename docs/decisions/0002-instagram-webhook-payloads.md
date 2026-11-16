@@ -23,7 +23,7 @@
    - **`url` is the reel's public page (`https://www.instagram.com/reel/<shortcode>/`), not a video file.** Fetching it returns an HTML page.
 7. **Posts arrive as `ig_post`.** No `share` attachment appeared. The payload has `ig_post_media_id`, `url` and, when the post has a caption, `title`.
    - `url` is a signed CDN link (`lookaside.fbsbx.com/ig_messaging_cdn/?asset_id=<ig_post_media_id>&signature=…`). It returned the JPEG directly, about 2 minutes after sending. The link has no expiry field, and the response says `no-store`.
-8. **A carousel arrived as a single `ig_post` with one image URL** and no `title`. The other photos were not included. The carousel we sent may simply have had no caption; that is still to confirm.
+8. **The carousel arrived as a single `ig_post` with one image URL and no `title`.** The other items weren't included. Muhammed confirmed afterwards that the post he sent **had a caption**, so the caption was dropped, not missing.
 9. **A share and the text after it are two separate webhooks.** The reel and "For my movies collection" arrived 9.1 s apart, each as its own event, with nothing linking them except the sender and the timing.
 
 ### Setup that was needed
@@ -36,7 +36,7 @@
    - index reels from the caption first, and treat the video as unavailable unless an official route exists;
    - check whether an official API returns a reel's media from `reel_video_id` for an app-scoped share;
    - get the video through capture paths that have the file (the Phase 3 share extension).
-2. **Carousels: only the first image (decision needed).** Treat a carousel as one image plus its caption unless an official way to get the other images turns up.
+2. **Carousels: one image and no caption (decision needed).** Treat a carousel as a single image with no caption, unless an official way to get the other items and the caption turns up. Ask the user when that isn't enough to identify it.
 3. **Post images must be downloaded right away.** The link works now, but there's no stated lifetime. Fetch and store the image (and a 360p copy, per §9) when the webhook arrives. Re-check the link after 24 hours to measure its life; still to do.
 4. **The adapter (SAV-11):**
    - parse `entry[].messaging[]`;
