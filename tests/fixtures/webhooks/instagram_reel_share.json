@@ -1,0 +1,33 @@
+{
+  "object": "instagram",
+  "entry": [
+    {
+      "time": 1768478458171,
+      "id": "17840000000000001",
+      "messaging": [
+        {
+          "sender": {
+            "id": "1000000000000001"
+          },
+          "recipient": {
+            "id": "17840000000000001"
+          },
+          "timestamp": 1768478456454,
+          "message": {
+            "mid": "aWdfZAGFAKEMID0002AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "attachments": [
+              {
+                "type": "ig_reel",
+                "payload": {
+                  "reel_video_id": "18000000000000201",
+                  "title": "Kadıköy'de bu hafta keşfettiğimiz yer: Moda'da küçük bir meyhane, sahile iki dakika 🍷\n\nMezeler her gün taze yapılıyor; en çok atom, fava ve deniz börülcesini sevdik. Ana yemekte ızgara levrek ve kuzu şiş var, porsiyonlar iki kişiye yetiyor.\n\nFiyatlar: kişi başı ortalama 900-1200 TL arası.\nHafta sonu akşamları çok dolu oluyor, mutlaka rezervasyon yapın.\nPazartesi günleri kapalı.\n#kadıköy",
+                  "url": "https://www.instagram.com/reel/FAKEREEL002/"
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}
