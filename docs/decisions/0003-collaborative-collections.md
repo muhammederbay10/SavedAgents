@@ -34,7 +34,7 @@ Every save arrived as an ordinary `messages` webhook in the 1:1 chat between the
 ### Why it works
 Muhammed confirmed that **every save into the collaborative collection is automatically posted into his DM chat with the bot**. A collaborative collection is tied to that chat, so each save becomes a message, and the message triggers the webhook. The two reel events were two saves.
 
-The bot didn't have to accept anything. When Muhammed logged in as the bot, the collection **didn't appear in the bot's own saved collections**, and he couldn't save into it from the bot's side. So the bot isn't a visible member of the collection; capture works only because each save is posted into the shared chat.
+The bot didn't have to accept anything. From Muhammed's personal account, **the bot is listed as a member of the collection**. But when he logged in as the bot, the collection **didn't appear in the bot's own saved collections**, and he couldn't save into it from the bot's side. Either way, the bot doesn't need to see it: capture works because each save is posted into the shared chat.
 
 ### What a first Graph API check showed (inconclusive)
 With Muhammed's approval, we made a few read-only Graph API calls (`graph.facebook.com`) with the bot's Unified-login token (`EAA…`), to see whether the API returns more than the webhook. These are observations for this one account and these requests only:
