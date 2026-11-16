@@ -345,6 +345,7 @@ erDiagram
 - **`VOCABULARY_ALIAS`** holds other wordings of a value, in any language, each with a `status`: `candidate` (one decision-model match), `verified` (confirmed, used for exact hits) or `rejected` (a wrong match, never used again). `probability` is the best match confidence seen, and `correction_count` counts user corrections against it. Which items matched through an alias is recorded in their `ENRICHMENT_RUN` normalize step, not here.
 - **"Delete my data"** removes the user's items with their `raw_values` and enrichment runs, and lowers each value's `item_count`. The vocabulary keeps only gated, generic wording with no link to any user. A value no item uses any more can be cleaned up.
 - Opening hours and ratings go out of date, so refresh `ENTITY.data` regularly (e.g. every 30 days), and also when the user asks for `open_now`. Streaming availability is refreshed per country (`ENTITY_AVAILABILITY`).
+- Column-level choices (which columns may be empty, defaults, what is deleted with a user, index types) are in decision record 0005. The `MEMORY` table is created in Phase 2.
 
 ## 5. Tech stack
 
@@ -410,8 +411,9 @@ savedagent/
       session.py            # short-term: history + working set (Redis)
       longterm.py           # extract → gate → consolidate → retrieve
     db/
-      models.py
-      migrations/
+      models.py             # SQLAlchemy models for the tables in §4
+      types.py              # column types for pgvector and PostGIS
+      migrations/           # Alembic environment and revisions
   evals/
     labeled_saves.jsonl     # ~100 hand-labeled saves for model comparison
   extension/                # Phase 2 browser extension
@@ -419,6 +421,7 @@ savedagent/
     fixtures/webhooks/      # real (anonymized) webhook payloads
   docker/postgres/          # Postgres 16 image with PostGIS + pgvector
   docker-compose.yml
+  alembic.ini               # Alembic configuration
   Dockerfile                # API image
   Makefile                  # fmt, lint, typecheck, test, up
   pyproject.toml
