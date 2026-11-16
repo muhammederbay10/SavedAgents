@@ -74,6 +74,7 @@ class CaptureEvent(BaseModel):
     media_url: str | None      # video or image URL if provided
     media_type: Literal["reel", "post", "carousel", "video", "tweet"] | None
     collection_hint: str | None  # e.g. "Movies", from an import or the user's message
+    source_message_id: str | None  # the DM's message id (mid), so answers can reply to it (§3.5)
     received_at: datetime
 ```
 
@@ -81,6 +82,7 @@ class CaptureEvent(BaseModel):
 - Reels arrive as an `ig_reel` attachment with `title` (the caption), `url` and `video_id`.
 - Posts arrive as `ig_post`. Meta is replacing the old `share` type during 2026, so the adapter should accept both.
 - Plain text messages ("what's in Beşiktaş?") are routed to the **Response agent**, not the indexing pipeline. A text sent right after a share (e.g. "for my Movies collection") is attached as the `collection_hint`.
+- Every share keeps its message id (`mid`) as `source_message_id`. Answers later reply to that exact message, so the saved reel appears again in the chat (§3.5, decision record 0004).
 - Replies use the Send API. Instagram only allows replies within **24 hours** of the user's last message. That's fine for chat, but it means the bot **cannot send proactive alerts**, which need the mobile app (Phase 3).
 
 **Browser extension import (Phase 2, optional).** Adds a "Sync my saved" button on `instagram.com/<me>/saved`. It reads collections (with their names: Food, Movies, Studying…) and post links from the page in the user's own logged-in session, at human speed, and sends them to `/import`. This is a grey area under Instagram's Terms, so it's opt-in and runs only on the user's device.
@@ -153,7 +155,7 @@ flowchart TD
   R --> N[Normalize args — Gemini Decision choice<br/>against the type's known values<br/>'netflx' → Netflix · 'beşilktaş' → Beşiktaş]
   N --> S[Hybrid retrieval<br/>SQL/PostGIS filters + vector similarity]
   S --> Q{Can stored fields<br/>answer it?}
-  Q -- "yes (most questions)" --> W[Response agent writes reply<br/>user's language, with links]
+  Q -- "yes (most questions)" --> W[Response agent writes reply<br/>user's language: a short intro, then one<br/>reply per result quoting the saved reel]
   Q -- "no: 'which ones had<br/>a twist ending?'" --> D[Deep look — parallel subagents<br/>on the retrieved candidates only, ≤ ~30]
   D --> D1[Gemini Decision 1 yes/no per candidate<br/>on the stored video itself, in parallel]
   D1 --> WB[Write findings back to<br/>saved_item.attributes → next time is free]
@@ -178,6 +180,8 @@ flowchart TD
 | `set_status(entity_id, status)` | Mark as visited / watched / read / done, or "want to" |
 | `resolve_choice(item_id, option)` | Handles the user's answer to a "which one?" question |
 | `list_memories()` / `forget_memory(id)` | "What do you remember about me?" / "Forget that" (§3.7) |
+
+**How results are shown: the saved reels come back.** When an answer lists saved items, the bot sends a short intro ("3 places in Beşiktaş from your Food collection 🍽"), then **one message per result that replies to the user's original share** (`reply_to.mid` = the item's `source_message_id`). Instagram shows the saved reel or post quoted above the bot's line, e.g. "1/3 · Kronotrop, Beşiktaş · open now · Maps link". This works for DM shares and for saves into a collaborative collection alike (decision record 0004). If an item has no message id (for example a later browser import), the bot falls back to the post link, which Instagram shows as a preview card, or to the name and Maps or TMDB link. Results are capped (e.g. 5 per answer) with "show more" for the rest. Replies only work inside the 24-hour window, which is always true when answering a question the user just asked.
 
 Location for places in Phase 1: the user can type an area ("I'm in Beşiktaş") or share their location in the DM. Real "near me" alerts come with the mobile app.
 
@@ -273,7 +277,7 @@ erDiagram
     uuid id  uuid user_id  text platform  text platform_post_id  text post_url
     text media_type  text caption  text transcript  text summary
     text type  text subtype  text[] tags  text collection  jsonb fields  jsonb attributes
-    text status  vector embedding  timestamptz saved_at
+    text status  vector embedding  timestamptz saved_at  text source_message_id
   }
   ENTITY {
     uuid id  text type  text source  text external_id  text name  jsonb data
@@ -295,6 +299,7 @@ erDiagram
 - **`USER_ENTITY.status`**: `want | done` (visited / watched / read), per user. Memory and ranking use it.
 - `SAVED_ITEM.fields` holds the extracted type fields (e.g. `{"subject": "maths", "topic": "integrals", "format": "tutorial"}`). `attributes` holds facts learned later by deep look.
 - `SAVED_ITEM.status` goes `pending → enriching → needs_user → done | failed`.
+- `SAVED_ITEM.source_message_id` is the Instagram message id (`mid`) of the DM or collection save that brought the item in. Answers reply to it so the saved reel shows again (§3.5). It's empty for items from imports.
 - Opening hours, ratings and streaming availability go out of date, so refresh `ENTITY.data` regularly (e.g. every 30 days), and also when the user asks for `open_now` or a platform.
 
 ## 5. Tech stack
@@ -355,7 +360,7 @@ savedagent/
       retrieval.py          # hybrid SQL + vector search
       deep_look.py          # parallel subagents + write-back
       fallback.py           # L1–L4 fallback ladder, time budget, logging
-      messenger.py          # send DM replies
+      messenger.py          # send DM replies, incl. replies that quote a saved reel (reply_to)
     memory/
       session.py            # short-term: history + working set (Redis)
       longterm.py           # extract → gate → consolidate → retrieve
