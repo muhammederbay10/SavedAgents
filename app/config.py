@@ -7,7 +7,7 @@ rest of the code never hard-codes configuration.
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field, PostgresDsn, RedisDsn
+from pydantic import Field, PostgresDsn, RedisDsn, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
@@ -35,6 +35,14 @@ class Settings(BaseSettings):
             `saved_item.embedding` and `vocabulary.embedding`
             (`EMBEDDING_DIMENSION`). The first migration creates both columns
             with this size, so it must match the embedding model.
+        meta_app_secret: The Meta app's secret (`META_APP_SECRET`). Every
+            webhook body is signed with it (`X-Hub-Signature-256`).
+        meta_webhook_verify_token: The token Meta repeats in the webhook
+            verification handshake (`META_WEBHOOK_VERIFY_TOKEN`). We choose it
+            and enter the same value in the Meta app dashboard.
+        collection_hint_window_seconds: How long after a share a text from the
+            same user still counts as that item's collection hint
+            (`COLLECTION_HINT_WINDOW_SECONDS`).
     """
 
     model_config = SettingsConfigDict(
@@ -47,6 +55,9 @@ class Settings(BaseSettings):
     database_url: PostgresDsn
     redis_url: RedisDsn
     embedding_dimension: int = Field(gt=0, le=MAX_EMBEDDING_DIMENSION)
+    meta_app_secret: SecretStr = Field(min_length=1)
+    meta_webhook_verify_token: SecretStr = Field(min_length=1)
+    collection_hint_window_seconds: int = Field(gt=0)
 
 
 @lru_cache

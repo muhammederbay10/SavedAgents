@@ -5,9 +5,9 @@ from collections.abc import AsyncIterator, Iterator
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from pydantic import PostgresDsn, RedisDsn
+from pydantic import PostgresDsn, RedisDsn, SecretStr
 from sqlalchemy import URL
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from app.config import Settings
@@ -22,6 +22,10 @@ from tests.database import (
 
 TEST_DATABASE_URL = "postgresql+asyncpg://test_user:test_password@localhost:5432/test_db"
 TEST_REDIS_URL = "redis://localhost:6379/0"
+# Synthetic values. The real ones only ever live in `.env`.
+TEST_META_APP_SECRET = "synthetic-app-secret-7c1e"
+TEST_META_WEBHOOK_VERIFY_TOKEN = "synthetic-verify-token-52ab"
+TEST_COLLECTION_HINT_WINDOW_SECONDS = 30
 
 
 LOGGERS_CHANGED_BY_LOGGING_SETUP = ("", "uvicorn", "uvicorn.error", "uvicorn.access")
@@ -46,6 +50,9 @@ def settings() -> Settings:
         database_url=PostgresDsn(TEST_DATABASE_URL),
         redis_url=RedisDsn(TEST_REDIS_URL),
         embedding_dimension=TEST_EMBEDDING_DIMENSION,
+        meta_app_secret=SecretStr(TEST_META_APP_SECRET),
+        meta_webhook_verify_token=SecretStr(TEST_META_WEBHOOK_VERIFY_TOKEN),
+        collection_hint_window_seconds=TEST_COLLECTION_HINT_WINDOW_SECONDS,
     )
 
 
@@ -98,6 +105,29 @@ async def db_session(migrated_database_url: URL) -> AsyncIterator[AsyncSession]:
                 expire_on_commit=False,
             ) as session:
                 yield session
+            await transaction.rollback()
+    finally:
+        await engine.dispose()
+
+
+@pytest.fixture
+async def session_factory(
+    migrated_database_url: URL,
+) -> AsyncIterator[async_sessionmaker[AsyncSession]]:
+    """A session factory on the migrated database, for code that commits by itself.
+
+    Every session uses one connection inside one outer transaction. A commit
+    only releases a savepoint, and everything is rolled back after the test.
+    """
+    engine = create_async_engine(migrated_database_url, poolclass=NullPool)
+    try:
+        async with engine.connect() as connection:
+            transaction = await connection.begin()
+            yield async_sessionmaker(
+                bind=connection,
+                join_transaction_mode="create_savepoint",
+                expire_on_commit=False,
+            )
             await transaction.rollback()
     finally:
         await engine.dispose()

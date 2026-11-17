@@ -28,8 +28,13 @@ TEST_DATABASE_NAME_PREFIX = "savedagent_test_"
 # Small on purpose: test vectors stay readable, and it proves the size is not hard-coded.
 TEST_EMBEDDING_DIMENSION = 8
 ALEMBIC_TIMEOUT_SECONDS = 60.0
-# The settings require a Redis URL, but migrations never connect to Redis.
+# The settings require these, but migrations never use them.
 UNUSED_REDIS_URL = "redis://localhost:6379/0"
+UNUSED_WEBHOOK_SETTINGS = {
+    "META_APP_SECRET": "unused-by-migrations",
+    "META_WEBHOOK_VERIFY_TOKEN": "unused-by-migrations",
+    "COLLECTION_HINT_WINDOW_SECONDS": "30",
+}
 
 
 def admin_url_or_skip() -> URL:
@@ -75,6 +80,7 @@ def run_alembic(
             "DATABASE_URL": database_url.render_as_string(hide_password=False),
             "REDIS_URL": UNUSED_REDIS_URL,
             "EMBEDDING_DIMENSION": str(embedding_dimension),
+            **UNUSED_WEBHOOK_SETTINGS,
         },
         cwd=working_directory,
         capture_output=True,

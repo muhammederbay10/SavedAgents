@@ -6,13 +6,22 @@ from pathlib import Path
 import pytest
 
 from tests.api_process import read_output, run_api_until_exit, running_api
-from tests.conftest import TEST_DATABASE_URL, TEST_REDIS_URL
+from tests.conftest import (
+    TEST_COLLECTION_HINT_WINDOW_SECONDS,
+    TEST_DATABASE_URL,
+    TEST_META_APP_SECRET,
+    TEST_META_WEBHOOK_VERIFY_TOKEN,
+    TEST_REDIS_URL,
+)
 
 VALID_ENVIRONMENT = {
     "LOG_LEVEL": "INFO",
     "DATABASE_URL": TEST_DATABASE_URL,
     "REDIS_URL": TEST_REDIS_URL,
     "EMBEDDING_DIMENSION": "1024",
+    "META_APP_SECRET": TEST_META_APP_SECRET,
+    "META_WEBHOOK_VERIFY_TOKEN": TEST_META_WEBHOOK_VERIFY_TOKEN,
+    "COLLECTION_HINT_WINDOW_SECONDS": str(TEST_COLLECTION_HINT_WINDOW_SECONDS),
 }
 SYNTHETIC_PASSWORD = "synthetic-pw-9f2c"
 SYNTHETIC_QUERY_TOKEN = "synthetic-query-token-41d7"

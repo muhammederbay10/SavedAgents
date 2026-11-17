@@ -6,6 +6,8 @@ collaborative collection), then anonymized. They are the reference input for the
 [`docs/decisions/0002-instagram-webhook-payloads.md`](../../../docs/decisions/0002-instagram-webhook-payloads.md)
 and [`docs/decisions/0003-collaborative-collections.md`](../../../docs/decisions/0003-collaborative-collections.md).
 
+Every file is a recording except `synthetic_instagram_share_legacy.json`, which is marked below.
+
 | File | What was sent to the bot |
 |---|---|
 | `instagram_reel_share.json` | A reel, with a long Turkish caption |
@@ -19,6 +21,7 @@ and [`docs/decisions/0003-collaborative-collections.md`](../../../docs/decisions
 | `instagram_collection_save_reel_2.json` | SAV-6: a second reel saved into that collection, same shape |
 | `instagram_collection_save_photo.json` | SAV-6: a photo post saved into that collection. Arrives as a normal `ig_post` with its caption |
 | `instagram_collection_save_reel_with_caption.json` | SAV-6: a reel that has a caption, saved into that collection. Still only the MP4 link; the caption is not sent |
+| `synthetic_instagram_share_legacy.json` | **Not a recording.** The older `share` attachment that `ig_post` replaces. Meta never sent one to us, so this file follows Meta's documented shape (`type: "share"` with only a `url`) inside a recorded envelope. Added in SAV-11 so the adapter's `share` branch is tested |
 | `meta_dashboard_test_messages.json` | The sample Meta sends from the dashboard's **Test** button. It has a different shape (`changes`, not `messaging`) and is not what real DMs look like |
 
 ## How they were anonymized
@@ -38,7 +41,8 @@ Only the values were changed; every key, nesting level and value type is exactly
 
 The texts the tester typed ("Test", "Restaurants in beşiktaş", "For my movies collection") are kept
 as sent. `tests/test_webhook_fixtures.py` fails if a fixture contains an id, URL or signature that
-doesn't follow these fake patterns.
+doesn't follow these fake patterns. It also fails if a file named `instagram_*.json` holds a `share`
+attachment, so a synthetic payload can't pass as a recording.
 
 To record new payloads, follow the steps in the decision record and anonymize the same way. Never
 commit a raw recording.
