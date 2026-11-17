@@ -92,3 +92,16 @@ def test_provenance_with_a_sentence_missing_in_one_language_is_rejected(tmp_path
     path.write_text(unaligned.model_dump_json(), encoding="utf-8")
     with pytest.raises(ClipSetError, match="shared sentence ids"):
         load_provenance(path)
+
+
+@pytest.mark.parametrize("duration", ["0", "-1.5", "NaN", "Infinity"])
+def test_provenance_with_an_impossible_clip_length_is_rejected(
+    tmp_path: Path, duration: str
+) -> None:
+    provenance = write_clip_set(tmp_path)
+    text = provenance.model_dump_json().replace('"duration_s":1.5', f'"duration_s":{duration}', 1)
+    assert text != provenance.model_dump_json()
+    path = tmp_path / "provenance.json"
+    path.write_text(text, encoding="utf-8")
+    with pytest.raises(ClipSetError, match="provenance"):
+        load_provenance(path)

@@ -198,7 +198,7 @@ So these are first choices. SAV-19 and SAV-20 score them again on labelled saves
 
 `scripts/spikes/model_choices/` repeats round 2: the speech-to-text comparison and the embedding retrieval check. [`scripts/spikes/README.md`](../../scripts/spikes/README.md) explains how to run it.
 
-- By default it sends nothing. A live run needs `--live`, the key in the environment, and the amount already spent; it refuses any request that could take the total over $2.
+- By default it sends nothing. A live run needs `--live`, the key in the environment, and the amount already spent; it refuses any request that could take the total over $2. Before the first request it also checks that the amounts are real numbers and that the report can be written.
 - The repository holds no audio and no sentences, only the FLEURS provenance (`fleurs_provenance.json`): dataset revision, sentence ids, file names and SHA-256 hashes. The spike refuses clips that don't match.
 - **Checked offline:** fed the public FLEURS transcripts the Reviewer stored in round 2, the spike's scoring gives the same edit errors for every request and the same error rate and cost per minute for all 24 cells of the table above.
 - **Not re-run live.** The Reviewer's own ad hoc scripts were not kept, so the spike's requests follow OpenRouter's documented contracts and are tested against a mocked transport. A new live run needs Muhammed's approval (SAV-22 §8). To stay on the safe side of the cap, pass the higher figure, $0.20654018, as the amount already spent.

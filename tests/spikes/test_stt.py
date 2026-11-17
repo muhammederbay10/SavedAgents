@@ -171,3 +171,9 @@ def test_file_that_is_not_pcm_wav_is_rejected_without_naming_it(tmp_path: Path) 
     with pytest.raises(ClipSetError) as error:
         unreferenced_clips(tmp_path)
     assert "restaurant-name" not in str(error.value)
+
+
+def test_empty_wav_file_is_rejected(tmp_path: Path) -> None:
+    (tmp_path / "empty.wav").write_bytes(wav_bytes(seconds=0.0))
+    with pytest.raises(ClipSetError, match="unreferenced clip 1"):
+        unreferenced_clips(tmp_path)

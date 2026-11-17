@@ -161,7 +161,8 @@ def unreferenced_clips(directory: Path) -> list[Clip]:
         The clips, ordered by file name.
 
     Raises:
-        ClipSetError: If the folder has no WAV file, or one cannot be read as PCM WAV.
+        ClipSetError: If the folder has no WAV file, or one is empty or cannot be
+            read as PCM WAV.
     """
     paths = sorted(directory.glob("*.wav"))
     if not paths:
@@ -173,12 +174,13 @@ def _unreferenced_clip(path: Path, position: int) -> Clip:
     try:
         audio = path.read_bytes()
         with wave.open(str(path), "rb") as wav_file:
-            duration_seconds = wav_file.getnframes() / wav_file.getframerate()
+            frames = wav_file.getnframes()
+            frame_rate = wav_file.getframerate()
     except (OSError, EOFError, wave.Error) as error:
-        # The message names the position, not the file: file names can be private.
-        raise ClipSetError(
-            f"unreferenced clip {position} is not a readable PCM WAV file"
-        ) from error
+        raise _unreadable_clip(position) from error
+    if frames <= 0 or frame_rate <= 0:
+        raise _unreadable_clip(position)
+    duration_seconds = frames / frame_rate
     return Clip(
         group="unreferenced",
         clip_id=f"unreferenced-{position}",
@@ -187,6 +189,11 @@ def _unreferenced_clip(path: Path, position: int) -> Clip:
         audio=audio,
         duration_seconds=duration_seconds,
     )
+
+
+def _unreadable_clip(position: int) -> ClipSetError:
+    # The message names the position, not the file: file names can be private.
+    return ClipSetError(f"unreferenced clip {position} is not a readable, non-empty PCM WAV file")
 
 
 def estimate_transcription_usd(model: SpeechToTextModel, duration_seconds: float) -> float:

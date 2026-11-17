@@ -13,7 +13,7 @@ import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from scripts.spikes.model_choices.settings import FLEURS_MANIFEST_NAME
 
@@ -41,7 +41,7 @@ class SampleProvenance(BaseModel):
     original_file: str
     sha256_pcm_wav: str
     sha256_reference_utf8: str
-    duration_s: float
+    duration_s: float = Field(gt=0, allow_inf_nan=False)
 
 
 class Provenance(BaseModel):

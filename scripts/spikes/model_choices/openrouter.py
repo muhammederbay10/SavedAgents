@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 
 import httpx
 
-from scripts.spikes.model_choices.budget import SpendLedger
+from scripts.spikes.model_choices.budget import SpendLedger, is_valid_amount
 from scripts.spikes.model_choices.settings import (
     AUDIO_FORMAT,
     EMBEDDINGS_PATH,
@@ -44,7 +44,8 @@ class ApiResult:
         status: HTTP status, or `None` when no response arrived.
         latency_seconds: Time from sending the request to reading the response.
         body: The response's JSON object; empty when there was none.
-        returned_cost_usd: `usage.cost` from the response, or `None` if absent.
+        returned_cost_usd: `usage.cost` from the response; `None` if it is absent
+            or not a finite, non-negative number.
         error: The exception's class name when no response arrived.
     """
 
@@ -147,14 +148,15 @@ class OpenRouterClient:
         """Read the key's total spend, to cross-check the ledger. This call is free.
 
         Returns:
-            The spend OpenRouter reports for the key, or `None` if it could not be read.
+            The spend OpenRouter reports for the key, or `None` if it could not be
+            read or is not a finite, non-negative number.
         """
         try:
             response = await self._http_client.get(KEY_PATH)
         except httpx.HTTPError:
             return None
         data = _json_object(response).get("data")
-        return _number(data.get("usage")) if isinstance(data, dict) else None
+        return _amount(data.get("usage")) if isinstance(data, dict) else None
 
     async def _post(self, path: str, payload: JsonObject, estimate_usd: float) -> ApiResult:
         self._ledger.authorize(estimate_usd)
@@ -168,7 +170,7 @@ class OpenRouterClient:
         latency_seconds = time.perf_counter() - started
         body = _json_object(response)
         usage = body.get("usage")
-        returned_cost_usd = _number(usage.get("cost")) if isinstance(usage, dict) else None
+        returned_cost_usd = _amount(usage.get("cost")) if isinstance(usage, dict) else None
         self._ledger.record(returned_cost_usd, estimate_usd)
         return ApiResult(response.status_code, latency_seconds, body, returned_cost_usd)
 
@@ -181,7 +183,9 @@ def _json_object(response: httpx.Response) -> JsonObject:
     return body if isinstance(body, dict) else {}
 
 
-def _number(value: object) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, int | float):
-        return None
-    return float(value)
+def _amount(value: object) -> float | None:
+    # JSON can carry NaN and Infinity. They are dropped here, so they reach neither
+    # the ledger nor the report.
+    if isinstance(value, int | float) and is_valid_amount(value):
+        return float(value)
+    return None

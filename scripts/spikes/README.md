@@ -32,15 +32,17 @@ python -m scripts.spikes.model_choices \
 |---|---|
 | `--media-dir` | Folder with the FLEURS `manifest.json` and the WAV clips (see below) |
 | `--unreferenced-dir` | Optional folder of extra PCM WAV clips without reference transcripts, such as audio taken from private reels |
-| `--output-dir` | Where `report.json` is written. Needed with `--live` |
+| `--output-dir` | Where `report.json` is written. Needed with `--live`. Use a new folder: a folder that already holds a `report.json` is refused, so an earlier report is never overwritten |
 | `--live` | Send real, paid requests |
-| `--spent-so-far` | US dollars already charged for SAV-7 in earlier runs. Needed with `--live`. It was `0.08541` after rounds 1 and 2; later rounds add to it, so use the latest total reported on SAV-7 |
+| `--spent-so-far` | US dollars already charged for SAV-7 in earlier runs. Needed with `--live`. It was `0.08541` after rounds 1 and 2; later rounds add to it, so use the latest total in record 0008 |
 | `--spend-cap` | Cumulative limit. Defaults to the owner's $2.00; it can be lowered but not raised |
 
 What keeps a live run inside the rules:
 
 - **The spending cap is cumulative.** Earlier spending plus this run's whole plan must fit under the cap before the first request. Each request is checked again before it is sent. A response that reports no charge is counted at its estimate, and estimates are twice the catalog price. If a response charges more than expected and the total reaches the cap, the run stops before the next request and still writes what it measured.
 - **The key** is read from the `OPENROUTER_API_KEY` environment variable only. The spike never reads `.env`, and never logs or writes the key.
+- **Amounts must be real numbers.** `nan`, `inf` and negative values for `--spent-so-far` and `--spend-cap` are refused before anything is sent. A response whose charge is missing, not finite or negative is also counted at its estimate.
+- **The report is secured before the first request.** The output folder is created and `report.json` is claimed up front; if that fails, nothing is sent. If the run breaks part-way, the report is still written with what was spent (`run_finished` is then `false`), and the spending is logged as well.
 - **Media and results stay outside the repository.** A `--media-dir`, `--unreferenced-dir` or `--output-dir` inside the repository is refused.
 - **Private clips stay private.** Clips from `--unreferenced-dir` are labelled by position (`unreferenced-1`), and their transcripts are never written. Only success, latency, cost and metadata are kept for them.
 - **Failures stay visible.** No request is retried. An error response or an empty transcript is a failed request and scores as the whole reference deleted.

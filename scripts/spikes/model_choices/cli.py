@@ -4,6 +4,11 @@ Without `--live` nothing is sent: the test clips are verified and the plan is
 logged. With `--live` the same clips go to every speech-to-text model, the
 reference sentences go to every embedding model, and a report is written to a
 folder outside the repository.
+
+Everything that can stop a live run is checked before the first request: the
+amounts, the key, the plan against the cap, and that the report can be written.
+Once requests have been sent, the report and its spending are written even if
+the run breaks.
 """
 
 import argparse
@@ -21,7 +26,12 @@ import httpx
 
 from app.logging_config import configure_logging
 from scripts.spikes.model_choices import embeddings, stt
-from scripts.spikes.model_choices.budget import SpendCapExceededError, SpendLedger
+from scripts.spikes.model_choices.budget import (
+    InvalidAmountError,
+    SpendCapExceededError,
+    SpendLedger,
+    is_valid_amount,
+)
 from scripts.spikes.model_choices.fleurs import (
     PROVENANCE_PATH,
     ClipSetError,
@@ -42,6 +52,7 @@ logger = logging.getLogger(__name__)
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 REPORT_NAME = "report.json"
+RUN_STARTED_NOTE = "the run started; this file is replaced by the report when it ends"
 EXIT_OK = 0
 EXIT_FAILED = 1
 # Each embedding model runs at 1024 dimensions and at its full size.
@@ -50,6 +61,10 @@ EMBEDDING_SIZES_PER_MODEL = 2
 
 class UsageError(ValueError):
     """Raised when the command line asks for something the spike does not allow."""
+
+
+class ReportNotWrittenError(RuntimeError):
+    """Raised when a live run finished but its report could not be saved."""
 
 
 @dataclass(frozen=True)
@@ -69,13 +84,23 @@ class Plan:
 
 @dataclass
 class Measurements:
-    """Results collected during a live run; partly filled if the run stops early."""
+    """Results collected during a live run; partly filled if the run stops early.
+
+    Attributes:
+        transcriptions: One outcome per finished transcription request.
+        embedding_runs: One entry per finished embedding request.
+        key_usage_before_usd: The key's total spend before the run, if readable.
+        key_usage_after_usd: The key's total spend after the run, if readable.
+        stopped_at_spend_cap: The ledger refused a request mid-run.
+        finished: The run reached its end; false if it broke part-way.
+    """
 
     transcriptions: list[stt.TranscriptionOutcome] = field(default_factory=list)
     embedding_runs: list[embeddings.EmbeddingRun] = field(default_factory=list)
     key_usage_before_usd: float | None = None
     key_usage_after_usd: float | None = None
     stopped_at_spend_cap: bool = False
+    finished: bool = False
 
 
 def main(
@@ -96,6 +121,7 @@ def main(
     options = _parse(arguments)
     configure_logging("INFO", sys.stdout)
     try:
+        _check_amounts(options)
         provenance = load_provenance(provenance_path)
         samples = load_samples(_outside_repository(options.media_dir), provenance)
         clips = stt.fleurs_clips(samples)
@@ -107,8 +133,11 @@ def main(
             logger.info("dry_run_finished", extra={"hint": "add --live to send the requests"})
             return EXIT_OK
         report_path = _run_live(options, provenance, samples, clips, plan, transport)
-    except (ClipSetError, UsageError, SpendCapExceededError) as error:
+    except (ClipSetError, UsageError, InvalidAmountError, SpendCapExceededError) as error:
         logger.error("run_refused", extra={"reason": str(error)})
+        return EXIT_FAILED
+    except ReportNotWrittenError as error:
+        logger.error("report_not_written", extra={"reason": str(error)})
         return EXIT_FAILED
     logger.info("report_written", extra={"path": str(report_path)})
     return EXIT_OK
@@ -154,6 +183,18 @@ def _parse(arguments: Sequence[str]) -> argparse.Namespace:
     return parser.parse_args(arguments)
 
 
+def _check_amounts(options: argparse.Namespace) -> None:
+    """Refuse amounts that are not real dollars, before anything else happens.
+
+    `float("nan")` and `float("inf")` parse as numbers, but a NaN makes every
+    cap comparison false, so they are rejected here as well as in the ledger.
+    """
+    if options.spent_so_far is not None and not is_valid_amount(options.spent_so_far):
+        raise UsageError("--spent-so-far must be a finite number, zero or more")
+    if not is_valid_amount(options.spend_cap) or not 0 < options.spend_cap <= SPEND_CAP_USD:
+        raise UsageError(f"--spend-cap must be above 0 and at most {SPEND_CAP_USD:.2f}")
+
+
 def build_plan(clips: Sequence[stt.Clip], samples: Sequence[FleursSample]) -> Plan:
     """Count the requests of a live run and add up their cost estimates."""
     texts = [sample.reference for sample in samples]
@@ -183,10 +224,6 @@ def _run_live(
 ) -> Path:
     if options.output_dir is None or options.spent_so_far is None:
         raise UsageError("--live needs --output-dir and --spent-so-far")
-    if not 0 < options.spend_cap <= SPEND_CAP_USD:
-        raise UsageError(f"--spend-cap must be above 0 and at most {SPEND_CAP_USD:.2f}")
-    if options.spent_so_far < 0:
-        raise UsageError("--spent-so-far cannot be negative")
     output_directory = _outside_repository(options.output_dir)
     api_key = os.environ.get(API_KEY_ENVIRONMENT_VARIABLE)
     if not api_key:
@@ -194,12 +231,66 @@ def _run_live(
     ledger = SpendLedger(cap_usd=options.spend_cap, spent_before_usd=options.spent_so_far)
     # The whole plan must fit before the first request, not only each request on its own.
     ledger.authorize(plan.worst_case_usd)
-    measurements = asyncio.run(_measure(api_key, ledger, samples, clips, transport))
-    report = build_report(provenance, plan, ledger, measurements)
-    output_directory.mkdir(parents=True, exist_ok=True)
-    report_path = output_directory / REPORT_NAME
-    report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    # Last check before paid work: a run whose report cannot be saved must not start.
+    report_path = _reserve_report(output_directory)
+    measurements = Measurements()
+    try:
+        asyncio.run(_measure(api_key, ledger, samples, clips, transport, measurements))
+    finally:
+        # Requests may have been charged, so the spending is kept even if the run broke.
+        _save_report(report_path, build_report(provenance, plan, ledger, measurements))
     return report_path
+
+
+def _reserve_report(output_directory: Path) -> Path:
+    """Create the output folder and claim the report file, without overwriting anything.
+
+    Args:
+        output_directory: The resolved output folder, outside the repository.
+
+    Returns:
+        The path of the report, which now holds a short "run started" note.
+
+    Raises:
+        UsageError: If the folder cannot be created or written, or a report is already there.
+    """
+    report_path = output_directory / REPORT_NAME
+    try:
+        output_directory.mkdir(parents=True, exist_ok=True)
+        with report_path.open("x", encoding="utf-8") as placeholder:
+            placeholder.write(json.dumps({"status": RUN_STARTED_NOTE}))
+    except FileExistsError as error:
+        raise UsageError(
+            f"the output folder is a file, or already holds {REPORT_NAME}; use a new folder"
+        ) from error
+    except OSError as error:
+        raise UsageError("the output folder cannot be created or written to") from error
+    return report_path
+
+
+def _save_report(report_path: Path, report: dict[str, object]) -> None:
+    """Log the spending, then write the report over the "run started" note.
+
+    The spending is logged first, so it is not lost if the file cannot be written.
+
+    Raises:
+        ReportNotWrittenError: If the report file cannot be written.
+    """
+    logger.info("spend", extra=_as_log_fields(report["spend"]))
+    try:
+        _write_report(report_path, report)
+    except OSError as error:
+        raise ReportNotWrittenError(
+            "the report could not be written; the spending is in the log line before this one"
+        ) from error
+
+
+def _write_report(report_path: Path, report: dict[str, object]) -> None:
+    report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _as_log_fields(spend: object) -> dict[str, object]:
+    return dict(spend) if isinstance(spend, dict) else {}
 
 
 async def _measure(
@@ -208,8 +299,9 @@ async def _measure(
     samples: Sequence[FleursSample],
     clips: Sequence[stt.Clip],
     transport: httpx.AsyncBaseTransport | None,
-) -> Measurements:
-    measurements = Measurements()
+    measurements: Measurements,
+) -> None:
+    """Run both comparisons, filling `measurements` as requests finish."""
     async with build_http_client(api_key, transport) as http_client:
         client = OpenRouterClient(http_client, ledger)
         measurements.key_usage_before_usd = await client.key_usage_usd()
@@ -224,7 +316,7 @@ async def _measure(
             measurements.stopped_at_spend_cap = True
             logger.error("stopped_at_spend_cap", extra={"reason": str(error)})
         measurements.key_usage_after_usd = await client.key_usage_usd()
-    return measurements
+    measurements.finished = True
 
 
 def build_report(
@@ -256,6 +348,7 @@ def build_report(
             "key_usage_before_usd": measurements.key_usage_before_usd,
             "key_usage_after_usd": measurements.key_usage_after_usd,
             "stopped_at_spend_cap": measurements.stopped_at_spend_cap,
+            "run_finished": measurements.finished,
         },
         "speech_to_text": {
             "by_language": [

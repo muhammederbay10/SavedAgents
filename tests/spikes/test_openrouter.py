@@ -135,3 +135,42 @@ async def test_unreadable_key_usage_is_none() -> None:
     recorder = Recorder(httpx.ConnectError("no network"))
 
     assert await client_for(recorder, roomy_ledger()).key_usage_usd() is None
+
+
+@pytest.mark.parametrize(
+    "cost_literal",
+    [
+        pytest.param("NaN", id="NaN"),
+        pytest.param("Infinity", id="infinity"),
+        pytest.param("-Infinity", id="minus infinity"),
+        pytest.param("1e999", id="overflows to infinity"),
+        pytest.param("-0.5", id="negative"),
+        pytest.param('"0.0002"', id="a string"),
+        pytest.param("true", id="a boolean"),
+    ],
+)
+async def test_malformed_charge_is_dropped_and_the_estimate_stays_reserved(
+    cost_literal: str,
+) -> None:
+    body = f'{{"text": "hi", "usage": {{"cost": {cost_literal}}}}}'
+    recorder = Recorder(httpx.Response(200, content=body.encode("utf-8")))
+    ledger = SpendLedger(cap_usd=1.0, spent_before_usd=0.0)
+    client = client_for(recorder, ledger)
+
+    result = await client.transcribe(PLAIN_MODEL, b"RIFFdata", 0.6)
+
+    assert result.is_success
+    assert result.returned_cost_usd is None
+    assert ledger.returned_usd == 0.0
+    assert ledger.unconfirmed_usd == pytest.approx(0.6)
+    with pytest.raises(SpendCapExceededError):
+        await client.transcribe(PLAIN_MODEL, b"RIFFdata", 0.5)
+    assert len(recorder.requests) == 1
+
+
+@pytest.mark.parametrize("usage_literal", ["NaN", "Infinity", "-1"])
+async def test_malformed_key_usage_is_none(usage_literal: str) -> None:
+    body = f'{{"data": {{"usage": {usage_literal}}}}}'
+    recorder = Recorder(httpx.Response(200, content=body.encode("utf-8")))
+
+    assert await client_for(recorder, roomy_ledger()).key_usage_usd() is None
