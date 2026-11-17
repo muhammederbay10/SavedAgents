@@ -108,7 +108,7 @@ flowchart TD
   B --> C[2. Classify + route — Gemini Decision 1 on the video, one pass<br/>choice: built-in type — place · movie/series · book · … · none of these<br/>yes/no: is it a list of several things?<br/>has speech = the file has an audio track + speech check]
   C --> T[3. Speech-to-text<br/>only if has speech]
   T --> X[4. Extract — text model<br/>caption + location tag + transcript<br/>→ category + tags in open words · entity candidates<br/>· the type's fields · summary]
-  X --> NV[Normalize open values against the vocabulary<br/>decision model: an existing value or 'new']
+  X --> NV[Normalize open values against the vocabulary<br/>exact hit → reuse · otherwise privacy gate,<br/>then decision model: an existing value or 'new']
   NV --> X2
   X2{Type needs an entity<br/>and none was found?}
   X2 -- "yes (e.g. silent reel)" --> V[Escalate: multimodal generative model<br/>watches the video itself]
@@ -152,17 +152,30 @@ SavedAgent works for **anything a user saves**, so it never forces a post into a
 
 **Phase 1 built-in types:** place, movie/series and study. Everything else uses an open category from day one.
 
-**Open values, kept consistent: the vocabulary.** Category, tags, cuisine, genre, subject, exam, format, subtype and similar fields are **open text**; there are **no value lists in code**. To stop "korean", "Korean food" and "Kore mutfağı" becoming three values, each new value goes through the **vocabulary**, a table that grows from real saves:
-1. The text model writes the value in its own words.
-2. Similar existing values are found (embedding search within the same field), and Gemini Decision 1 picks one of them or **"new"**.
-3. A match reuses the existing value and stores the new wording as an alias; "new" adds a value.
-4. User corrections update the item and, when they rename a value, its aliases.
+**Open values, kept consistent: the vocabulary.** Category, tags, cuisine, genre, subject, exam, format, subtype and similar fields are **open text**; there are **no value lists in code**. To stop "korean", "Korean food" and "Kore mutfağı" becoming three values, each new value goes through the **vocabulary**, a shared table that grows from real saves:
+1. The text model writes the value in its own words. The item keeps that wording in `raw_values`.
+2. **Exact hit (no model call):** if the wording, lower-cased and trimmed, equals a canonical value or a **verified** alias of the same field, that value is reused. This is the only shortcut.
+3. **Privacy gate:** any other wording must pass the gate (below) before it can touch the shared vocabulary. If it fails, the item keeps the wording as written, for this user only.
+4. **Match or new:** embedding search finds similar values in the same field, and Gemini Decision 1 picks one of them or **"new"**. A nearby vector is only a candidate, never a match on its own.
+   - **Match:** the item uses that value, and the wording is stored as a **candidate** alias.
+   - **New:** a new canonical value is added.
+5. A candidate alias becomes **verified** when the decision model has matched it to the same value with high confidence (`VOCAB_ALIAS_MIN_PROBABILITY`) for at least `VOCAB_ALIAS_MIN_USERS` different users, or when we confirm it in eval review. Only verified aliases count for the exact hit in step 2.
 
 Values are stored in one canonical form (English, lower case) with aliases in any language, so a question in Turkish, Spanish or English finds the same items. Search filters offer the values that **exist in this user's saves**.
 
+**Privacy gate: only generic words are shared.** The vocabulary has no link to any user and is used for everyone's normalization, so nothing personal may enter it, as a canonical value or as an alias:
+- Code checks first: text with an @handle, URL, email address or phone-like number, or longer than `VOCAB_MAX_VALUE_LENGTH`, is rejected.
+- Then Gemini Decision 1 yes/no: "Is this a generic word or phrase that could describe anyone's save, with no name, handle, contact or address of a private person, and nothing that describes the user themselves ('my diagnosis', 'my ex', 'grandma Ayşe's recipe')?" Only a confident yes (`VOCAB_PRIVACY_MIN_PROBABILITY`) passes. Uncertain counts as no.
+- Rejected wording stays on the user's own item (as its category, tag or field value), is still searchable by that user, and is deleted with "delete my data". It never becomes a candidate for anyone else.
+
+**Corrections move one item; synonyms need evidence.**
+- When a user corrects an item ("no, it's a travel video"), **only that item changes**: its category becomes "travel video", through the same steps as above. "Car review" and "travel video" are **not** made synonyms, and no other item, the user's or anyone else's, is touched. Values the user sets by hand are marked as such in `raw_values` and are never re-normalized.
+- The correction is counted against the alias that produced the wrong value. A candidate alias that gets corrected is not verified. A verified alias that collects corrections from several users is flagged for review.
+- **Undoing a wrong alias:** we mark it `rejected`, which stops future matches. Only the items that were matched through it (recorded in their `ENRICHMENT_RUN` normalize step) are re-normalized from their own `raw_values`. Items the user corrected by hand keep the user's choice.
+
 **Places are global.** Location fields come from Google Places' address components for any country: country, region or state, city, district, neighbourhood, plus coordinates. "Restaurants in Beşiktaş", "cafés in Brooklyn" and "bars in Shibuya" work the same way. A filter can match any of those levels.
 
-**Streaming platforms** come from TMDB's watch providers for the user's country (from their profile, or asked once). There is no platform list in code.
+**Streaming platforms differ by country**, so they're stored per movie **and** country in `ENTITY_AVAILABILITY` (§4), from TMDB's watch providers. Each row has its own `refreshed_at`, so refreshing a movie for a user in the US never changes what a user in Japan sees. A row is fetched when a user in that country saves or asks about the movie, and refreshed when it's older than `AVAILABILITY_MAX_AGE_DAYS`. Search and replies use the asking user's `country` (from their profile, or asked once). Provider names come from TMDB; there is no platform list in code.
 
 ### 3.5 Answering questions (light work, every message)
 
@@ -196,7 +209,7 @@ flowchart TD
 | `near(lat, lng, radius_m, subtype?, open_now?)` | PostGIS search around a point (places only) |
 | `deep_look(item_ids, question)` | Fans out parallel subagents (see diagram) for questions the index can't answer |
 | `get_item(id)` | Full details: entity info, original post link, why we matched it |
-| `update_item(id, fields)` | Fix mistakes ("no, it's the Bebek branch"), add notes |
+| `update_item(id, fields)` | Fix mistakes ("no, it's the Bebek branch", "it's a travel video"), add notes. Changes only this item and never adds a synonym (§3.4) |
 | `set_status(entity_id, status)` | Mark as visited / watched / read / done, or "want to" |
 | `resolve_choice(item_id, option)` | Handles the user's answer to a "which one?" question |
 | `list_memories()` / `forget_memory(id)` | "What do you remember about me?" / "Forget that" (§3.7) |
@@ -266,7 +279,7 @@ Every model sits behind a small provider interface (`generator.generate`, `class
 
 | Role | Model | Why | Watch out for |
 |---|---|---|---|
-| **Fixed decisions:** content type, subtype/tags, has-speech, is-list, which resolver candidate, filter normalization, deep-look yes/no, memory gate + consolidation | **Gemini Decision 1** (Google, `gemini-decision-1`, launched 11 Nov 2026) | Takes **text, images, audio, video and PDFs directly**. Typed outputs with calibrated probabilities, up to 1,000 questions per pass, ~50–100 ms model time (Google's figures), $0.10/M input tokens, output free | Brand new, and all benchmarks are Google's own. Video is still token-heavy, so cost scales with video length. Do counting, maths and dates in code |
+| **Fixed decisions:** content type, subtype/tags, has-speech, is-list, which resolver candidate, vocabulary privacy gate + match-or-new, filter normalization, deep-look yes/no, memory gate + consolidation | **Gemini Decision 1** (Google, `gemini-decision-1`, launched 11 Nov 2026) | Takes **text, images, audio, video and PDFs directly**. Typed outputs with calibrated probabilities, up to 1,000 questions per pass, ~50–100 ms model time (Google's figures), $0.10/M input tokens, output free | Brand new, and all benchmarks are Google's own. Video is still token-heavy, so cost scales with video length. Do counting, maths and dates in code |
 | **Speech-to-text** (posts with speech only) | Whisper-class model (e.g. faster-whisper large-v3 self-hosted, or a hosted STT API) | Many reels say the name out loud, in any language. Must handle many languages | Background music lowers accuracy. Keep word timestamps for debugging |
 | **Open-ended extraction** (entity names, type fields, summary) and **memory extraction** | DeepSeek V4.1 Flash (same provider as the response agent) | Names and summaries aren't fixed choices, so a decision model can't produce them. Text in, so it's cheap | Only as good as the caption + transcript it receives |
 | **Escalation:** watch the video when the text gave no entity | A multimodal generative model with native video + audio (e.g. Gemini Flash class) | Catches what the caption and speech missed (silent reels with text overlays, recognisable storefronts or movie scenes) | Most expensive per call. Track the escalation rate per type |
@@ -290,15 +303,18 @@ erDiagram
   SAVED_ITEM ||--o{ ENRICHMENT_RUN : "processed by"
   USER ||--o{ MEMORY : "long-term memory"
   USER ||--o{ CONVERSATION_MSG : has
+  ENTITY ||--o{ ENTITY_AVAILABILITY : "streaming per country"
+  VOCABULARY ||--o{ VOCABULARY_ALIAS : "wordings"
 
   USER { uuid id  text display_name  text home_area  text country  text language  timestamptz created_at }
   PLATFORM_ACCOUNT { uuid id  uuid user_id  text platform  text platform_user_id  text username }
   SAVED_ITEM {
     uuid id  uuid user_id  text platform  text platform_post_id  text post_url
     text media_type  text caption  text transcript  text summary
-    text type  text category  text subtype  text[] tags  text collection  jsonb fields  jsonb attributes
+    text type  text category  text subtype  text[] tags  text collection  jsonb fields  jsonb raw_values  jsonb attributes
     text status  vector embedding  timestamptz saved_at  text source_message_id
   }
+  ENTITY_AVAILABILITY { uuid entity_id  text country  jsonb providers  timestamptz refreshed_at }
   ENTITY {
     uuid id  text type  text source  text external_id  text name  jsonb data
     geography location  text country  text region  text city  text district  text neighbourhood  timestamptz refreshed_at
@@ -311,19 +327,24 @@ erDiagram
     uuid source_msg_id  uuid superseded_by  timestamptz created_at  timestamptz updated_at
   }
   CONVERSATION_MSG { uuid id  uuid user_id  text role  text content  timestamptz at }
-  VOCABULARY { uuid id  text field  text value  text[] aliases  vector embedding  int item_count  timestamptz created_at }
+  VOCABULARY { uuid id  text field  text value  vector embedding  int item_count  timestamptz created_at }
+  VOCABULARY_ALIAS { uuid id  uuid vocabulary_id  text alias  text status  float probability  int correction_count  timestamptz created_at }
 ```
 
 - **`ENTITY`** is the real-world thing: a restaurant, a movie, a book. It's shared across all users, one record per `(source, external_id)`, e.g. `(google_places, ChIJ…)` or `(tmdb, 27205)`. Types without a resolver (study, recipe…) have no entity, and their info lives in `SAVED_ITEM.fields`.
-- `location` and the address fields (`country`, `region`, `city`, `district`, `neighbourhood`) are only filled for places, from Google Places' address components for any country; any of them may be empty (PostGIS GIST index on `location`). Type-specific data goes in `data` (GIN index), e.g. genres and streaming providers for movies.
+- `location` and the address fields (`country`, `region`, `city`, `district`, `neighbourhood`) are only filled for places, from Google Places' address components for any country; any of them may be empty (PostGIS GIST index on `location`). Type-specific data goes in `data` (GIN index), e.g. genres and runtime for movies. Streaming providers are **not** in `data`, because they differ by country (see `ENTITY_AVAILABILITY`).
+- **`ENTITY_AVAILABILITY`** holds TMDB watch providers for one movie or series in one country, primary key `(entity_id, country)`, with its own `refreshed_at`. Retrieval joins on the asking user's `country`. It holds no user data.
 - **`ITEM_ENTITY`** is many-to-many, because one list post can mention several entities.
 - **`USER_ENTITY.status`**: `want | done` (visited / watched / read), per user. Memory and ranking use it.
 - `SAVED_ITEM.fields` holds the extracted type fields (e.g. `{"subject": "maths", "topic": "integrals", "format": "tutorial"}`). `attributes` holds facts learned later by deep look.
 - `SAVED_ITEM.status` goes `pending → enriching → needs_user → done | failed`.
 - `SAVED_ITEM.source_message_id` is the Instagram message id (`mid`) of the DM or collection save that brought the item in. Answers reply to it so the saved reel shows again (§3.5). It's empty for items from imports.
 - `SAVED_ITEM.category` is the open category the text model gives every item ("restaurant", "car review"), and `type` is the built-in type when one applies (empty otherwise). `subtype`, `tags` and open values inside `fields` use the vocabulary.
-- **`VOCABULARY`** holds one canonical value per `field` (category, tag, cuisine, genre, subject, exam…) in English lower case, with `aliases` in any language and an `embedding` for matching new wordings. It's shared by all users and grows from real saves (§3.4). It stores generic words only: anything personal stays on the item, so "delete my data" never needs to touch it, and a value no item uses any more can be cleaned up.
-- Opening hours, ratings and streaming availability go out of date, so refresh `ENTITY.data` regularly (e.g. every 30 days), and also when the user asks for `open_now` or a platform.
+- `SAVED_ITEM.raw_values` keeps the text model's own wording for each open value before normalization, and marks values the user set by hand. It lets us re-normalize the item if an alias is rejected, and holds wording that failed the privacy gate. It belongs to the item and is deleted with it.
+- **`VOCABULARY`** holds one canonical value per `field` (category, tag, cuisine, genre, subject, exam…) in English lower case, with an `embedding` for matching new wordings; `(field, value)` is unique. It's shared by all users, grows from real saves, and holds only wording that passed the privacy gate (§3.4).
+- **`VOCABULARY_ALIAS`** holds other wordings of a value, in any language, each with a `status`: `candidate` (one decision-model match), `verified` (confirmed, used for exact hits) or `rejected` (a wrong match, never used again). `probability` is the best match confidence seen, and `correction_count` counts user corrections against it. Which items matched through an alias is recorded in their `ENRICHMENT_RUN` normalize step, not here.
+- **"Delete my data"** removes the user's items with their `raw_values` and enrichment runs, and lowers each value's `item_count`. The vocabulary keeps only gated, generic wording with no link to any user. A value no item uses any more can be cleaned up.
+- Opening hours and ratings go out of date, so refresh `ENTITY.data` regularly (e.g. every 30 days), and also when the user asks for `open_now`. Streaming availability is refreshed per country (`ENTITY_AVAILABILITY`).
 
 ## 5. Tech stack
 
@@ -359,12 +380,11 @@ savedagent/
       deepseek.py           # text model: extraction + response agent
       multimodal.py         # video model for escalations
       embeddings.py
-    types/                  # content-type registry — one module per type
+    types/                  # built-in types only — one module each; items with no built-in type need none
       registry.py
       place.py              # schema, decision questions, filters, resolver
       movie.py
       study.py
-      other.py
     resolvers/
       google_places.py
       tmdb.py
@@ -374,6 +394,7 @@ savedagent/
       classify.py           # decision model on the video: type, tags, has-speech, is-list
       transcribe.py         # speech-to-text (only if has speech)
       extract.py            # text model with the type's schema; escalates to video model
+      normalize.py          # vocabulary: exact hit, privacy gate, match-or-new
       resolve.py            # type's resolver + decision-model candidate choice
       embed.py
       worker.py             # parallel fan-out for bulk imports
@@ -430,7 +451,7 @@ Instagram supports **collaborative collections**: you create a new collection, s
 
 **Phase 1: Instagram DM MVP (1–2 weeks)**
 - Ingestion → indexing pipeline (decision model on the video → speech-to-text → text-model extraction → resolver) → confirmation DM.
-- Content types: **place, movie/series, study, other**, with Google Places and TMDB resolvers.
+- Built-in types **place, movie/series and study**, with Google Places and TMDB resolvers. Everything else is saved with its open category and tags.
 - Response agent (DeepSeek) with `search_items`, `near`, `set_status`, hybrid SQL + vector retrieval, and fallback levels L1–L2.
 - Short-term memory (history + working set) and a basic always-on profile (home area, country, language).
 - "Which one?" follow-up when we're not sure.
