@@ -6,7 +6,7 @@ SavedAgent indexes posts you save on Instagram (later TikTok, X and Facebook) an
 - Rules for contributors and agents: [`AGENTS.md`](AGENTS.md)
 - Decision records: [`docs/decisions/`](docs/decisions/)
 
-This repository currently holds the project skeleton (a FastAPI app with a health endpoint, the database schema with its migrations, a local Docker stack and the development tooling) and the content-type registry.
+This repository currently holds the project skeleton (a FastAPI app with a health endpoint, the database schema with its migrations, a local Docker stack and the development tooling), the content-type registry and the Instagram webhook, which stores what users share with the bot and queues the work that follows.
 
 ## Requirements
 
@@ -27,7 +27,7 @@ source .venv/bin/activate
 make install                    # the app plus ruff, mypy and pytest
 ```
 
-The values in `.env.example` work as they are for local development.
+The values in `.env.example` work as they are for local development. To receive real webhooks from Meta, set the two `META_*` values as described under [Instagram webhook](#instagram-webhook).
 
 ## Run
 
@@ -105,6 +105,59 @@ TEST_DATABASE_ADMIN_URL=postgresql+asyncpg://savedagent:change-me@localhost:5432
 
 Each run creates its own databases named `savedagent_test_<random>` on that server and drops them at the end. It never reads or changes the `savedagent` database you develop against. The user in the URL must be allowed to create databases and extensions, which the Compose user is.
 
+### Redis tests
+
+Two tests check that a job really lands in Redis and that arq refuses a second job with the same id. They are **skipped** unless `TEST_REDIS_URL` is set. To run them, start the `redis` service and point the variable at it:
+
+```bash
+docker compose up --detach --wait redis
+TEST_REDIS_URL=redis://localhost:6379/0 make test
+```
+
+Each test queues one job under a random id and removes it again. No worker should be reading that Redis while the tests run. Both variables can be set in the same run.
+
+## Instagram webhook
+
+Users share posts and reels with the bot account by direct message, or save them into a collaborative collection the bot belongs to. Meta sends each message to the API as a `messages` webhook.
+
+| Endpoint | What it does |
+|---|---|
+| `GET /webhooks/instagram` | Meta's verification handshake. Returns `hub.challenge` when `hub.verify_token` equals `META_WEBHOOK_VERIFY_TOKEN`, and 403 otherwise |
+| `POST /webhooks/instagram` | Receives a webhook. Checks `X-Hub-Signature-256` against the raw body with `META_APP_SECRET` (401 if it is missing or wrong), stores the share or routes the text, queues a job and answers 200 |
+
+What happens to a message ([`app/adapters/instagram.py`](app/adapters/instagram.py), decision records 0002, 0003 and 0009):
+
+| Message | Result |
+|---|---|
+| A reel shared by DM (`ig_reel`) | A saved item with the reel's id, public link and caption |
+| A post shared by DM or saved into the collection (`ig_post`, or the older `share`) | A saved item with the post's id (`ig_post` only) and caption. The signed image link is passed to the indexing job and not stored |
+| A reel saved into the collection (`unsupported_type`) | A saved item with only its message id. The signed video link is passed to the indexing job and not stored |
+| A text sent at most `COLLECTION_HINT_WINDOW_SECONDS` after a share | Stored as that item's collection, e.g. "For my movies collection". No chat job |
+| Any other text | A chat job for the response agent |
+| Anything else (read receipts, reactions, the bot's own messages, other attachments) | Ignored, and logged without its content |
+
+- **First contact:** the first message from an Instagram account creates its `user` and `platform_account` rows.
+- **Message id:** every saved item keeps the id of the message it came in with (`source_message_id`), so answers can reply to it (decision record 0004).
+- **One item per post and per message:** sharing the same post twice, or a webhook that Meta delivers twice, creates one saved item. Two reels saved into the collection have no post id, so they stay two items (decision record 0007).
+- **Jobs:** new items are queued as `index_saved_item` and texts as `answer_chat_message` on Redis, through `arq` ([`app/ingestion/jobs.py`](app/ingestion/jobs.py)). The workers that run them come with the indexing pipeline and the response agent. Until then the jobs wait in Redis and expire after a day, and the items stay `pending`.
+- **Errors:** if Postgres or Redis is down, the endpoint answers 500 and Meta delivers the webhook again. Handling a webhook twice is safe.
+
+### Connect the Meta app
+
+Meta needs a public HTTPS address, so local development uses a tunnel.
+
+1. In `.env`, set `META_APP_SECRET` to the app's secret (Meta app dashboard → **App settings → Basic**) and `META_WEBHOOK_VERIFY_TOKEN` to any long random text.
+2. Start the stack and a tunnel:
+   ```bash
+   make up && make migrate
+   ngrok http 8000
+   ```
+3. In the Meta app go to **Use cases → Customize → API setup with Unified login → Configure webhooks**. Set the callback URL to `https://<your-tunnel>/webhooks/instagram` and the verify token to your `META_WEBHOOK_VERIFY_TOKEN`, then subscribe to `messages`.
+4. In **Generate access tokens**, generate a token for the bot account, then switch **Webhook Subscription** off and on again. No direct message arrived before this step (decision record 0002, finding 10).
+5. Send the bot a reel from an Instagram Tester account. `docker compose logs --follow api` shows `capture_ingested`.
+
+The dashboard's **Test** button sends a sample in another shape than real messages. It is answered with 200 and ignored.
+
 ## Database
 
 The schema is defined twice, and a test keeps the two in step:
@@ -141,11 +194,15 @@ All configuration comes from environment variables. Locally they live in `.env`,
 | `DATABASE_URL` | API | Postgres URL, e.g. `postgresql+asyncpg://user:password@host:5432/db` |
 | `REDIS_URL` | API | Redis URL, e.g. `redis://host:6379/0` |
 | `EMBEDDING_DIMENSION` | API, migrations | Length of the embedding vectors, 1 to 2000. Must match the embedding model: `1024` for `openai/text-embedding-3-large` (see [Database](#database)) |
+| `META_APP_SECRET` | API | The Meta app's secret. Every webhook is signed with it. **Secret** |
+| `META_WEBHOOK_VERIFY_TOKEN` | API | The text Meta repeats in the verification handshake. You choose it and enter it in the Meta app. **Secret** |
+| `COLLECTION_HINT_WINDOW_SECONDS` | API | A text sent this many seconds or less after a share becomes that item's collection hint. A whole number above 0 |
 | `TEST_DATABASE_ADMIN_URL` | Tests only | Postgres server for the database tests (see [Database tests](#database-tests)). Not read by the API |
+| `TEST_REDIS_URL` | Tests only | Redis server for the Redis tests (see [Redis tests](#redis-tests)). Not read by the API |
 | `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` | Docker Compose | Credentials and database name for the `db` container |
 | `API_PORT`, `POSTGRES_PORT`, `REDIS_PORT` | Docker Compose | Ports published on `127.0.0.1` |
 
-The API settings are defined in [`app/config.py`](app/config.py). None of them has a default, so the API refuses to start when one is missing or invalid. The error names the variable but never prints its value, because a URL can contain a password. Under Docker Compose, `DATABASE_URL` and `REDIS_URL` are built in `docker-compose.yml` from the `POSTGRES_*` values, so the two in `.env` are only used by `make run`.
+The API settings are defined in [`app/config.py`](app/config.py). None of them has a default, so the API refuses to start when one is missing or invalid. The error names the variable but never prints its value, because a URL can contain a password. The two secrets are also hidden when the settings are printed. Under Docker Compose, `DATABASE_URL` and `REDIS_URL` are built in `docker-compose.yml` from the `POSTGRES_*` values, so the two in `.env` are only used by `make run`.
 
 ## Logging
 
@@ -232,9 +289,19 @@ app/
   main.py             # FastAPI app factory and GET /health
   config.py           # settings from environment variables
   logging_config.py   # JSON logging setup
+  adapters/
+    base.py           # CaptureEvent and ChatMessage: what every adapter outputs
+    instagram.py      # signature check, webhook parsing → CaptureEvent / ChatMessage
+  api/
+    webhooks.py       # GET and POST /webhooks/instagram
+  ingestion/
+    service.py        # stores captures, routes texts, queues jobs
+    repository.py     # users on first contact, saved items, collection hints
+    jobs.py           # job names and ids, the arq queue
   types/              # content-type registry: one module per built-in type
   db/
     models.py         # SQLAlchemy models
+    session.py        # the API's engine and session factory
     types.py          # column types for pgvector and PostGIS
     deletion.py       # "delete my data" for one user
     migrations/       # Alembic environment and revisions

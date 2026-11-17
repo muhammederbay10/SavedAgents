@@ -80,9 +80,11 @@ class CaptureEvent(BaseModel):
 ```
 
 **Instagram DM bot (Phase 1).** The user shares a post or reel by DM to our Instagram professional account (`@savedagent`). Meta then sends a `messages` webhook:
-- Reels arrive as an `ig_reel` attachment with `title` (the caption), `url` and `video_id`.
-- Posts arrive as `ig_post`. Meta is replacing the old `share` type during 2026, so the adapter should accept both.
-- Plain text messages ("what's in Beşiktaş?") are routed to the **Response agent**, not the indexing pipeline. A text sent right after a share (e.g. "for my Movies collection") is attached as the `collection_hint`.
+- Reels arrive as an `ig_reel` attachment with `title` (the caption), `url` (the reel's public page) and `reel_video_id`.
+- Posts arrive as `ig_post`, with a signed link to the image instead of a public link. Meta is replacing the old `share` type during 2026, so the adapter accepts both.
+- A reel saved into a collaborative collection that the bot belongs to arrives as an `unsupported_type` attachment with only a signed link to the video file (decision record 0003).
+- A signed link is the `media_url`, never the `post_url`.
+- Plain text messages ("what's in Beşiktaş?") are routed to the **Response agent**, not the indexing pipeline. A text sent right after a share (e.g. "for my Movies collection") is attached as the `collection_hint`. "Right after" is a time window from config (`COLLECTION_HINT_WINDOW_SECONDS`); the share and the text are two separate webhooks (decision record 0009).
 - Every share keeps its message id (`mid`) as `source_message_id`. Answers later reply to that exact message, so the saved reel appears again in the chat (§3.5, decision record 0004).
 - Replies use the Send API. Instagram only allows replies within **24 hours** of the user's last message. That's fine for chat, but it means the bot **cannot send proactive alerts**, which need the mobile app (Phase 3).
 
@@ -93,6 +95,8 @@ class CaptureEvent(BaseModel):
 ### 3.2 Ingestion API
 - `GET /webhooks/instagram`: Meta's verification handshake (`hub.mode`, `hub.verify_token`, `hub.challenge`).
 - `POST /webhooks/instagram`: verify the `X-Hub-Signature-256` HMAC, check for duplicates by message id, map to a `CaptureEvent` or a chat message, **enqueue, and return 200 immediately**. Meta retries slow webhooks.
+- The first message from an account creates its `USER` and `PLATFORM_ACCOUNT`.
+- The webhook stores the `SAVED_ITEM` as `pending` and queues a job on Redis (`arq`): `index_saved_item` for a new item, `answer_chat_message` for a text. Each job has an id made from the item or the message, so a webhook that is delivered twice is queued once. If the database or the queue fails, the webhook is answered with an error and Meta delivers it again (decision record 0009).
 - `POST /import`: batch endpoint for the browser extension and data-export uploads.
 - Upsert by `(user_id, platform, platform_post_id)`, so sharing the same post twice doesn't create a duplicate. An item without a post id (a reel saved into a collaborative collection) is stored once per `(user_id, source_message_id)`, so a webhook that Meta delivers twice doesn't create one either. Two saves of the same reel are two messages, and stay two items (decision record 0007).
 
@@ -374,11 +378,15 @@ savedagent/
     config.py
     logging_config.py       # structured (JSON) logging setup
     adapters/
-      base.py
-      instagram.py          # webhook parsing → CaptureEvent / ChatMessage
+      base.py               # CaptureEvent and ChatMessage
+      instagram.py          # signature check, webhook parsing → CaptureEvent / ChatMessage
     api/
-      webhooks.py
+      webhooks.py           # Meta's handshake and the Instagram `messages` webhook
       imports.py
+    ingestion/
+      service.py            # stores captures, routes texts, queues jobs
+      repository.py         # users on first contact, saved items, collection hints
+      jobs.py               # job names and ids, the arq queue
     models/
       base.py               # Generator / Classifier / Transcriber / Embedder interfaces
       decision.py           # Gemini Decision 1 client
@@ -417,6 +425,7 @@ savedagent/
       longterm.py           # extract → gate → consolidate → retrieve
     db/
       models.py             # SQLAlchemy models for the tables in §4
+      session.py            # the API's engine and session factory
       types.py              # column types for pgvector and PostGIS
       deletion.py           # "delete my data": removes a user's rows, lowers vocabulary counts
       migrations/           # Alembic environment and revisions
