@@ -11,13 +11,13 @@ People save posts on Instagram all the time: a restaurant to try, a movie to wat
 **SavedAgent** is a chat agent for the things you save.
 1. You share a post or reel to our Instagram bot by DM, as easily as tapping Save.
 2. SavedAgent works out what the post is about (a place, a movie, a study tip, anything). It looks up the real thing behind it, such as the restaurant on Google Maps or the movie on TMDB, and indexes it once.
-3. Later you ask in plain language, in Turkish or English: "restaurants in Beşiktaş in my Food collection", "horror movies on Netflix I saved", "the maths study videos". It answers from your own saves, with links.
+3. Later you ask in plain language, in any language: "restaurants in Beşiktaş in my Food collection", "cafés in Brooklyn I saved", "horror movies on Netflix", "my car review videos". It answers from your own saves, with links.
 
 Instagram comes first. TikTok, X and Facebook follow through the same backend.
 
 ### Why it's worth building
 - **It solves a real, daily problem.** Collections are where saves go to be forgotten. Being able to filter by place, genre, platform or subject turns them into something useful.
-- **It works for any kind of content**, not just food. Places, movies, study material and other content types are plug-ins in one pipeline.
+- **It works for any kind of content, for anyone, anywhere.** Every save gets an open category ("restaurant", "car review", "guitar lesson"), so nothing is forced into a fixed list. Places work in any country, and questions and answers work in any language. Places, movies and the like get extra behaviour as built-in types (decision record 0005).
 - **It understands the video**, not just the caption. Many reels only say the restaurant's name out loud.
 - **It stays on the right side of the platforms.** It uses official APIs only and never asks for a user's password, so it can't get users' accounts banned.
 - **It's cheap to run.** Each post is analyzed once, when it's saved, so answering a question costs almost nothing.
@@ -81,6 +81,7 @@ pytest
 - **Small, single-purpose functions and modules.** If a function needs a comment to explain *what* it does, split it or rename it.
 - **Clear names.** `resolve_place_candidates()`, not `process()`. No abbreviations except well-known ones (`id`, `url`, `db`).
 - **No magic values.** Thresholds, model names, limits and URLs live in `app/config.py` (loaded from environment variables).
+- **No closed lists of real-world values, and nothing tied to one place or language.** Categories, cuisines, genres, subjects, platforms and areas come from real data through the vocabulary, Google Places or TMDB, never from an enum or list in code. Code must work for any country and any language (decision record 0005).
 - **No dead code.** No commented-out code, unused imports or "just in case" functions. Git remembers.
 - **Explicit errors.** No bare `except:` and no swallowed exceptions. Catch specific errors, add context, and re-raise or handle them.
 - **Logging, not `print`.** Use structured logging. Never log secrets, tokens, raw webhook bodies or personal data.
