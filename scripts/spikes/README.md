@@ -25,7 +25,7 @@ python -m scripts.spikes.model_choices \
   --media-dir /path/outside/the/repo/fleurs \
   --output-dir /path/outside/the/repo/results \
   --live \
-  --spent-so-far 0.08541
+  --spent-so-far <total charged so far>
 ```
 
 | Option | Meaning |
@@ -34,7 +34,7 @@ python -m scripts.spikes.model_choices \
 | `--unreferenced-dir` | Optional folder of extra PCM WAV clips without reference transcripts, such as audio taken from private reels |
 | `--output-dir` | Where `report.json` is written. Needed with `--live` |
 | `--live` | Send real, paid requests |
-| `--spent-so-far` | US dollars already charged for SAV-7 in earlier runs. Needed with `--live`. After the two rounds in record 0008 it is `0.08541` |
+| `--spent-so-far` | US dollars already charged for SAV-7 in earlier runs. Needed with `--live`. It was `0.08541` after rounds 1 and 2; later rounds add to it, so use the latest total reported on SAV-7 |
 | `--spend-cap` | Cumulative limit. Defaults to the owner's $2.00; it can be lowered but not raised |
 
 What keeps a live run inside the rules:

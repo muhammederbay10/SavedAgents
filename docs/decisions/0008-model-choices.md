@@ -1,6 +1,6 @@
 # 0008: Model choices, all through OpenRouter
 
-- Status: accepted by Muhammed in chat on 2026-11-17 (recorded on SAV-7 and in SAV-22's owner-approved updates). It is a first choice from a small test; the evals (SAV-19, SAV-20) re-check it.
+- Status: accepted by Muhammed in chat on 2026-11-17 (recorded on SAV-7 and in SAV-22's owner-approved updates), **except the escalation model, which is pending** a third round and Muhammed's decision. These are first choices from a small test; the evals (SAV-19, SAV-20) re-check them.
 - Date: 2026-11-17
 - Ticket: SAV-7 (the ticket first asked for `0003-…`, then `0005-…`; both numbers were taken, so this is `0008`)
 
@@ -8,7 +8,7 @@
 
 `docs/ARCHITECTURE.md` §3.9 names a model for each role, but none of them had been tried on our own saves. Gemini Decision 1 launched on 11 Nov 2026, the speech-to-text and embedding models were still open (SAV-22 §11), and Muhammed decided that every model call goes through **OpenRouter** with one key. SavedAgent is a product for **any language**, so a model that only handles Turkish and English is not enough.
 
-The Reviewer ran two rounds of live checks with Muhammed's approval, under a cap of $2 for the whole ticket. Muhammed then chose the models. This record keeps the two apart: [what was measured](#what-was-measured), and [what Muhammed decided](#decision).
+The Reviewer ran two rounds of live checks with Muhammed's approval, under a cap of $2 for the whole ticket. Muhammed then chose the models. This record keeps the two apart: [what was measured](#what-was-measured), and [what Muhammed decided](#decision). A third round is running for the escalation model; see [Pending](#pending-the-escalation-model-round-3).
 
 ## Decision
 
@@ -18,7 +18,7 @@ Every model call goes through OpenRouter (`https://openrouter.ai/api/v1`, key `O
 |---|---|---|
 | Fixed decisions | `google/gemini-decision-1` | `POST /api/alpha/decisions`: its own contract, with the media in `state`, typed questions, and probabilities in the answer. Not chat completions |
 | Extraction, response agent, memory extraction | `deepseek/deepseek-v4.1-flash` | `POST /api/v1/chat/completions` |
-| Escalation for silent reels | `google/gemini-2.5-flash` | `POST /api/v1/chat/completions`, with the video as input |
+| Escalation for silent reels | **Pending.** Not decided; see [Pending](#pending-the-escalation-model-round-3) | To be recorded with the model |
 | Speech-to-text | `microsoft/mai-transcribe-2`; fallback `openai/gpt-transcribe` | `POST /api/v1/audio/transcriptions` |
 | Embeddings | `openai/text-embedding-3-large` with `dimensions=1024` | `POST /api/v1/embeddings` |
 
@@ -28,7 +28,18 @@ Every model call goes through OpenRouter (`https://openrouter.ai/api/v1`, key `O
 4. **Speech gate.** The pipeline first checks whether the file has an audio track. No audio track means `has_speech=false`, and speech-to-text is skipped. For files with audio, model-based speech detection stays **provisional** (see [the speech-gate failure](#round-1-access-and-first-checks)).
 5. **Any language.** Speech-to-text, extraction, replies and evals must work in any language. Turkish examples are only examples.
 
-**Where the owner's choice differs from the measurements' proposal:** the Reviewer proposed `qwen/qwen3-embedding-8b` at 1024 dimensions, because both embedding models scored the same and Qwen was cheaper. Muhammed chose `openai/text-embedding-3-large` at 1024 dimensions ("Yes, with OpenAI"). Everything else follows the Reviewer's proposals.
+**Where the owner's choice differs from the measurements' proposal:** the Reviewer proposed `qwen/qwen3-embedding-8b` at 1024 dimensions, because both embedding models scored the same and Qwen was cheaper. Muhammed chose `openai/text-embedding-3-large` at 1024 dimensions ("Yes, with OpenAI"). The other decided rows follow the Reviewer's proposals.
+
+### Pending: the escalation model (round 3)
+
+Muhammed first approved `google/gemini-2.5-flash` for the escalation, then reopened that choice the same day. His reason: it is an older model, and it was only tested because the round 1 instructions said "Gemini Flash-class". **No escalation model is selected until he decides after round 3.**
+
+Round 3 compares five models through OpenRouter: `google/gemini-2.5-flash`, `qwen/qwen3.8-flash`, `z-ai/glm-5.3-flash`, `deepseek/deepseek-v4.1-flash-1017` and `openai/gpt-6.1-terra`.
+
+- **Escalation:** the round 1 test on the same three reels and their three muted copies, with one prompt and one JSON schema for every model. Models that take only images get frames sampled from the video, and are labelled as such.
+- **Extraction and response agent:** the round 1 extraction and tool-calling checks for the same five models, next to the current `deepseek/deepseek-v4.1-flash`. This part is a comparison only. `deepseek/deepseek-v4.1-flash` stays the approved model unless Muhammed changes it.
+
+Round 3's results, its charges and Muhammed's decision are added to this record when they exist. Nothing in this record is a round 3 result.
 
 ## What was measured
 
@@ -38,9 +49,9 @@ The Reviewer made all live calls. Charges are the `usage.cost` values OpenRouter
 |---|---|
 | Round 1 (16 Nov) | $0.02412 |
 | Round 2 (17 Nov) | $0.06130 |
-| **Total** | **$0.08541** of the $2.00 cap |
+| **Total of rounds 1 and 2** | **$0.08541** of the $2.00 cap |
 
-The key's own usage counter agreed with the total to rounding.
+The key's own usage counter agreed with the total to rounding. Round 3's charges are not in this table yet; it must stop before the ticket's total would pass $1.50.
 
 ### Round 1: access and first checks
 
@@ -148,14 +159,15 @@ The per-request metrics of both rounds stay next to the private test media, outs
 
 ## Consequences
 
-- **SAV-10 (model clients):** build the clients for OpenRouter with the ids and endpoints above. The decision client uses `/api/alpha/decisions`, not chat completions. The transcriber falls back to GPT on an error or an empty transcript, and marks language and timestamps as unavailable when they are missing. The embedder sends `dimensions=1024` and checks the returned size. Model ids, the base URL and `OPENROUTER_API_KEY` become settings in `app/config.py`, `.env.example` and the README there.
+- **SAV-10 (model clients):** build the clients for OpenRouter with the ids and endpoints above. The escalation model id is not known yet, so it must be a setting with no model assumed in code. The decision client uses `/api/alpha/decisions`, not chat completions. The transcriber falls back to GPT on an error or an empty transcript, and marks language and timestamps as unavailable when they are missing. The embedder sends `dimensions=1024` and checks the returned size. Model ids, the base URL and `OPENROUTER_API_KEY` become settings in `app/config.py`, `.env.example` and the README there.
 - **SAV-9 (schema):** embedding columns have 1024 dimensions.
 - **SAV-14 (pipeline):** check for an audio track before speech-to-text, and skip speech-to-text when there is none. The speech decision for files with audio is provisional (open point 1).
 - **SAV-19, SAV-20 (evals):** score speech-to-text, extraction and retrieval on labelled saves in more than one language, and track how often the fallback and the escalation run.
-- **`docs/ARCHITECTURE.md` §3.9 and §5** are updated to these models in this ticket, after SAV-26's design change lands, because SAV-26 edits the same sections.
+- **`docs/ARCHITECTURE.md` §3.9 and §5** are updated to these models in this ticket, after SAV-26's design change lands, because SAV-26 edits the same sections. The escalation row stays "pending" there until Muhammed decides.
 - **Switching the embedding model later** means re-embedding every item.
 
 ## Open points for Muhammed
 
 1. **Speech detection for files with audio.** An audio track doesn't mean speech (a reel can have only music). No detector is chosen yet, so SAV-14 needs a rule for files that have audio.
 2. **Where DeepSeek runs.** OpenRouter routed `deepseek/deepseek-v4.1-flash` to more than one provider. Whether to pin a provider for user data (SAV-22 §11, question 3) is still open.
+3. **The escalation model.** Pending round 3 (see [Pending](#pending-the-escalation-model-round-3)). Round 3 may also lead Muhammed to change the extraction and response-agent model; until he says so, it stays `deepseek/deepseek-v4.1-flash`.
