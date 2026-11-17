@@ -188,7 +188,7 @@ The dimension stays a setting, so another model can be tried on a fresh database
 
 ## Configuration
 
-All configuration comes from environment variables. Locally they live in `.env`, and `.env.example` lists every variable.
+All configuration comes from environment variables. Locally they live in `.env`, and `.env.example` lists every variable. The variables of the model clients have their own table under [Model settings](#model-settings).
 
 | Variable | Used by | Meaning |
 |---|---|---|
@@ -225,6 +225,119 @@ What the logging setup does for you:
 - `LOG_LEVEL` applies to every logger, including uvicorn's and other libraries'.
 - There is no access log. Uvicorn's access records hold the client's address and the full query string, so they are switched off. To see a request in the logs, log it from the application code, without personal data.
 - The API is started with `--ws none`. It has no WebSocket endpoints, and uvicorn would otherwise log the address and query string of every WebSocket handshake.
+
+## Models
+
+Every model call goes through [OpenRouter](https://openrouter.ai) with one key, and every model sits behind a small interface in [`app/models/base.py`](app/models/base.py). Which model serves a role is a setting, so a model is swapped in `.env` without a code change. The choices and their measurements are in decision record 0008 (SAV-7); how the clients work is in [0010](docs/decisions/0010-model-clients.md).
+
+| Interface | Role | Model (setting) | Endpoint |
+|---|---|---|---|
+| `Classifier.decide` | Fixed decisions: typed questions answered with probabilities | `google/gemini-decision-1` (`DECISION_MODEL`) | `POST /api/alpha/decisions`, its own contract, not chat completions |
+| `Transcriber.transcribe` | Speech-to-text | `microsoft/mai-transcribe-2` (`TRANSCRIPTION_MODEL`), then `openai/gpt-transcribe` (`TRANSCRIPTION_FALLBACK_MODEL`) | `POST /api/v1/audio/transcriptions` |
+| `Generator.generate` | Extraction and the response agent: text, JSON that follows a schema, tool calls | `deepseek/deepseek-v4.1-flash` (`TEXT_MODEL`), pinned to one provider | `POST /api/v1/chat/completions` |
+| `Generator.generate` | Escalation: watch the video when the text gave no entity | `google/gemini-2.5-flash` (`ESCALATION_MODEL`) | `POST /api/v1/chat/completions`, with the video inline |
+| `Embedder.embed` | Embeddings | `openai/text-embedding-3-large` (`EMBEDDING_MODEL`) at `EMBEDDING_DIMENSION` | `POST /api/v1/embeddings` |
+
+```python
+from app.config import get_model_settings
+from app.models.base import GenerationRequest, Message, YesNoQuestion
+from app.models.factory import build_model_clients, open_http_client
+
+settings = get_model_settings()
+async with open_http_client(settings) as http_client:
+    models = build_model_clients(settings, http_client)
+
+    decision = await models.classifier.decide(
+        ["the caption", video], [YesNoQuestion("is_list", "Is this a list of several things?")]
+    )
+    transcript = await models.transcriber.transcribe(audio)
+    reply = await models.text_generator.generate(
+        GenerationRequest(messages=[Message(role="user", content="…")])
+    )
+    vectors = await models.embedder.embed(["a cosy café"])
+```
+
+**The boundary.** Code outside `app/models/` imports only `app.models.base` (the interfaces), `app.models.errors` and `app.models.factory`. It never imports a model SDK, a client class or the HTTP transport. `tests/test_model_boundary.py` fails if it does.
+
+**In tests, use the fakes** in [`app/models/fakes.py`](app/models/fakes.py): `FakeClassifier`, `FakeTranscriber`, `FakeGenerator` and `FakeEmbedder`. They make no network call, return what the test scripted (or raise a scripted error), and record the calls they received.
+
+**What the results tell you**
+
+- **Decisions:** one answer per question, by key. A question the model refused, left out or answered unusably comes back as `Unanswered`; the others stay valid.
+- **Transcripts:** `model` is the model whose answer it is, and `attempts` lists every model that was asked. `language`, `segments` and `words` are `None` when the model did not return them, which is always the case for the fallback model. **An empty transcript is a result, not an error:** it means no model heard words. A **failure** is raised as `TranscriptionFailedError`, and only when both models failed. The full table is in [record 0010](docs/decisions/0010-model-clients.md#speech-to-text-an-empty-transcript-is-a-result-a-failure-is-an-error).
+- **Generation:** `structured` holds the parsed JSON when a schema was requested. `tool_calls` holds the calls with parsed arguments.
+- **Embeddings:** every vector has exactly `EMBEDDING_DIMENSION` components, or the call raises `EmbeddingDimensionError`.
+
+**Errors** are all subclasses of `ModelError` ([`app/models/errors.py`](app/models/errors.py)). A call that times out, is rate-limited or hits a server error is retried with a doubling wait (`OPENROUTER_MAX_ATTEMPTS`, `OPENROUTER_RETRY_*`); anything else fails at once.
+
+| Error | Meaning |
+|---|---|
+| `ModelRequestError` | The request was rejected. Subclasses: `ModelAuthenticationError` (key refused), `ModelCreditsError` (out of credits) |
+| `ModelRateLimitError`, `ModelUnavailableError` | Still rate-limited, or timeouts and server errors, after the last attempt |
+| `ProviderRouteUnavailableError` | The pinned provider cannot serve the call, and no other provider is allowed |
+| `ProviderPinViolationError` | Another provider than the pinned one answered. The reply is discarded |
+| `ModelResponseError` | The answer was unusable. Subclasses: `SchemaOutputError`, `EmbeddingDimensionError` |
+| `TranscriptionFailedError` | Both speech-to-text models failed |
+
+**Nothing private is logged.** Logs and error messages hold the operation, the model, the HTTP status and the attempt number. They never hold the key, a caption, a transcript, a message, media, or a provider's own error text.
+
+### The DeepSeek provider pin
+
+DeepSeek's own API is hosted in China, and OpenRouter by default sends a model to whichever provider it likes. So the text model is **pinned to one provider endpoint hosted outside China**, and the pin is a setting:
+
+```bash
+TEXT_MODEL_PROVIDER=coreweave/fp8     # the endpoint's OpenRouter slug
+TEXT_MODEL_PROVIDER_NAME=CoreWeave    # the name OpenRouter reports for it in a response
+```
+
+- **Every request allows only that endpoint:** `provider: {"only": [slug], "order": [slug], "allow_fallbacks": false}`.
+- **Every reply is checked:** if OpenRouter's `provider` field is missing or names anyone else, the reply is discarded with `ProviderPinViolationError`.
+- **No route means an error, never another host.** If the endpoint cannot serve a call (OpenRouter answers 404 or 503; a 503 is retried first), `generate` raises `ProviderRouteUnavailableError`.
+
+**Why CoreWeave** (evidence read on 17 Nov 2026; the full comparison is in [record 0010](docs/decisions/0010-model-clients.md#the-provider-that-serves-deepseek)):
+
+- OpenRouter's provider list gives CoreWeave `datacenters: ["US"]`.
+- CoreWeave's own list of all its availability zones has 60 zones in the United States, Canada and Europe, and none in China or elsewhere in Asia.
+- CoreWeave lists DeepSeek V4.1 Flash among its hosted models, and OpenRouter's endpoint supports JSON-schema output and tool calls.
+
+No page says which zone serves the endpoint, and **no live call has confirmed the route yet**. The choice is waiting for the owner's confirmation. To change the provider, change both variables and add the new provider's serving-region evidence to a decision record. A company's home country alone is not evidence.
+
+### Model settings
+
+The model clients read these variables through `ModelSettings` in [`app/config.py`](app/config.py), with `get_model_settings()`. It is a separate class from the API's `Settings`: the API and the migrations call no model, so they start without these. The same rules apply: no variable has a default, and an error names the variable without printing its value. The values in `.env.example` are the approved models; only `OPENROUTER_API_KEY` needs a real value, and only for real model calls.
+
+| Variable | Meaning |
+|---|---|
+| `OPENROUTER_API_KEY` | The one key for every model call. Never commit a real one |
+| `OPENROUTER_BASE_URL` | Base URL for chat completions, transcriptions and embeddings: `https://openrouter.ai/api/v1`. Must be `https` |
+| `OPENROUTER_DECISIONS_URL` | Full URL of the decisions endpoint, which is not chat completions: `https://openrouter.ai/api/alpha/decisions`. Must be `https` |
+| `OPENROUTER_MAX_ATTEMPTS` | How often one call is tried in total when it times out, is rate-limited or hits a server error. At least 1 |
+| `OPENROUTER_RETRY_BASE_DELAY_SECONDS`, `OPENROUTER_RETRY_MAX_DELAY_SECONDS` | The wait before the second try, which doubles each time, and the longest wait |
+| `DECISION_MODEL`, `DECISION_TIMEOUT_SECONDS` | Decision model id (`google/gemini-decision-1`) and the time limit of one request |
+| `TEXT_MODEL`, `TEXT_TIMEOUT_SECONDS` | Text model id (`deepseek/deepseek-v4.1-flash`) and the time limit of one request |
+| `TEXT_MODEL_PROVIDER` | The one provider endpoint that may serve the text model, as an OpenRouter slug (`coreweave/fp8`). Must be hosted outside China. See [The DeepSeek provider pin](#the-deepseek-provider-pin) |
+| `TEXT_MODEL_PROVIDER_NAME` | The name OpenRouter reports for that provider in a response (`CoreWeave`). A reply that names another provider is discarded |
+| `ESCALATION_MODEL`, `ESCALATION_TIMEOUT_SECONDS` | Video model id (`google/gemini-2.5-flash`) and the time limit of one request |
+| `TRANSCRIPTION_MODEL`, `TRANSCRIPTION_RESPONSE_FORMAT` | Default speech-to-text model (`microsoft/mai-transcribe-2`) and its response format: `verbose_json` (with language and timestamps) or `json` |
+| `TRANSCRIPTION_FALLBACK_MODEL`, `TRANSCRIPTION_FALLBACK_RESPONSE_FORMAT` | The model asked when the default fails or returns no words (`openai/gpt-transcribe`, which only accepts `json`) |
+| `TRANSCRIPTION_TIMEOUT_SECONDS` | Time limit of one transcription request, for either model |
+| `EMBEDDING_MODEL`, `EMBEDDING_TIMEOUT_SECONDS` | Embedding model id (`openai/text-embedding-3-large`) and the time limit of one request. The vector size is `EMBEDDING_DIMENSION` |
+| `EMBEDDING_DIMENSION` | Shared with the database (see [Configuration](#configuration)): the vector size the embedding model is asked for, and the size every returned vector must have |
+
+The Compose `api` service does not receive these variables yet, because the API calls no model. The ticket that first calls a model from a container adds them to `docker-compose.yml`.
+
+### Live smoke tests
+
+`tests/live/` holds one real call per model client. They are **skipped** unless both `LIVE_MODEL_TESTS=1` and `OPENROUTER_API_KEY` are set, so `make check` never spends money. They send only invented text and one second of generated silence, and cost a fraction of a cent together. **A live run needs the owner's approval first.**
+
+Tests do not read `.env`, so load it into your shell first:
+
+```bash
+set -a; source .env; set +a
+LIVE_MODEL_TESTS=1 pytest -m live
+```
+
+The text-model test also checks that the reply came from the pinned provider. Sending a video to the escalation model is not covered: the test sends text only.
 
 ## Content types
 
@@ -304,6 +417,7 @@ app/
     session_state.py  # per-user state in Redis: payloads, text receipts, recent shares
     erasure.py        # erases a user's Redis state and jobs for "delete my data"
   types/              # content-type registry: one module per built-in type
+  models/             # model interfaces, OpenRouter clients, fakes (see "Models")
   db/
     models.py         # SQLAlchemy models
     session.py        # the API's engine and session factory

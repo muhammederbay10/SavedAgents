@@ -392,11 +392,17 @@ savedagent/
       erasure.py            # erases a user's Redis state and jobs for "delete my data"
     models/
       base.py               # Generator / Classifier / Transcriber / Embedder interfaces
+      errors.py             # error types of model calls
+      openrouter.py         # shared HTTP transport: key, timeouts, retries, error mapping
+      wire.py               # JSON helpers shared by the clients
       decision.py           # Gemini Decision 1 client
-      transcriber.py        # speech-to-text provider
-      deepseek.py           # text model: extraction + response agent
+      transcriber.py        # speech-to-text: default model + fallback
+      chat_completions.py   # Generator over chat completions, with the provider pin
+      deepseek.py           # text model: extraction + response agent, pinned to one provider
       multimodal.py         # video model for escalations
       embeddings.py
+      factory.py            # builds every client from the settings
+      fakes.py              # fake implementations of the interfaces, for tests
     types/                  # built-in types only — one module each; items with no built-in type need none
       base.py               # what a type declares: ContentType, filters, schema bases, vocabulary marks
       registry.py           # the list of types, looked up by name
@@ -438,6 +444,8 @@ savedagent/
   scripts/spikes/           # reproducible experiments behind decision records
   tests/
     fixtures/webhooks/      # real (anonymized) webhook payloads
+    fixtures/openrouter/    # model responses written from the provider's documentation
+    live/                   # opt-in smoke tests that call the real models
   docker/postgres/          # Postgres 16 image with PostGIS + pgvector
   docker-compose.yml
   alembic.ini               # Alembic configuration
