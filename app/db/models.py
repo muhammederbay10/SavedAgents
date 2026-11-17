@@ -6,8 +6,8 @@ the two drift apart.
 
 Deleting a `user` row deletes everything that belongs to that user: platform
 accounts, saved items (with their entity links and enrichment runs), entity
-statuses and conversation messages. `entity` rows are shared between users and
-stay.
+statuses and conversation messages. `entity` and `vocabulary` rows are shared
+between users and stay.
 """
 
 import uuid
@@ -40,7 +40,7 @@ JsonObject = dict[str, Any]
 
 # Postgres text-search configuration for the full-text index. "simple" splits
 # and lowercases words without language-specific stemming, because saved posts
-# mix Turkish and English.
+# can be in any language.
 FULL_TEXT_SEARCH_CONFIG = "simple"
 
 NAMING_CONVENTION = {
@@ -79,6 +79,12 @@ def _one_of(column_name: str, values: type[StrEnum]) -> str:
     return f"{column_name} IN ({quoted_values})"
 
 
+def _not_empty(column_name: str) -> str:
+    # A missing value must be NULL. An empty string would count as a real value
+    # in the unique keys, so two items without an id would collide.
+    return f"{column_name} <> ''"
+
+
 class Base(DeclarativeBase):
     """Base class of every model. Its metadata names constraints predictably."""
 
@@ -94,7 +100,8 @@ class User(Base):
         UUID(as_uuid=True), primary_key=True, server_default=_GENERATED_UUID
     )
     display_name: Mapped[str | None] = mapped_column(Text)
-    home_city: Mapped[str | None] = mapped_column(Text)
+    home_area: Mapped[str | None] = mapped_column(Text)
+    country: Mapped[str | None] = mapped_column(Text)
     language: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
@@ -115,13 +122,31 @@ class PlatformAccount(Base):
 
 
 class SavedItem(Base):
-    """One post a user saved, with everything indexing learned about it."""
+    """One post a user saved, with everything indexing learned about it.
+
+    A user's item is stored once per post id and once per message id, whichever
+    it has. Every item has a post id, a message id or a post link, so it can
+    always be shown back to the user (decision record 0007).
+    """
 
     __tablename__ = "saved_item"
     __table_args__ = (
         UniqueConstraint("user_id", "platform", "platform_post_id"),
+        Index(
+            "uq_saved_item_user_id_source_message_id",
+            "user_id",
+            "source_message_id",
+            unique=True,
+            postgresql_where=text("source_message_id IS NOT NULL"),
+        ),
+        CheckConstraint(
+            "platform_post_id IS NOT NULL OR source_message_id IS NOT NULL OR post_url IS NOT NULL",
+            name="has_post_id_message_id_or_post_url",
+        ),
+        CheckConstraint(_not_empty("platform_post_id"), name="platform_post_id_is_not_empty"),
+        CheckConstraint(_not_empty("source_message_id"), name="source_message_id_is_not_empty"),
+        CheckConstraint(_not_empty("post_url"), name="post_url_is_not_empty"),
         CheckConstraint(_one_of("status", ItemStatus), name="status_is_known"),
-        Index("ix_saved_item_user_id_source_message_id", "user_id", "source_message_id"),
         Index("ix_saved_item_fields", "fields", postgresql_using="gin"),
         Index(
             "ix_saved_item_embedding",
@@ -137,12 +162,13 @@ class SavedItem(Base):
     user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("user.id", ondelete=_DELETE_WITH_PARENT))
     platform: Mapped[str] = mapped_column(Text)
     platform_post_id: Mapped[str | None] = mapped_column(Text)
-    post_url: Mapped[str] = mapped_column(Text)
+    post_url: Mapped[str | None] = mapped_column(Text)
     media_type: Mapped[str | None] = mapped_column(Text)
     caption: Mapped[str | None] = mapped_column(Text)
     transcript: Mapped[str | None] = mapped_column(Text)
     summary: Mapped[str | None] = mapped_column(Text)
     type: Mapped[str | None] = mapped_column(Text)
+    category: Mapped[str | None] = mapped_column(Text)
     subtype: Mapped[str | None] = mapped_column(Text)
     tags: Mapped[list[str]] = mapped_column(ARRAY(Text), server_default=_EMPTY_TEXT_ARRAY)
     collection: Mapped[str | None] = mapped_column(Text)
@@ -205,8 +231,11 @@ class Entity(Base):
     name: Mapped[str] = mapped_column(Text)
     data: Mapped[JsonObject] = mapped_column(JSONB, server_default=_EMPTY_JSON_OBJECT)
     location: Mapped[GeoPoint | None] = mapped_column(GeographyPoint())
-    district: Mapped[str | None] = mapped_column(Text)
+    country: Mapped[str | None] = mapped_column(Text)
+    region: Mapped[str | None] = mapped_column(Text)
     city: Mapped[str | None] = mapped_column(Text)
+    district: Mapped[str | None] = mapped_column(Text)
+    neighbourhood: Mapped[str | None] = mapped_column(Text)
     refreshed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -273,3 +302,25 @@ class ConversationMessage(Base):
     role: Mapped[str] = mapped_column(Text)
     content: Mapped[str] = mapped_column(Text)
     at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class Vocabulary(Base):
+    """One canonical value of an open field, such as a category, a tag or a cuisine.
+
+    Shared by all users, one row per `(field, value)`. It holds generic words
+    only and nothing personal, so it belongs to no user and stays when a user
+    is deleted.
+    """
+
+    __tablename__ = "vocabulary"
+    __table_args__ = (UniqueConstraint("field", "value"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=_GENERATED_UUID
+    )
+    field: Mapped[str] = mapped_column(Text)
+    value: Mapped[str] = mapped_column(Text)
+    aliases: Mapped[list[str]] = mapped_column(ARRAY(Text), server_default=_EMPTY_TEXT_ARRAY)
+    embedding: Mapped[list[float] | None] = mapped_column(Vector())
+    item_count: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

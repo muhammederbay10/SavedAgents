@@ -18,6 +18,7 @@ SCHEMA_TABLES = {
     "user_entity",
     "enrichment_run",
     "conversation_msg",
+    "vocabulary",
 }
 # Alembic's own bookkeeping table and the table PostGIS creates for itself.
 TABLES_OUTSIDE_THE_SCHEMA = {"alembic_version", "spatial_ref_sys"}
@@ -26,9 +27,9 @@ OTHER_EMBEDDING_DIMENSION = 12
 
 LIST_TABLES = "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
 LIST_EXTENSIONS = "SELECT extname FROM pg_extension"
-EMBEDDING_COLUMN_TYPE = (
-    "SELECT format_type(atttypid, atttypmod) FROM pg_attribute "
-    "WHERE attrelid = 'saved_item'::regclass AND attname = 'embedding'"
+EMBEDDING_COLUMN_TYPES = (
+    "SELECT attrelid::regclass::text, format_type(atttypid, atttypmod) FROM pg_attribute "
+    "WHERE attname = 'embedding' AND attrelid IN ('saved_item'::regclass, 'vocabulary'::regclass)"
 )
 
 
@@ -59,7 +60,7 @@ def test_downgrade_base_removes_every_table_and_upgrade_works_again(
     assert schema_tables(empty_database_url) == SCHEMA_TABLES
 
 
-def test_embedding_column_gets_the_configured_dimension(
+def test_embedding_columns_get_the_configured_dimension(
     empty_database_url: URL, tmp_path: Path
 ) -> None:
     run_alembic(
@@ -70,8 +71,11 @@ def test_embedding_column_gets_the_configured_dimension(
         embedding_dimension=OTHER_EMBEDDING_DIMENSION,
     )
 
-    rows = fetch_all(empty_database_url, EMBEDDING_COLUMN_TYPE)
-    assert rows[0][0] == f"vector({OTHER_EMBEDDING_DIMENSION})"
+    column_types = dict(tuple(row) for row in fetch_all(empty_database_url, EMBEDDING_COLUMN_TYPES))
+    assert column_types == {
+        "saved_item": f"vector({OTHER_EMBEDDING_DIMENSION})",
+        "vocabulary": f"vector({OTHER_EMBEDDING_DIMENSION})",
+    }
 
 
 def test_models_describe_the_same_schema_as_the_migrations(

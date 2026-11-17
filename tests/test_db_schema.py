@@ -26,6 +26,7 @@ from app.db.models import (
     SavedItem,
     User,
     UserEntity,
+    Vocabulary,
     saved_item_search_vector,
 )
 from app.db.types import GeographyPoint, GeoPoint
@@ -35,6 +36,7 @@ INSTAGRAM = "instagram"
 REEL_ID = "18000000000000201"
 OTHER_REEL_ID = "18000000000000202"
 REEL_URL = "https://www.instagram.com/reel/FAKEREEL002/"
+OTHER_REEL_URL = "https://www.instagram.com/reel/FAKEREEL006/"
 MESSAGE_ID = "aWdfZAGFAKEMID0002"
 OTHER_MESSAGE_ID = "aWdfZAGFAKEMID0008"
 SENDER_ID = "1000000000000001"
@@ -54,7 +56,9 @@ EXPECTED_INDEX_DEFINITIONS = {
     "ix_saved_item_fields": "USING gin (fields)",
     "ix_saved_item_embedding": "USING hnsw (embedding vector_cosine_ops)",
     "ix_saved_item_full_text": "USING gin (to_tsvector(",
-    "ix_saved_item_user_id_source_message_id": "USING btree (user_id, source_message_id)",
+    "uq_saved_item_user_id_source_message_id": (
+        "USING btree (user_id, source_message_id) WHERE (source_message_id IS NOT NULL)"
+    ),
 }
 
 
@@ -74,6 +78,13 @@ def reel_saved_by(user: User, **overrides: object) -> SavedItem:
         "media_type": "reel",
     }
     return SavedItem(**{**values, **overrides})
+
+
+def collection_save_by(user: User, message_id: str) -> SavedItem:
+    """A reel saved into a collaborative collection: a message id, no post id and no link."""
+    return SavedItem(
+        user_id=user.id, platform=INSTAGRAM, media_type="reel", source_message_id=message_id
+    )
 
 
 def place(external_id: str, name: str, location: GeoPoint | None = None) -> Entity:
@@ -118,7 +129,7 @@ async def query_plan_without_sequential_scans(
     return "\n".join(row[0] for row in plan)
 
 
-# --- saved_item: unique key ---------------------------------------------------
+# --- saved_item: dedupe keys (decision record 0007) ----------------------------
 
 
 async def test_duplicate_share_of_a_post_by_one_user_is_rejected(db_session: AsyncSession) -> None:
@@ -153,18 +164,96 @@ async def test_same_post_id_on_another_platform_is_a_different_item(
     assert await count_rows(db_session, SavedItem, SavedItem.user_id == user.id) == 2
 
 
-async def test_items_without_a_post_id_do_not_collide(db_session: AsyncSession) -> None:
+async def test_same_message_stored_twice_for_one_user_is_rejected(
+    db_session: AsyncSession,
+) -> None:
+    user = await add_user(db_session)
+    db_session.add(collection_save_by(user, MESSAGE_ID))
+    await db_session.flush()
+
+    db_session.add(collection_save_by(user, MESSAGE_ID))
+
+    with pytest.raises(IntegrityError, match="uq_saved_item_user_id_source_message_id"):
+        await db_session.flush()
+
+
+async def test_same_message_is_rejected_even_when_the_post_ids_differ(
+    db_session: AsyncSession,
+) -> None:
+    user = await add_user(db_session)
+    db_session.add(reel_saved_by(user, source_message_id=MESSAGE_ID))
+    await db_session.flush()
+
+    db_session.add(
+        reel_saved_by(user, platform_post_id=OTHER_REEL_ID, source_message_id=MESSAGE_ID)
+    )
+
+    with pytest.raises(IntegrityError, match="uq_saved_item_user_id_source_message_id"):
+        await db_session.flush()
+
+
+async def test_two_users_can_have_the_same_message_id(db_session: AsyncSession) -> None:
+    first_user = await add_user(db_session)
+    second_user = await add_user(db_session)
+
+    db_session.add_all(
+        [collection_save_by(first_user, MESSAGE_ID), collection_save_by(second_user, MESSAGE_ID)]
+    )
+    await db_session.flush()
+
+    assert await count_rows(db_session, SavedItem, SavedItem.source_message_id == MESSAGE_ID) == 2
+
+
+async def test_same_reel_saved_through_two_messages_is_stored_twice(
+    db_session: AsyncSession,
+) -> None:
+    # The accepted limit of decision record 0007: without a post id the keys tell
+    # messages apart, not reels, and nothing in the payload links the two saves.
+    user = await add_user(db_session)
+
+    db_session.add_all(
+        [collection_save_by(user, MESSAGE_ID), collection_save_by(user, OTHER_MESSAGE_ID)]
+    )
+    await db_session.flush()
+
+    assert await count_rows(db_session, SavedItem, SavedItem.user_id == user.id) == 2
+
+
+async def test_items_with_only_a_post_link_are_accepted_and_do_not_collide(
+    db_session: AsyncSession,
+) -> None:
     user = await add_user(db_session)
 
     db_session.add_all(
         [
-            reel_saved_by(user, platform_post_id=None, source_message_id=MESSAGE_ID),
-            reel_saved_by(user, platform_post_id=None, source_message_id=OTHER_MESSAGE_ID),
+            SavedItem(user_id=user.id, platform=INSTAGRAM, post_url=REEL_URL),
+            SavedItem(user_id=user.id, platform=INSTAGRAM, post_url=OTHER_REEL_URL),
         ]
     )
     await db_session.flush()
 
     assert await count_rows(db_session, SavedItem, SavedItem.user_id == user.id) == 2
+
+
+async def test_item_without_post_id_message_id_or_post_link_is_rejected(
+    db_session: AsyncSession,
+) -> None:
+    user = await add_user(db_session)
+    db_session.add(SavedItem(user_id=user.id, platform=INSTAGRAM, caption="A caption"))
+
+    with pytest.raises(IntegrityError, match="ck_saved_item_has_post_id_message_id_or_post_url"):
+        await db_session.flush()
+
+
+@pytest.mark.parametrize("column", ["platform_post_id", "source_message_id", "post_url"])
+async def test_empty_text_is_rejected_where_a_missing_value_must_be_null(
+    db_session: AsyncSession, column: str
+) -> None:
+    user = await add_user(db_session)
+    db_session.add(reel_saved_by(user, **{column: ""}))
+
+    with pytest.raises(IntegrityError, match=f"ck_saved_item_{column}_is_not_empty"):
+        await db_session.flush()
 
 
 # --- saved_item: defaults and status -------------------------------------------
@@ -184,6 +273,21 @@ async def test_new_item_starts_pending_with_empty_tags_and_fields(db_session: As
     assert item.attributes == {}
     assert item.saved_at is not None
     assert item.source_message_id is None
+
+
+async def test_item_keeps_an_open_category_without_a_built_in_type(
+    db_session: AsyncSession,
+) -> None:
+    user = await add_user(db_session)
+    item = reel_saved_by(user, category="car review", tags=["bmw", "m3"])
+    db_session.add(item)
+    await db_session.flush()
+
+    await db_session.refresh(item)
+
+    assert item.category == "car review"
+    assert item.type is None
+    assert item.tags == ["bmw", "m3"]
 
 
 async def test_unknown_item_status_is_rejected(db_session: AsyncSession) -> None:
@@ -379,6 +483,30 @@ async def test_entity_location_is_read_back_as_the_point_that_was_stored(
     assert pier.location == BESIKTAS_PIER
 
 
+async def test_place_keeps_every_address_level_and_is_found_by_any_of_them(
+    db_session: AsyncSession,
+) -> None:
+    cafe = place("ChIJ-fake-brooklyn", "Brooklyn café")
+    cafe.country = "United States"
+    cafe.region = "New York"
+    cafe.city = "New York"
+    cafe.district = "Brooklyn"
+    cafe.neighbourhood = "Williamsburg"
+    pier_without_address = place("ChIJ-fake-besiktas", "Beşiktaş pier", BESIKTAS_PIER)
+    db_session.add_all([cafe, pier_without_address])
+    await db_session.flush()
+
+    for address_level in (
+        Entity.country == "United States",
+        Entity.region == "New York",
+        Entity.city == "New York",
+        Entity.district == "Brooklyn",
+        Entity.neighbourhood == "Williamsburg",
+    ):
+        found = await db_session.execute(select(Entity.name).where(address_level))
+        assert found.scalars().all() == ["Brooklyn café"]
+
+
 async def test_entities_are_found_by_a_value_inside_their_data(db_session: AsyncSession) -> None:
     horror = Entity(
         type="movie", source="tmdb", external_id="1", name="Horror", data={"genres": ["horror"]}
@@ -396,7 +524,99 @@ async def test_entities_are_found_by_a_value_inside_their_data(db_session: Async
     assert found.scalars().all() == ["Horror"]
 
 
+# --- vocabulary (decision record 0005) ---------------------------------------------
+
+
+async def test_duplicate_vocabulary_value_in_one_field_is_rejected(
+    db_session: AsyncSession,
+) -> None:
+    db_session.add(Vocabulary(field="cuisine", value="korean"))
+    await db_session.flush()
+
+    db_session.add(Vocabulary(field="cuisine", value="korean"))
+
+    with pytest.raises(IntegrityError, match="uq_vocabulary_field_value"):
+        await db_session.flush()
+
+
+async def test_same_vocabulary_value_can_exist_in_two_fields(db_session: AsyncSession) -> None:
+    db_session.add_all(
+        [Vocabulary(field="cuisine", value="korean"), Vocabulary(field="tag", value="korean")]
+    )
+    await db_session.flush()
+
+    assert await count_rows(db_session, Vocabulary, Vocabulary.value == "korean") == 2
+
+
+async def test_new_vocabulary_value_starts_with_no_aliases_and_no_items(
+    db_session: AsyncSession,
+) -> None:
+    value = Vocabulary(field="category", value="car review")
+    db_session.add(value)
+    await db_session.flush()
+
+    await db_session.refresh(value)
+
+    assert value.aliases == []
+    assert value.item_count == 0
+    assert value.embedding is None
+    assert value.created_at is not None
+
+
+async def test_vocabulary_value_keeps_aliases_in_any_language_and_its_embedding(
+    db_session: AsyncSession,
+) -> None:
+    aliases = ["Korean food", "comida coreana", "한식"]
+    value = Vocabulary(
+        field="cuisine", value="korean", aliases=aliases, embedding=unit_vector(0), item_count=3
+    )
+    db_session.add(value)
+    await db_session.flush()
+
+    await db_session.refresh(value)
+
+    assert value.aliases == aliases
+    assert value.embedding == unit_vector(0)
+    assert value.item_count == 3
+
+
+async def test_vocabulary_embedding_of_the_wrong_size_is_rejected(
+    db_session: AsyncSession,
+) -> None:
+    db_session.add(Vocabulary(field="cuisine", value="korean", embedding=[1.0, 0.0, 0.0]))
+
+    with pytest.raises(DBAPIError, match=f"expected {TEST_EMBEDDING_DIMENSION} dimensions"):
+        await db_session.flush()
+
+
+async def test_deleting_a_user_keeps_the_shared_vocabulary(db_session: AsyncSession) -> None:
+    user = await add_user(db_session)
+    db_session.add_all(
+        [
+            reel_saved_by(user, category="car review"),
+            Vocabulary(field="category", value="car review", item_count=1),
+        ]
+    )
+    await db_session.flush()
+
+    await db_session.delete(user)
+    await db_session.flush()
+
+    assert await count_rows(db_session, SavedItem, SavedItem.user_id == user.id) == 0
+    assert await count_rows(db_session, Vocabulary, Vocabulary.value == "car review") == 1
+
+
 # --- other tables ----------------------------------------------------------------
+
+
+async def test_user_profile_keeps_home_area_and_country(db_session: AsyncSession) -> None:
+    user = User(display_name="Test User", home_area="Brooklyn", country="US", language="en")
+    db_session.add(user)
+    await db_session.flush()
+
+    await db_session.refresh(user)
+
+    assert (user.home_area, user.country, user.language) == ("Brooklyn", "US", "en")
 
 
 async def test_one_platform_account_cannot_belong_to_two_users(db_session: AsyncSession) -> None:

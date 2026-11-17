@@ -32,9 +32,9 @@ class Settings(BaseSettings):
         database_url: Postgres connection URL (`DATABASE_URL`).
         redis_url: Redis connection URL (`REDIS_URL`).
         embedding_dimension: Length of the embedding vectors stored in
-            `saved_item.embedding` (`EMBEDDING_DIMENSION`). The first migration
-            creates the column with this size, so it must match the embedding
-            model.
+            `saved_item.embedding` and `vocabulary.embedding`
+            (`EMBEDDING_DIMENSION`). The first migration creates both columns
+            with this size, so it must match the embedding model.
     """
 
     model_config = SettingsConfigDict(
