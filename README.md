@@ -6,7 +6,7 @@ SavedAgent indexes posts you save on Instagram (later TikTok, X and Facebook) an
 - Rules for contributors and agents: [`AGENTS.md`](AGENTS.md)
 - Decision records: [`docs/decisions/`](docs/decisions/)
 
-This repository currently holds the project skeleton (a FastAPI app with a health endpoint, a local Docker stack and the development tooling) and the content-type registry.
+This repository currently holds the project skeleton (a FastAPI app with a health endpoint, the database schema with its migrations, a local Docker stack and the development tooling) and the content-type registry.
 
 ## Requirements
 
@@ -50,6 +50,12 @@ curl http://localhost:8000/health
 # {"status":"ok"}
 ```
 
+Create the database tables (once after the first `make up`, and again after pulling new migrations):
+
+```bash
+make migrate
+```
+
 Useful commands:
 
 ```bash
@@ -86,7 +92,40 @@ make check
 | `make typecheck` | `mypy app` |
 | `make test` | `pytest` |
 
-Tests never call external services and do not need Docker.
+Tests never call external services.
+
+### Database tests
+
+The tests for the schema and the migrations need a real Postgres with PostGIS and pgvector. They are **skipped** unless `TEST_DATABASE_ADMIN_URL` is set, and pytest lists every skipped test with the reason. To run them, start the `db` service and point the variable at its `postgres` maintenance database:
+
+```bash
+docker compose up --detach --wait db
+TEST_DATABASE_ADMIN_URL=postgresql+asyncpg://savedagent:change-me@localhost:5432/postgres make test
+```
+
+Each run creates its own databases named `savedagent_test_<random>` on that server and drops them at the end. It never reads or changes the `savedagent` database you develop against. The user in the URL must be allowed to create databases and extensions, which the Compose user is.
+
+## Database
+
+The schema is defined twice, and a test keeps the two in step:
+
+- [`app/db/models.py`](app/db/models.py): SQLAlchemy models, used for queries.
+- [`app/db/migrations/versions/`](app/db/migrations/versions/): Alembic migrations, the only thing that changes the database.
+
+"Delete my data" is `delete_user_data()` in [`app/db/deletion.py`](app/db/deletion.py). It deletes one user's rows and lowers the item counts of the shared vocabulary. The shared tables (entities, streaming availability, vocabulary and aliases) keep their rows.
+
+| Command | What it does |
+|---|---|
+| `make migrate` | Apply every migration (`alembic upgrade head`) |
+| `alembic downgrade base` | Drop every table the migrations created. **This deletes the data in them** |
+| `alembic revision -m "add x"` | Start a new, empty migration to fill in by hand |
+| `alembic check` | Fail if the models and the database differ |
+
+Alembic reads `DATABASE_URL` and `EMBEDDING_DIMENSION` through `app/config.py`, from `.env` or the environment. Run it from the repository root.
+
+The first migration creates the two embedding columns (`saved_item.embedding` and `vocabulary.embedding`) with `EMBEDDING_DIMENSION` components. The embedding model is `openai/text-embedding-3-large` at **1024 dimensions** (Muhammed's choice in SAV-7), so set `EMBEDDING_DIMENSION=1024`, as `.env.example` does. Both columns are then `vector(1024)`, and the database rejects a vector of any other length.
+
+The dimension stays a setting, so another model can be tried on a fresh database. To change it on a database that is already migrated, write a new migration that resizes both columns, and embed every saved item and vocabulary value again.
 
 ## Configuration
 
@@ -97,6 +136,8 @@ All configuration comes from environment variables. Locally they live in `.env`,
 | `LOG_LEVEL` | API | `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL` |
 | `DATABASE_URL` | API | Postgres URL, e.g. `postgresql+asyncpg://user:password@host:5432/db` |
 | `REDIS_URL` | API | Redis URL, e.g. `redis://host:6379/0` |
+| `EMBEDDING_DIMENSION` | API, migrations | Length of the embedding vectors, 1 to 2000. Must match the embedding model: `1024` for `openai/text-embedding-3-large` (see [Database](#database)) |
+| `TEST_DATABASE_ADMIN_URL` | Tests only | Postgres server for the database tests (see [Database tests](#database-tests)). Not read by the API |
 | `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` | Docker Compose | Credentials and database name for the `db` container |
 | `API_PORT`, `POSTGRES_PORT`, `REDIS_PORT` | Docker Compose | Ports published on `127.0.0.1` |
 
@@ -188,11 +229,17 @@ app/
   config.py           # settings from environment variables
   logging_config.py   # JSON logging setup
   types/              # content-type registry: one module per built-in type
+  db/
+    models.py         # SQLAlchemy models
+    types.py          # column types for pgvector and PostGIS
+    deletion.py       # "delete my data" for one user
+    migrations/       # Alembic environment and revisions
+alembic.ini           # Alembic configuration
 tests/                # pytest suite
 docker/postgres/      # Postgres 16 image with PostGIS and pgvector
 docker-compose.yml    # local stack: db, redis, api
 Dockerfile            # API image
-Makefile              # install, fmt, lint, typecheck, test, check, run, up, down
+Makefile              # install, fmt, lint, typecheck, test, check, run, migrate, up, down
 docs/
   ARCHITECTURE.md     # the design (source of truth)
   decisions/          # decision records

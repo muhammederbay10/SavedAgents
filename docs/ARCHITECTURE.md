@@ -69,7 +69,7 @@ class CaptureEvent(BaseModel):
     user_id: UUID              # our user
     platform: Literal["instagram", "tiktok", "x", "facebook", "youtube"]
     source: Literal["dm", "share_ext", "browser_import", "api"]
-    post_url: str
+    post_url: str | None       # no public link for collection-saved reels and DM-shared photo posts
     platform_post_id: str | None
     caption: str | None        # if the platform sends it
     media_url: str | None      # video or image URL if provided
@@ -94,7 +94,7 @@ class CaptureEvent(BaseModel):
 - `GET /webhooks/instagram`: Meta's verification handshake (`hub.mode`, `hub.verify_token`, `hub.challenge`).
 - `POST /webhooks/instagram`: verify the `X-Hub-Signature-256` HMAC, check for duplicates by message id, map to a `CaptureEvent` or a chat message, **enqueue, and return 200 immediately**. Meta retries slow webhooks.
 - `POST /import`: batch endpoint for the browser extension and data-export uploads.
-- Upsert by `(user_id, platform, platform_post_id)`, so sharing the same post twice doesn't create a duplicate.
+- Upsert by `(user_id, platform, platform_post_id)`, so sharing the same post twice doesn't create a duplicate. An item without a post id (a reel saved into a collaborative collection) is stored once per `(user_id, source_message_id)`, so a webhook that Meta delivers twice doesn't create one either. Two saves of the same reel are two messages, and stay two items (decision record 0007).
 
 ### 3.3 Indexing pipeline (heavy work, runs once per saved item)
 
@@ -345,6 +345,8 @@ erDiagram
 - **`VOCABULARY_ALIAS`** holds other wordings of a value, in any language, each with a `status`: `candidate` (one decision-model match), `verified` (confirmed, used for exact hits) or `rejected` (a wrong match, never used again). `probability` is the best match confidence seen, and `correction_count` counts user corrections against it. Which items matched through an alias is recorded in their `ENRICHMENT_RUN` normalize step, not here.
 - **"Delete my data"** removes the user's items with their `raw_values` and enrichment runs, and lowers each value's `item_count`. The vocabulary keeps only gated, generic wording with no link to any user. A value no item uses any more can be cleaned up.
 - Opening hours and ratings go out of date, so refresh `ENTITY.data` regularly (e.g. every 30 days), and also when the user asks for `open_now`. Streaming availability is refreshed per country (`ENTITY_AVAILABILITY`).
+- **Dedupe keys on `SAVED_ITEM`** (decision record 0007). A user's item is stored once per `(user_id, platform, platform_post_id)` and once per `(user_id, source_message_id)`, whichever of the two ids it has. `platform_post_id` and `post_url` may be empty: a reel saved into a collaborative collection has neither. Every item has at least a post id, a message id or a post link, and a missing value is never stored as empty text. The message-id key tells **messages apart, not reels**: the same reel saved through two messages (saved twice, or saved and also shared by DM) becomes two items, because nothing in the payloads links them.
+- Column-level choices (which columns may be empty, defaults, what is deleted with a user, index types) are in decision record 0007. The `MEMORY` table is created in Phase 2.
 
 ## 5. Tech stack
 
@@ -410,8 +412,10 @@ savedagent/
       session.py            # short-term: history + working set (Redis)
       longterm.py           # extract → gate → consolidate → retrieve
     db/
-      models.py
-      migrations/
+      models.py             # SQLAlchemy models for the tables in §4
+      types.py              # column types for pgvector and PostGIS
+      deletion.py           # "delete my data": removes a user's rows, lowers vocabulary counts
+      migrations/           # Alembic environment and revisions
   evals/
     labeled_saves.jsonl     # ~100 hand-labeled saves for model comparison
   extension/                # Phase 2 browser extension
@@ -419,6 +423,7 @@ savedagent/
     fixtures/webhooks/      # real (anonymized) webhook payloads
   docker/postgres/          # Postgres 16 image with PostGIS + pgvector
   docker-compose.yml
+  alembic.ini               # Alembic configuration
   Dockerfile                # API image
   Makefile                  # fmt, lint, typecheck, test, up
   pyproject.toml
