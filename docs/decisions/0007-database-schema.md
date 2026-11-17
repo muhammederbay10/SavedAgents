@@ -88,10 +88,11 @@ Two more limits:
 
 ### Delete my data
 
-`delete_user_data()` in `app/db/deletion.py` does two things in one transaction:
+`delete_user_data()` in `app/db/deletion.py` does three things in one transaction:
 
-1. It lowers `vocabulary.item_count` for every value the user's items use.
-2. It deletes the `user` row. The foreign keys then delete the user's items with their `raw_values` and enrichment runs, and the other rows listed in point 6.
+1. It locks the `user` row, and stops if there is no such user. Two requests for the same user at the same time therefore run one after the other: the second waits, finds the user gone and changes nothing. Without the lock, both would count the user's items and lower the counts twice.
+2. It lowers `vocabulary.item_count` for every value the user's items use.
+3. It deletes the `user` row. The foreign keys then delete the user's items with their `raw_values` and enrichment runs, and the other rows listed in point 6.
 
 The vocabulary has no link to items, so the function has to work out which values an item uses. **This rule is the one SAV-14 must also use when it raises the counts:**
 

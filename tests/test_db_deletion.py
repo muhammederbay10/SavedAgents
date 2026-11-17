@@ -4,11 +4,15 @@ These tests need Postgres with PostGIS and pgvector. See `tests/database.py`.
 All ids and texts are synthetic.
 """
 
+import asyncio
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 
-from sqlalchemy import String, cast, select
-from sqlalchemy.ext.asyncio import AsyncSession
+import pytest
+from sqlalchemy import URL, String, cast, select, text
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, create_async_engine
+from sqlalchemy.pool import NullPool
 
 from app.db.deletion import delete_user_data
 from app.db.models import (
@@ -24,6 +28,7 @@ from app.db.models import (
     Vocabulary,
     VocabularyAlias,
 )
+from tests.database import run_alembic
 from tests.db_factories import (
     INSTAGRAM,
     OTHER_REEL_ID,
@@ -56,6 +61,12 @@ ITEM_COUNTS_AFTER = {
     ("genre", "horror"): 0,
     ("genre", "thriller"): 4,
 }
+
+
+LOCK_WAIT_POLL_SECONDS = 0.05
+LOCK_WAIT_ATTEMPTS = 200
+BLOCKED_REQUEST_TIMEOUT_SECONDS = 10.0
+BACKEND_WAIT_STATE = "SELECT wait_event_type FROM pg_stat_activity WHERE pid = :backend_pid"
 
 
 @dataclass(frozen=True)
@@ -243,3 +254,70 @@ async def test_delete_my_data_for_an_unknown_user_changes_nothing(
     assert await item_counts(db_session) == ITEM_COUNTS_BEFORE
     assert await count_rows(db_session, User) == 2
     assert await count_rows(db_session, SavedItem, SavedItem.user_id == world.leaving_user_id) == 3
+
+
+# --- two requests at the same time -----------------------------------------------------
+
+
+@pytest.fixture
+def committed_database_url(empty_database_url: URL, tmp_path: Path) -> URL:
+    """A migrated database of its own, for a test whose sessions really commit."""
+    run_alembic(empty_database_url, tmp_path, "upgrade", "head")
+    return empty_database_url
+
+
+async def wait_until_blocked_on_a_lock(observer: AsyncConnection, backend_pid: int) -> None:
+    """Return once that database session is waiting for another session's lock."""
+    for _ in range(LOCK_WAIT_ATTEMPTS):
+        wait_state = await observer.execute(text(BACKEND_WAIT_STATE), {"backend_pid": backend_pid})
+        if wait_state.scalar_one_or_none() == "Lock":
+            return
+        await asyncio.sleep(LOCK_WAIT_POLL_SECONDS)
+    raise AssertionError("the second deletion request never waited for the first one")
+
+
+async def test_two_delete_requests_for_one_user_lower_the_item_count_only_once(
+    committed_database_url: URL,
+) -> None:
+    engine = create_async_engine(committed_database_url, poolclass=NullPool)
+    try:
+        async with AsyncSession(engine, expire_on_commit=False) as setup:
+            leaving_user = await add_user(setup)
+            staying_user = await add_user(setup)
+            await add_vocabulary(setup, {("category", "car review"): 2})
+            setup.add_all(
+                [
+                    reel_saved_by(leaving_user, category="car review"),
+                    reel_saved_by(staying_user, category="car review"),
+                ]
+            )
+            await setup.commit()
+
+        async with (
+            AsyncSession(engine) as first_request,
+            AsyncSession(engine) as second_request,
+            engine.connect() as connection,
+        ):
+            # Each statement must see the other sessions as they are right now.
+            observer = await connection.execution_options(isolation_level="AUTOCOMMIT")
+            second_pid = await second_request.scalar(text("SELECT pg_backend_pid()"))
+            assert second_pid is not None
+
+            await delete_user_data(first_request, leaving_user.id)
+            overlapping_delete = asyncio.create_task(
+                delete_user_data(second_request, leaving_user.id)
+            )
+            try:
+                await wait_until_blocked_on_a_lock(observer, second_pid)
+            finally:
+                await first_request.commit()
+            await asyncio.wait_for(overlapping_delete, BLOCKED_REQUEST_TIMEOUT_SECONDS)
+            await second_request.commit()
+
+        async with AsyncSession(engine) as check:
+            assert await item_counts(check) == {("category", "car review"): 1}
+            assert await count_rows(check, SavedItem, SavedItem.user_id == staying_user.id) == 1
+            assert await count_rows(check, User, User.id == leaving_user.id) == 0
+            assert await count_rows(check, SavedItem, SavedItem.user_id == leaving_user.id) == 0
+    finally:
+        await engine.dispose()

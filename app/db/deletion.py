@@ -3,11 +3,14 @@
 The foreign keys delete a user's rows when the `user` row goes. The vocabulary
 has no reference to a user, so its `item_count` has to be lowered here, before
 the user's items are gone.
+
+The user row is locked first. A second request for the same user then waits for
+the first one to finish and finds no user, so the counts are lowered only once.
 """
 
 import uuid
 
-from sqlalchemy import delete, text
+from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import (
@@ -70,8 +73,10 @@ async def delete_user_data(session: AsyncSession, user_id: uuid.UUID) -> None:
     deleted item that used it. The shared tables keep their rows: entities,
     streaming availability, vocabulary values and aliases.
 
-    The caller commits the session. Nothing happens for an unknown user id.
-    Files and session state outside Postgres are not touched.
+    The caller commits the session. The user row stays locked until then, so a
+    second request for the same user waits and then changes nothing. Nothing
+    happens for an unknown user id either. Files and session state outside
+    Postgres are not touched.
 
     Args:
         session: The database session to run the statements on.
@@ -80,6 +85,11 @@ async def delete_user_data(session: AsyncSession, user_id: uuid.UUID) -> None:
     Raises:
         sqlalchemy.exc.SQLAlchemyError: If the database rejects a statement.
     """
+    # Without this lock, a second request that starts before the first one
+    # commits still sees the user's items and lowers the counts a second time.
+    locked_user = await session.execute(select(User.id).where(User.id == user_id).with_for_update())
+    if locked_user.scalar_one_or_none() is None:
+        return
     await session.execute(
         _LOWER_ITEM_COUNTS,
         {
