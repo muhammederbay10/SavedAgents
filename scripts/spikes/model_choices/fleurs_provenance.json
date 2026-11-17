@@ -1,0 +1,160 @@
+{
+  "dataset": "google/fleurs",
+  "source": "https://huggingface.co/datasets/google/fleurs",
+  "revision": "70bb2e84b976b7e960aa89f1c648e09c59f894dd",
+  "split": "test",
+  "license": "CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/)",
+  "attribution": "FLEURS: Few-shot Learning Evaluation of Universal Representations of Speech, Conneau et al. (2022), Google",
+  "audio_preprocessing": "Original float32 WAV converted by macOS afconvert to mono 16000 Hz PCM16 WAV; no trimming or augmentation.",
+  "aligned_ids": [
+    1914,
+    1771,
+    1669
+  ],
+  "samples": [
+    {
+      "language": "en_us",
+      "id": 1914,
+      "original_file": "621925716775998155.wav",
+      "sha256_pcm_wav": "099f50015c9e03d19ea21dcac6def2b0564a1edb48ac0d33b2f2148ca2ac8546",
+      "sha256_reference_utf8": "4c2ed6b3f083afe8cf22baef2ee0ec56364a40531ebe7b700c0ea574b82ac9df",
+      "duration_s": 5.88
+    },
+    {
+      "language": "en_us",
+      "id": 1771,
+      "original_file": "2589557553267364799.wav",
+      "sha256_pcm_wav": "95af74006a68bda456cc20ed131880abbd1d665ac199f42e017b3c0815f8951e",
+      "sha256_reference_utf8": "6586cf6b9b89200ab1c71ae064c2320e2266a21a5e07c838053fa42225feeeaa",
+      "duration_s": 8.94
+    },
+    {
+      "language": "en_us",
+      "id": 1669,
+      "original_file": "8173060820032255320.wav",
+      "sha256_pcm_wav": "d5b0ce6f687b88ff5bae7522f2415c4074509baf92c5b65fd8a63f44803c387e",
+      "sha256_reference_utf8": "889febee2b3eed379bcbde631bdfc92ebca7582681e3354860c32163b7209d61",
+      "duration_s": 9.14
+    },
+    {
+      "language": "tr_tr",
+      "id": 1914,
+      "original_file": "14499715025785172231.wav",
+      "sha256_pcm_wav": "ca9cc909c6bc0926f9826874f27824b7780ae4eda08de80b91c703e3a1ffc9a1",
+      "sha256_reference_utf8": "05738e9d4ccb751b5476170293318eed16a0333cdec5de2c678a2316a99245b3",
+      "duration_s": 9.78
+    },
+    {
+      "language": "tr_tr",
+      "id": 1771,
+      "original_file": "124690985607407826.wav",
+      "sha256_pcm_wav": "b34dfad21408aeb40b7dc57e941b4aac6de321ce561cb46d0b2127360a2bbec3",
+      "sha256_reference_utf8": "60bbc06485748671864d5b87453555f73ab9e2161c1dad41a6ebdcb992c13992",
+      "duration_s": 12.0
+    },
+    {
+      "language": "tr_tr",
+      "id": 1669,
+      "original_file": "14629699940852218879.wav",
+      "sha256_pcm_wav": "083c7151da9e747f3fa9ec23215f53fcb21b0fe0d163ce59de4bae6f63f87222",
+      "sha256_reference_utf8": "a26472142118236c45d8d5b3c7f78fc15e8e0f94f460533e669b82890dc07c87",
+      "duration_s": 10.92
+    },
+    {
+      "language": "ar_eg",
+      "id": 1914,
+      "original_file": "11795512087306779633.wav",
+      "sha256_pcm_wav": "adab50217d2434cc1b3e3d60283040cfba256a5bd82fc04d37c9d4840599be40",
+      "sha256_reference_utf8": "873119181f557dcae534bd8f07901ac49185203a38bac4b4c6a18f93d2466bcf",
+      "duration_s": 7.32
+    },
+    {
+      "language": "ar_eg",
+      "id": 1771,
+      "original_file": "10223562251993082117.wav",
+      "sha256_pcm_wav": "a10522a0852787dbc44852f75b889209df28564de71d282fc531253666bfa395",
+      "sha256_reference_utf8": "a52b81c325fa96b79588f8dd63287a16b99262f83fd48e5aa5e28e551533cc81",
+      "duration_s": 14.76
+    },
+    {
+      "language": "ar_eg",
+      "id": 1669,
+      "original_file": "7686151320270397194.wav",
+      "sha256_pcm_wav": "d62505a3558adbb3461df594277b3236a83e16f727e0a0d721c8c9496b64c576",
+      "sha256_reference_utf8": "65c38e093057b7c20edcf8fb6e75716f56d56fc63d9f0eac5a76015f1ed79117",
+      "duration_s": 7.62
+    },
+    {
+      "language": "es_419",
+      "id": 1914,
+      "original_file": "5740978159715084423.wav",
+      "sha256_pcm_wav": "ca471210b88de2a655135d6c30f1bc0c8be665d8466eac6eadc6f116ddfd73de",
+      "sha256_reference_utf8": "f134c4566df90e1c03daf3953e0f4c1a75034d38c0d75ea63518aa449eb523a0",
+      "duration_s": 14.4
+    },
+    {
+      "language": "es_419",
+      "id": 1771,
+      "original_file": "3667933852121849716.wav",
+      "sha256_pcm_wav": "a763c7a1ca05eb23d08ff15d4e94fecd91334b186796a0c04876107ed0a074fd",
+      "sha256_reference_utf8": "bfb37d5ea6abbedbe7bd1084edd6e3409008e9a5e0d6e86552af59130107c098",
+      "duration_s": 11.64
+    },
+    {
+      "language": "es_419",
+      "id": 1669,
+      "original_file": "8326437371264983390.wav",
+      "sha256_pcm_wav": "c2917dcb5db3a5de02cec67b02d6dabf7f59319df886e2a7183221ec34f23457",
+      "sha256_reference_utf8": "df1430eb1cd1f3362ac8b64b0f3d2c07c48359889e948c99411bdffbfd3bff55",
+      "duration_s": 14.04
+    },
+    {
+      "language": "hi_in",
+      "id": 1914,
+      "original_file": "18179665096930871285.wav",
+      "sha256_pcm_wav": "1d01726c539211d5c71e6a566d7a4dd1bb713f930b7385817c77daba81eae4c7",
+      "sha256_reference_utf8": "06dd76c924f5c39259fe762f875c224c8af74610935bf7583af6759b20bc3b20",
+      "duration_s": 13.02
+    },
+    {
+      "language": "hi_in",
+      "id": 1771,
+      "original_file": "9699687672328404855.wav",
+      "sha256_pcm_wav": "b4c4646c0f714787b5ab3a35682faa96db8da88743ab02f8e25231884956a728",
+      "sha256_reference_utf8": "f0e8fb3c8246f91275a5f1b0a66ce787a0019689f7162f92eaa8215bfbdb89f2",
+      "duration_s": 11.16
+    },
+    {
+      "language": "hi_in",
+      "id": 1669,
+      "original_file": "11384310733046890772.wav",
+      "sha256_pcm_wav": "2f6227a62be86e6a22892f3763f0e4e6c5781033a07d0d197976b53daa387006",
+      "sha256_reference_utf8": "8623105c8f2859af1c6ab39d096d53717493a48190b0a8c8f89e799c27284918",
+      "duration_s": 8.7
+    },
+    {
+      "language": "ja_jp",
+      "id": 1914,
+      "original_file": "17855816070741310110.wav",
+      "sha256_pcm_wav": "cfb48901004ec8333d749b1d54ad76032d4ca73e40b676aa5bc56823d659eddd",
+      "sha256_reference_utf8": "2bfa43fb9801b44e470c2d27f3964e018812a3b8cdb1d0c66adb5bfcf57a6a66",
+      "duration_s": 15.0
+    },
+    {
+      "language": "ja_jp",
+      "id": 1771,
+      "original_file": "10228875750894489453.wav",
+      "sha256_pcm_wav": "c5dba8328a12972bcbef05144631acfaf0e85cc5ee67750149b01b2ef37b8317",
+      "sha256_reference_utf8": "040e5c2de1b68bcc0e5526cea46ba5c40eca36b6e06d2d6cc88f34c136e0979f",
+      "duration_s": 12.96
+    },
+    {
+      "language": "ja_jp",
+      "id": 1669,
+      "original_file": "12526861755097705133.wav",
+      "sha256_pcm_wav": "bf94b5839b2da212821044e7330492022d57987ee20e58ca88e3cbd882a6ded8",
+      "sha256_reference_utf8": "227375b556d8d377452ba128c87c69c6c008a79601f2b689c9fc8baa5b47bb51",
+      "duration_s": 10.08
+    }
+  ]
+}
