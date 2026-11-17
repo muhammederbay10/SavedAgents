@@ -121,7 +121,9 @@ The schema is defined twice, and a test keeps the two in step:
 
 Alembic reads `DATABASE_URL` and `EMBEDDING_DIMENSION` through `app/config.py`, from `.env` or the environment. Run it from the repository root.
 
-The first migration creates the two embedding columns (`saved_item.embedding` and `vocabulary.embedding`) with `EMBEDDING_DIMENSION` components. To change the dimension after that, write a new migration that resizes both columns, and embed every saved item and vocabulary value again.
+The first migration creates the two embedding columns (`saved_item.embedding` and `vocabulary.embedding`) with `EMBEDDING_DIMENSION` components. The embedding model is `openai/text-embedding-3-large` at **1024 dimensions** (Muhammed's choice in SAV-7), so set `EMBEDDING_DIMENSION=1024`, as `.env.example` does. Both columns are then `vector(1024)`, and the database rejects a vector of any other length.
+
+The dimension stays a setting, so another model can be tried on a fresh database. To change it on a database that is already migrated, write a new migration that resizes both columns, and embed every saved item and vocabulary value again.
 
 ## Configuration
 
@@ -132,7 +134,7 @@ All configuration comes from environment variables. Locally they live in `.env`,
 | `LOG_LEVEL` | API | `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL` |
 | `DATABASE_URL` | API | Postgres URL, e.g. `postgresql+asyncpg://user:password@host:5432/db` |
 | `REDIS_URL` | API | Redis URL, e.g. `redis://host:6379/0` |
-| `EMBEDDING_DIMENSION` | API, migrations | Length of the embedding vectors, 1 to 2000. Must match the embedding model |
+| `EMBEDDING_DIMENSION` | API, migrations | Length of the embedding vectors, 1 to 2000. Must match the embedding model: `1024` for `openai/text-embedding-3-large` (see [Database](#database)) |
 | `TEST_DATABASE_ADMIN_URL` | Tests only | Postgres server for the database tests (see [Database tests](#database-tests)). Not read by the API |
 | `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` | Docker Compose | Credentials and database name for the `db` container |
 | `API_PORT`, `POSTGRES_PORT`, `REDIS_PORT` | Docker Compose | Ports published on `127.0.0.1` |

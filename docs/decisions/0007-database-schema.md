@@ -16,7 +16,7 @@
 
 1. **One migration creates the nine Phase 1 tables:** `user`, `platform_account`, `saved_item`, `entity`, `item_entity`, `user_entity`, `enrichment_run`, `conversation_msg` and `vocabulary`. `memory` comes in Phase 2. `user` is a reserved word in Postgres, so raw SQL must write it as `"user"`. SQLAlchemy does that by itself.
 2. **Migrations are written by hand, and a test compares them with the models.** `app/db/models.py` describes the tables for queries. `tests/test_migrations.py` runs `alembic check`, which fails when the models and a migrated database differ.
-3. **The embedding size is read from `EMBEDDING_DIMENSION` when the first migration runs.** It sizes both `saved_item.embedding` and `vocabulary.embedding`. The models leave the size out, and the database enforces it. The setting accepts 1 to 2000, because pgvector can't build an HNSW index on a larger `vector` column. Which embedding model to use, and so the final dimension, is decided in SAV-7.
+3. **The embedding size is read from `EMBEDDING_DIMENSION` when the first migration runs.** It sizes both `saved_item.embedding` and `vocabulary.embedding`. The models leave the size out, and the database enforces it. The setting accepts 1 to 2000, because pgvector can't build an HNSW index on a larger `vector` column. The value is **1024**: Muhammed chose `openai/text-embedding-3-large` at 1024 dimensions in SAV-7 (P5). The size stays a setting and is not written into the migration or the models.
 4. **Which columns are required.**
    - Required: every id and owner reference, `platform`, an entity's `type`, `source`, `external_id` and `name`, both `status` columns, the role and content of a conversation message, and a vocabulary row's `field` and `value`.
    - Filled by the database when left out: ids (`gen_random_uuid()`), `created_at`, `saved_at`, `refreshed_at` and `at` (now), `saved_item.status` (`pending`), `tags` and `aliases` (empty list), `fields`, `attributes` and `data` (empty object), `item_entity.position` and `vocabulary.item_count` (0).
@@ -76,7 +76,7 @@ Two more limits:
 
 ## Owner decisions
 
-Muhammed approved these on SAV-9 on 2026-11-17.
+Muhammed approved these on 2026-11-17: P1–P4 on SAV-9, and P5 in SAV-7 (recorded on SAV-9).
 
 | # | Decision | Approved |
 |---|---|---|
@@ -84,6 +84,7 @@ Muhammed approved these on SAV-9 on 2026-11-17.
 | P2 | Runtime dependency `asyncpg` | Yes. It is the Postgres driver for SQLAlchemy's async engine. The `pgvector` and `GeoAlchemy2` packages are not added |
 | P3 | Git author of the SAV-9 commits | The same name and GitHub noreply address as the SAV-4 commits (record 0001, P3) |
 | P4 | Database tests without a test database | They are skipped, not failed. Pytest lists every skipped test with its reason (`-ra`) |
+| P5 | Embedding model and size (decided in SAV-7) | `openai/text-embedding-3-large` at 1024 dimensions. `.env.example` and the README set `EMBEDDING_DIMENSION=1024`, for both `saved_item.embedding` and `vocabulary.embedding` |
 
 ## Alternatives
 
@@ -100,8 +101,9 @@ Muhammed approved these on SAV-9 on 2026-11-17.
 
 ## Consequences
 
-- **New setting:** `EMBEDDING_DIMENSION`, required, in `.env.example`, the README and `docker-compose.yml`. The API refuses to start without it.
-- **Changing the embedding size later** needs a new migration that resizes both embedding columns, and every saved item and vocabulary value must be embedded again. SAV-7 should pick the model before real data exists.
+- **New setting:** `EMBEDDING_DIMENSION`, required, in `.env.example`, the README and `docker-compose.yml`. The API refuses to start without it. Its value is 1024 (P5).
+- **SAV-10 (embedder):** it must return vectors of exactly 1024 components for `openai/text-embedding-3-large`. The database rejects any other length.
+- **Changing the embedding size later** needs a new migration that resizes both embedding columns, and every saved item and vocabulary value must be embedded again. The model was chosen in SAV-7 before any real data existed, so no such migration is needed now.
 - **New dependencies:** `sqlalchemy[asyncio]` and `alembic` (named by the ticket) and `asyncpg` (P2).
 - **`make migrate`** applies the migrations from your machine. The API image doesn't contain `alembic.ini`, so migrations don't run inside the container. A deployment ticket decides how they run in a hosted environment.
 - **SAV-11 (ingestion):** `CaptureEvent.post_url` may be empty. Store a missing id or link as `None`, never as empty text. The same message can't be stored twice, so a repeated webhook can be detected from the unique key.
