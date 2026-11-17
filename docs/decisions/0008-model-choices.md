@@ -232,7 +232,7 @@ The per-request metrics of all rounds stay next to the private test media, outsi
 - **SAV-9 (schema):** embedding columns have 1024 dimensions.
 - **SAV-14 (pipeline):** route by decision 4. Check for an audio track; with one, always run speech-to-text; set `has_speech` from the final transcript. The "nearly empty" rule is a documented setting. No model's has-speech answer is used for routing. Speech-to-text now also runs on reels that have only music, so its cost applies to every item with an audio track (MAI was charged about $0.0017 per audio minute in round 2).
 - **SAV-19, SAV-20 (evals):** score speech-to-text, extraction and retrieval on labelled saves in more than one language, and track how often the fallback and the escalation run. `deepseek/deepseek-v4.1-flash-1017` is scored against the approved text model there, as a later candidate. Music-only reels show whether the "nearly empty" rule works.
-- **`docs/ARCHITECTURE.md` §3.9 and §5** are updated to these models in this ticket, after SAV-26's design change lands, because SAV-26 edits the same sections.
+- **`docs/ARCHITECTURE.md`** is updated in the same change: the models in §3.9 and §5, the speech routing in §3.3, and the comments in §6 that described the old routing. The earlier rule "skip speech-to-text when the caption already names the entity" is gone, because speech-to-text now always runs on files with an audio track.
 - **Switching the embedding model later** means re-embedding every item.
 
 ## Still open

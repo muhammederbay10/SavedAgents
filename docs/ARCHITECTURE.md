@@ -105,8 +105,10 @@ class CaptureEvent(BaseModel):
 ```mermaid
 flowchart TD
   A[CaptureEvent] --> B[1. Fetch<br/>caption, location tag, media URL<br/>→ download thumbnail + video now, links expire]
-  B --> C[2. Classify + route — Gemini Decision 1 on the video, one pass<br/>choice: built-in type — place · movie/series · book · … · none of these<br/>yes/no: is it a list of several things?<br/>has speech = the file has an audio track + speech check]
-  C --> T[3. Speech-to-text<br/>only if has speech]
+  B --> C[2. Classify + route — Gemini Decision 1 on the video, one pass<br/>choice: built-in type — place · movie/series · book · … · none of these<br/>yes/no: is it a list of several things?]
+  C --> AT{Does the file have<br/>an audio track?}
+  AT -- "no: no speech" --> X
+  AT -- yes --> T[3. Speech-to-text, always<br/>empty or nearly empty transcript = no speech]
   T --> X[4. Extract — text model<br/>caption + location tag + transcript<br/>→ category + tags in open words · entity candidates<br/>· the type's fields · summary]
   X --> NV[Normalize open values against the vocabulary<br/>exact hit → reuse · otherwise privacy gate,<br/>then decision model: an existing value or 'new']
   NV --> X2
@@ -129,7 +131,7 @@ Notes:
 - **One pass, many questions.** Each decision call sends the video once with all its questions. Google says it handles up to 1,000 questions per pass.
 - **List posts.** "5 movies to watch this weekend" or "3 cafés in Kadıköy" is one post with **several entities**. The extractor returns a list, and each entity is resolved and linked to the same saved item.
 - **The user's collection is a hint, not the type.** A "Food" collection can hold a restaurant and a recipe. The collection name is stored and used as a search filter and as a hint during classification, but the type is decided per post.
-- **Cost control.** If the caption (or the location tag, for places) already identifies the entity, skip speech-to-text.
+- **Speech routing** (decision record 0008). A file with no audio track has no speech, and speech-to-text is skipped. A file with an audio track always goes to speech-to-text, even when the caption or the location tag already names the entity. If the final transcript is empty or nearly empty, the item has no speech; what counts as nearly empty is a documented pipeline setting. No model's "has speech" answer decides the route: in our tests, for videos with no audio track, the decision model gave speech probabilities of up to 0.86 and the video models claimed speech.
 - **Any language, anywhere.** Captions, speech and replies can be in any language, and places can be in any country. Nothing in the pipeline assumes a language, a city or a country (decision record 0005).
 
 ### 3.4 Content types, open categories and the vocabulary
@@ -277,14 +279,16 @@ How memory is used:
 ### 3.9 Model roles
 Every model sits behind a small provider interface (`generator.generate`, `classifier.decide`, `transcriber.transcribe`, `embedder.embed`). Each role is set in config, so models can be swapped and compared on our own labeled saves.
 
+**All model calls go through OpenRouter** (`https://openrouter.ai/api/v1`, one key, `OPENROUTER_API_KEY`). The models below are first choices from small live tests; decision record [0008](decisions/0008-model-choices.md) has the measurements, and the evaluation set re-checks them.
+
 | Role | Model | Why | Watch out for |
 |---|---|---|---|
-| **Fixed decisions:** content type, subtype/tags, has-speech, is-list, which resolver candidate, vocabulary privacy gate + match-or-new, filter normalization, deep-look yes/no, memory gate + consolidation | **Gemini Decision 1** (Google, `gemini-decision-1`, launched 11 Nov 2026) | Takes **text, images, audio, video and PDFs directly**. Typed outputs with calibrated probabilities, up to 1,000 questions per pass, ~50–100 ms model time (Google's figures), $0.10/M input tokens, output free | Brand new, and all benchmarks are Google's own. Video is still token-heavy, so cost scales with video length. Do counting, maths and dates in code |
-| **Speech-to-text** (posts with speech only) | Whisper-class model (e.g. faster-whisper large-v3 self-hosted, or a hosted STT API) | Many reels say the name out loud, in any language. Must handle many languages | Background music lowers accuracy. Keep word timestamps for debugging |
-| **Open-ended extraction** (entity names, type fields, summary) and **memory extraction** | DeepSeek V4.1 Flash (same provider as the response agent) | Names and summaries aren't fixed choices, so a decision model can't produce them. Text in, so it's cheap | Only as good as the caption + transcript it receives |
-| **Escalation:** watch the video when the text gave no entity | A multimodal generative model with native video + audio (e.g. Gemini Flash class) | Catches what the caption and speech missed (silent reels with text overlays, recognisable storefronts or movie scenes) | Most expensive per call. Track the escalation rate per type |
-| **Response agent** (understands the message, calls tools, writes the reply) | **DeepSeek V4.1 Flash** | Cheap, fast, good enough for tool calling + short replies | Check tool-call reliability and reply quality in several languages on our own tests. The first-party API is hosted in China, so consider another host for user data |
-| **Embeddings** | A multilingual embedding model | Queries in one language must find captions in another | Re-embed everything if we switch models |
+| **Fixed decisions:** content type, subtype/tags, is-list, which resolver candidate, vocabulary privacy gate + match-or-new, filter normalization, deep-look yes/no, memory gate + consolidation | **Gemini Decision 1** (`google/gemini-decision-1`, launched 11 Nov 2026), through its own endpoint `POST /api/alpha/decisions`, not chat completions | Takes **text, images, audio, video and PDFs directly**. Typed outputs with calibrated probabilities, up to 1,000 questions per pass, ~50–100 ms model time (Google's figures), $0.10/M input tokens, output free | Brand new, and all benchmarks are Google's own. It does not decide whether a video has speech: it gave high speech probabilities for videos with no audio track (§3.3). Video is still token-heavy, so cost scales with video length. Do counting, maths and dates in code |
+| **Speech-to-text** (every item with an audio track) | `microsoft/mai-transcribe-2`; fallback `openai/gpt-transcribe` when MAI returns an error or an empty transcript. No routing by language | Many reels say the name out loud, in any language. In our test MAI had the lowest error rate in four of six languages, and it returns the detected language with word and segment timestamps | Background music lowers accuracy. Keep MAI's language and timestamps. The GPT fallback returns none, so they are stored as unavailable, not left out. An empty or nearly empty final transcript means no speech |
+| **Open-ended extraction** (entity names, type fields, summary) and **memory extraction** | `deepseek/deepseek-v4.1-flash` (the same model as the response agent), pinned to a provider hosted outside China | Names and summaries aren't fixed choices, so a decision model can't produce them. Text in, so it's cheap | Only as good as the caption + transcript it receives. The provider is a setting; which one, and where it is hosted, is verified with the model clients (SAV-10) |
+| **Escalation:** watch the video when the text gave no entity | `google/gemini-2.5-flash`, with the video file as input | Catches what the caption and speech missed (silent reels with text overlays, recognisable storefronts or movie scenes) | Most expensive per call. Track the escalation rate per type. It also reported speech in videos with no audio track, so its speech answer is not used |
+| **Response agent** (understands the message, calls tools, writes the reply) | **`deepseek/deepseek-v4.1-flash`**, pinned to a provider hosted outside China | Cheap, fast, good enough for tool calling + short replies | Check tool-call reliability and reply quality in several languages on our own tests. DeepSeek's first-party API is hosted in China, which is why user data goes to a pinned provider elsewhere |
+| **Embeddings** | `openai/text-embedding-3-large` with `dimensions=1024` | Queries in one language must find captions in another | Check that every returned vector has 1024 dimensions. Re-embed everything if we switch models |
 
 > **Fallback:** TypeSafe's **Jev** offers the same three question types and is cheaper ($0.042/M input), but its public docs describe text/structured input only. It's a good backup for text-only decisions (e.g. filter normalization, memory gate) behind the same `Classifier` interface.
 
@@ -355,7 +359,7 @@ erDiagram
 | API | Python 3.12 + FastAPI | Async, good for webhooks, easy validation with Pydantic |
 | Queue / workers | `arq` on Redis | Simple, async, retries built in. Redis also holds short-term memory |
 | DB | Postgres 16 + PostGIS + pgvector | One database for location queries, JSON filters and semantic search |
-| Models | Gemini Decision 1 for decisions, faster-whisper for speech, DeepSeek V4.1 Flash for extraction + replies, multimodal model for rare escalations, multilingual embeddings | See §3.9 |
+| Models | All through OpenRouter: Gemini Decision 1 for decisions, MAI Transcribe 2 for speech (GPT Transcribe as fallback), DeepSeek V4.1 Flash for extraction + replies, Gemini 2.5 Flash for rare escalations, OpenAI `text-embedding-3-large` at 1024 dimensions | One provider and one key. See §3.9 and decision record 0008 |
 | Media | ffmpeg (downscale stored videos, thumbnails, audio extraction) | Standard tool |
 | Resolvers | Google Places API (New) · TMDB API · Open Library / Google Books | Best coverage in each area. TMDB includes streaming availability per country |
 | Hosting | Fly.io / Railway / Render to start | Public HTTPS URL for Meta's webhooks, and cheap |
@@ -394,8 +398,8 @@ savedagent/
       open_library.py
     pipeline/
       fetch.py              # download media before links expire
-      classify.py           # decision model on the video: type, tags, has-speech, is-list
-      transcribe.py         # speech-to-text (only if has speech)
+      classify.py           # decision model on the video: type, tags, is-list
+      transcribe.py         # speech-to-text (when the file has an audio track)
       extract.py            # text model with the type's schema; escalates to video model
       normalize.py          # vocabulary: exact hit, privacy gate, match-or-new
       resolve.py            # type's resolver + decision-model candidate choice
@@ -419,6 +423,7 @@ savedagent/
   evals/
     labeled_saves.jsonl     # ~100 hand-labeled saves for model comparison
   extension/                # Phase 2 browser extension
+  scripts/spikes/           # reproducible experiments behind decision records
   tests/
     fixtures/webhooks/      # real (anonymized) webhook payloads
   docker/postgres/          # Postgres 16 image with PostGIS + pgvector
