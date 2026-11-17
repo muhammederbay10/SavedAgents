@@ -55,11 +55,17 @@ When you need approval, stop and post: what you want to do, why, what changes, a
 
 - One ticket = one branch = one pull request. Branch from the latest `main`. Name branches `<ticket-key>-<short-topic>` in lowercase, e.g. `sav-11-instagram-webhook`. Tickets live in the Multica workspace "SavedAgent" (ticket keys `SAV-N`), project "SavedAgent: Instagram saved-posts agent".
 - **Team loop in Multica** (details in SAV-22 §7 and SAV-24). Jarvis orchestrates, the Developer builds and the Reviewer reviews:
-  1. The Developer commits locally (no push) and hands the exact SHA, the base SHA and its local repo path to the Reviewer.
-  2. The Reviewer reviews that SHA locally and replies APPROVE or CHANGES REQUESTED.
+  1. The Developer commits locally (no push) and hands the exact SHA, the base SHA and its worktree path to the Reviewer.
+  2. The Reviewer reviews that SHA in its own detached worktree and replies APPROVE or CHANGES REQUESTED.
   3. Jarvis runs the fix and re-review rounds. After APPROVE, Jarvis asks the owner once to approve the push and the pull request.
   4. Only then the Developer pushes and opens the pull request, and only the owner merges.
 - **Handoffs happen only by mention.** Agents start work when a comment mentions them; a finished run wakes nobody up. Every handoff or stop is a comment that mentions the next agent and Jarvis.
+- **Work in a git worktree next to the main repo, never in hidden folders.** The owner's checkout of the main repo is not touched: no edits, branch switches or commits there. Each ticket gets one worktree named after its branch, all in one folder next to the repo:
+  ```bash
+  git -C <main repo> fetch origin
+  git -C <main repo> worktree add ../SavedAgents-worktrees/sav-11-instagram-webhook -b sav-11-instagram-webhook origin/main
+  ```
+  Parallel tickets get separate worktrees in that same folder. Reviews use a detached `../SavedAgents-worktrees/review-<ticket>` worktree that is removed afterwards. Each worktree has its own `.venv` and Docker Compose project name; `.env` is never copied into it. After a merge, the ticket's worktree is removed with `git worktree remove`. Full rule: SAV-22, 17 Nov 2026 update.
 - **Commit locally as often as you like.** Pushing needs approval (see §1).
 - Commit messages use [Conventional Commits](https://www.conventionalcommits.org/): `feat:`, `fix:`, `refactor:`, `docs:`, `test:`, `chore:`. The first line is ≤ 72 characters and in the imperative mood.
 - Before asking for approval to push, report on the ticket: the branch, head commit SHA, a short summary of changes, the test and lint results, and anything left open.
