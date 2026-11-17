@@ -18,7 +18,9 @@ SCHEMA_TABLES = {
     "user_entity",
     "enrichment_run",
     "conversation_msg",
+    "entity_availability",
     "vocabulary",
+    "vocabulary_alias",
 }
 # Alembic's own bookkeeping table and the table PostGIS creates for itself.
 TABLES_OUTSIDE_THE_SCHEMA = {"alembic_version", "spatial_ref_sys"}

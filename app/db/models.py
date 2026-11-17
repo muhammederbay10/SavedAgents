@@ -5,9 +5,11 @@ describe the same tables for queries, and `tests/test_migrations.py` fails when
 the two drift apart.
 
 Deleting a `user` row deletes everything that belongs to that user: platform
-accounts, saved items (with their entity links and enrichment runs), entity
-statuses and conversation messages. `entity` and `vocabulary` rows are shared
-between users and stay.
+accounts, saved items (with their raw wording, entity links and enrichment
+runs), entity statuses and conversation messages. Four tables are shared by all
+users, have no reference to a user and stay: `entity`, `entity_availability`,
+`vocabulary` and `vocabulary_alias`. Use `app.db.deletion.delete_user_data` for
+"delete my data": it also lowers the vocabulary's item counts.
 """
 
 import uuid
@@ -56,6 +58,13 @@ _EMPTY_JSON_OBJECT = text("'{}'::jsonb")
 _EMPTY_TEXT_ARRAY = text("'{}'::text[]")
 _DELETE_WITH_PARENT = "CASCADE"
 
+# The `vocabulary.field` names of the open values that have their own column on
+# `saved_item`. An open value inside `saved_item.fields` uses its key as the
+# field name, e.g. "cuisine" or "genre".
+CATEGORY_VOCABULARY_FIELD = "category"
+SUBTYPE_VOCABULARY_FIELD = "subtype"
+TAG_VOCABULARY_FIELD = "tag"
+
 
 class ItemStatus(StrEnum):
     """Where a saved item is in the indexing pipeline."""
@@ -72,6 +81,19 @@ class EntityStatus(StrEnum):
 
     WANT = "want"
     DONE = "done"
+
+
+class AliasStatus(StrEnum):
+    """How far a vocabulary alias is trusted.
+
+    A candidate has been matched by the decision model. A verified alias is
+    confirmed and may be used for exact hits. A rejected alias was a wrong match
+    and is never used again.
+    """
+
+    CANDIDATE = "candidate"
+    VERIFIED = "verified"
+    REJECTED = "rejected"
 
 
 def _one_of(column_name: str, values: type[StrEnum]) -> str:
@@ -173,6 +195,7 @@ class SavedItem(Base):
     tags: Mapped[list[str]] = mapped_column(ARRAY(Text), server_default=_EMPTY_TEXT_ARRAY)
     collection: Mapped[str | None] = mapped_column(Text)
     fields: Mapped[JsonObject] = mapped_column(JSONB, server_default=_EMPTY_JSON_OBJECT)
+    raw_values: Mapped[JsonObject] = mapped_column(JSONB, server_default=_EMPTY_JSON_OBJECT)
     attributes: Mapped[JsonObject] = mapped_column(JSONB, server_default=_EMPTY_JSON_OBJECT)
     status: Mapped[str] = mapped_column(Text, server_default=ItemStatus.PENDING)
     embedding: Mapped[list[float] | None] = mapped_column(Vector())
@@ -236,6 +259,25 @@ class Entity(Base):
     city: Mapped[str | None] = mapped_column(Text)
     district: Mapped[str | None] = mapped_column(Text)
     neighbourhood: Mapped[str | None] = mapped_column(Text)
+    refreshed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class EntityAvailability(Base):
+    """Where one movie or series can be streamed in one country.
+
+    Shared by all users, one row per `(entity_id, country)`. Each row has its
+    own `refreshed_at`, so refreshing one country never changes another.
+    """
+
+    __tablename__ = "entity_availability"
+
+    entity_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("entity.id", ondelete=_DELETE_WITH_PARENT), primary_key=True
+    )
+    country: Mapped[str] = mapped_column(Text, primary_key=True)
+    providers: Mapped[JsonObject] = mapped_column(JSONB, server_default=_EMPTY_JSON_OBJECT)
     refreshed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -307,9 +349,10 @@ class ConversationMessage(Base):
 class Vocabulary(Base):
     """One canonical value of an open field, such as a category, a tag or a cuisine.
 
-    Shared by all users, one row per `(field, value)`. It holds generic words
-    only and nothing personal, so it belongs to no user and stays when a user
-    is deleted.
+    Shared by all users, one row per `(field, value)`. Only generic wording that
+    passed the privacy gate is stored here, so the table belongs to no user and
+    stays when a user is deleted. `item_count` is the number of saved items
+    that use the value.
     """
 
     __tablename__ = "vocabulary"
@@ -320,7 +363,33 @@ class Vocabulary(Base):
     )
     field: Mapped[str] = mapped_column(Text)
     value: Mapped[str] = mapped_column(Text)
-    aliases: Mapped[list[str]] = mapped_column(ARRAY(Text), server_default=_EMPTY_TEXT_ARRAY)
     embedding: Mapped[list[float] | None] = mapped_column(Vector())
     item_count: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class VocabularyAlias(Base):
+    """Another wording of a vocabulary value, in any language.
+
+    Shared by all users like the value it belongs to, and gated the same way.
+    `probability` is the best match confidence seen for the alias, and
+    `correction_count` counts user corrections against it.
+    """
+
+    __tablename__ = "vocabulary_alias"
+    __table_args__ = (
+        UniqueConstraint("vocabulary_id", "alias"),
+        CheckConstraint(_one_of("status", AliasStatus), name="status_is_known"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=_GENERATED_UUID
+    )
+    vocabulary_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("vocabulary.id", ondelete=_DELETE_WITH_PARENT)
+    )
+    alias: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(Text, server_default=AliasStatus.CANDIDATE)
+    probability: Mapped[float | None] = mapped_column(Float)
+    correction_count: Mapped[int] = mapped_column(Integer, server_default=text("0"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

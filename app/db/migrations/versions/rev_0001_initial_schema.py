@@ -36,11 +36,13 @@ _SAVED_ITEM_SEARCH_VECTOR = sa.text(
 
 # Dropped in this order, so that tables go before the tables they reference.
 _TABLES_IN_DROP_ORDER = (
+    "vocabulary_alias",
     "vocabulary",
     "conversation_msg",
     "enrichment_run",
     "user_entity",
     "item_entity",
+    "entity_availability",
     "entity",
     "saved_item",
     "platform_account",
@@ -118,6 +120,9 @@ def _create_saved_item_tables(embedding_dimension: int) -> None:
         ),
         sa.Column("collection", sa.Text()),
         sa.Column("fields", postgresql.JSONB(), server_default=_EMPTY_JSON_OBJECT, nullable=False),
+        sa.Column(
+            "raw_values", postgresql.JSONB(), server_default=_EMPTY_JSON_OBJECT, nullable=False
+        ),
         sa.Column(
             "attributes", postgresql.JSONB(), server_default=_EMPTY_JSON_OBJECT, nullable=False
         ),
@@ -211,6 +216,23 @@ def _create_entity_tables() -> None:
     )
     op.create_index("ix_entity_location", "entity", ["location"], postgresql_using="gist")
     op.create_index("ix_entity_data", "entity", ["data"], postgresql_using="gin")
+    # No reference to `user`: availability is shared and stays when a user is deleted.
+    op.create_table(
+        "entity_availability",
+        sa.Column("entity_id", sa.Uuid(), nullable=False),
+        sa.Column("country", sa.Text(), nullable=False),
+        sa.Column(
+            "providers", postgresql.JSONB(), server_default=_EMPTY_JSON_OBJECT, nullable=False
+        ),
+        sa.Column("refreshed_at", sa.DateTime(timezone=True), server_default=_NOW, nullable=False),
+        sa.PrimaryKeyConstraint("entity_id", "country", name="pk_entity_availability"),
+        sa.ForeignKeyConstraint(
+            ["entity_id"],
+            ["entity.id"],
+            name="fk_entity_availability_entity_id_entity",
+            ondelete=_DELETE_WITH_PARENT,
+        ),
+    )
     op.create_table(
         "item_entity",
         sa.Column("saved_item_id", sa.Uuid(), nullable=False),
@@ -257,21 +279,42 @@ def _create_entity_tables() -> None:
     )
 
 
-def _create_vocabulary_table(embedding_dimension: int) -> None:
+def _create_vocabulary_tables(embedding_dimension: int) -> None:
     # No reference to `user`: the vocabulary is shared and stays when a user is deleted.
     op.create_table(
         "vocabulary",
         _uuid_primary_key(),
         sa.Column("field", sa.Text(), nullable=False),
         sa.Column("value", sa.Text(), nullable=False),
-        sa.Column(
-            "aliases", postgresql.ARRAY(sa.Text()), server_default=_EMPTY_TEXT_ARRAY, nullable=False
-        ),
         sa.Column("embedding", Vector(embedding_dimension)),
         sa.Column("item_count", sa.Integer(), server_default=sa.text("0"), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=_NOW, nullable=False),
         sa.PrimaryKeyConstraint("id", name="pk_vocabulary"),
         sa.UniqueConstraint("field", "value", name="uq_vocabulary_field_value"),
+    )
+    op.create_table(
+        "vocabulary_alias",
+        _uuid_primary_key(),
+        sa.Column("vocabulary_id", sa.Uuid(), nullable=False),
+        sa.Column("alias", sa.Text(), nullable=False),
+        sa.Column("status", sa.Text(), server_default="candidate", nullable=False),
+        sa.Column("probability", sa.Float()),
+        sa.Column("correction_count", sa.Integer(), server_default=sa.text("0"), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=_NOW, nullable=False),
+        sa.PrimaryKeyConstraint("id", name="pk_vocabulary_alias"),
+        sa.ForeignKeyConstraint(
+            ["vocabulary_id"],
+            ["vocabulary.id"],
+            name="fk_vocabulary_alias_vocabulary_id_vocabulary",
+            ondelete=_DELETE_WITH_PARENT,
+        ),
+        sa.UniqueConstraint(
+            "vocabulary_id", "alias", name="uq_vocabulary_alias_vocabulary_id_alias"
+        ),
+        sa.CheckConstraint(
+            "status IN ('candidate', 'verified', 'rejected')",
+            name=op.f("ck_vocabulary_alias_status_is_known"),
+        ),
     )
 
 
@@ -287,7 +330,7 @@ def upgrade() -> None:
     _create_user_tables()
     _create_saved_item_tables(embedding_dimension)
     _create_entity_tables()
-    _create_vocabulary_table(embedding_dimension)
+    _create_vocabulary_tables(embedding_dimension)
 
 
 def downgrade() -> None:

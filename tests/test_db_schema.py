@@ -8,14 +8,13 @@ import math
 import uuid
 
 import pytest
-from sqlalchemy import ColumnElement, Select, func, literal, select, text
+from sqlalchemy import Select, func, literal, select, text
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import (
     FULL_TEXT_SEARCH_CONFIG,
-    Base,
     ConversationMessage,
     EnrichmentRun,
     Entity,
@@ -26,20 +25,26 @@ from app.db.models import (
     SavedItem,
     User,
     UserEntity,
-    Vocabulary,
     saved_item_search_vector,
 )
 from app.db.types import GeographyPoint, GeoPoint
 from tests.database import TEST_EMBEDDING_DIMENSION
-
-INSTAGRAM = "instagram"
-REEL_ID = "18000000000000201"
-OTHER_REEL_ID = "18000000000000202"
-REEL_URL = "https://www.instagram.com/reel/FAKEREEL002/"
-OTHER_REEL_URL = "https://www.instagram.com/reel/FAKEREEL006/"
-MESSAGE_ID = "aWdfZAGFAKEMID0002"
-OTHER_MESSAGE_ID = "aWdfZAGFAKEMID0008"
-SENDER_ID = "1000000000000001"
+from tests.db_factories import (
+    INSTAGRAM,
+    MESSAGE_ID,
+    OTHER_MESSAGE_ID,
+    OTHER_REEL_ID,
+    OTHER_REEL_URL,
+    REEL_ID,
+    REEL_URL,
+    SENDER_ID,
+    add_user,
+    collection_save_by,
+    count_rows,
+    place,
+    reel_saved_by,
+    unit_vector,
+)
 
 BESIKTAS_PIER = GeoPoint(latitude=41.0410, longitude=29.0070)
 MODA_PIER = GeoPoint(latitude=40.9790, longitude=29.0250)
@@ -62,45 +67,6 @@ EXPECTED_INDEX_DEFINITIONS = {
 }
 
 
-async def add_user(session: AsyncSession) -> User:
-    user = User(display_name="Test User")
-    session.add(user)
-    await session.flush()
-    return user
-
-
-def reel_saved_by(user: User, **overrides: object) -> SavedItem:
-    values: dict[str, object] = {
-        "user_id": user.id,
-        "platform": INSTAGRAM,
-        "platform_post_id": REEL_ID,
-        "post_url": REEL_URL,
-        "media_type": "reel",
-    }
-    return SavedItem(**{**values, **overrides})
-
-
-def collection_save_by(user: User, message_id: str) -> SavedItem:
-    """A reel saved into a collaborative collection: a message id, no post id and no link."""
-    return SavedItem(
-        user_id=user.id, platform=INSTAGRAM, media_type="reel", source_message_id=message_id
-    )
-
-
-def place(external_id: str, name: str, location: GeoPoint | None = None) -> Entity:
-    return Entity(
-        type="place",
-        source="google_places",
-        external_id=external_id,
-        name=name,
-        location=location,
-    )
-
-
-def unit_vector(axis: int) -> list[float]:
-    return [1.0 if index == axis else 0.0 for index in range(TEST_EMBEDDING_DIMENSION)]
-
-
 def haversine_meters(first: GeoPoint, second: GeoPoint) -> float:
     first_latitude, second_latitude = math.radians(first.latitude), math.radians(second.latitude)
     latitude_delta = second_latitude - first_latitude
@@ -110,13 +76,6 @@ def haversine_meters(first: GeoPoint, second: GeoPoint) -> float:
         + math.cos(first_latitude) * math.cos(second_latitude) * math.sin(longitude_delta / 2) ** 2
     )
     return 2 * EARTH_RADIUS_METERS * math.asin(math.sqrt(half_chord))
-
-
-async def count_rows(
-    session: AsyncSession, model: type[Base], *conditions: ColumnElement[bool]
-) -> int:
-    statement = select(func.count()).select_from(model).where(*conditions)
-    return (await session.execute(statement)).scalar_one()
 
 
 async def query_plan_without_sequential_scans(
@@ -259,7 +218,9 @@ async def test_empty_text_is_rejected_where_a_missing_value_must_be_null(
 # --- saved_item: defaults and status -------------------------------------------
 
 
-async def test_new_item_starts_pending_with_empty_tags_and_fields(db_session: AsyncSession) -> None:
+async def test_new_item_starts_pending_with_empty_tags_fields_and_raw_values(
+    db_session: AsyncSession,
+) -> None:
     user = await add_user(db_session)
     item = reel_saved_by(user)
     db_session.add(item)
@@ -270,6 +231,7 @@ async def test_new_item_starts_pending_with_empty_tags_and_fields(db_session: As
     assert item.status == ItemStatus.PENDING
     assert item.tags == []
     assert item.fields == {}
+    assert item.raw_values == {}
     assert item.attributes == {}
     assert item.saved_at is not None
     assert item.source_message_id is None
@@ -522,88 +484,6 @@ async def test_entities_are_found_by_a_value_inside_their_data(db_session: Async
     )
 
     assert found.scalars().all() == ["Horror"]
-
-
-# --- vocabulary (decision record 0005) ---------------------------------------------
-
-
-async def test_duplicate_vocabulary_value_in_one_field_is_rejected(
-    db_session: AsyncSession,
-) -> None:
-    db_session.add(Vocabulary(field="cuisine", value="korean"))
-    await db_session.flush()
-
-    db_session.add(Vocabulary(field="cuisine", value="korean"))
-
-    with pytest.raises(IntegrityError, match="uq_vocabulary_field_value"):
-        await db_session.flush()
-
-
-async def test_same_vocabulary_value_can_exist_in_two_fields(db_session: AsyncSession) -> None:
-    db_session.add_all(
-        [Vocabulary(field="cuisine", value="korean"), Vocabulary(field="tag", value="korean")]
-    )
-    await db_session.flush()
-
-    assert await count_rows(db_session, Vocabulary, Vocabulary.value == "korean") == 2
-
-
-async def test_new_vocabulary_value_starts_with_no_aliases_and_no_items(
-    db_session: AsyncSession,
-) -> None:
-    value = Vocabulary(field="category", value="car review")
-    db_session.add(value)
-    await db_session.flush()
-
-    await db_session.refresh(value)
-
-    assert value.aliases == []
-    assert value.item_count == 0
-    assert value.embedding is None
-    assert value.created_at is not None
-
-
-async def test_vocabulary_value_keeps_aliases_in_any_language_and_its_embedding(
-    db_session: AsyncSession,
-) -> None:
-    aliases = ["Korean food", "comida coreana", "한식"]
-    value = Vocabulary(
-        field="cuisine", value="korean", aliases=aliases, embedding=unit_vector(0), item_count=3
-    )
-    db_session.add(value)
-    await db_session.flush()
-
-    await db_session.refresh(value)
-
-    assert value.aliases == aliases
-    assert value.embedding == unit_vector(0)
-    assert value.item_count == 3
-
-
-async def test_vocabulary_embedding_of_the_wrong_size_is_rejected(
-    db_session: AsyncSession,
-) -> None:
-    db_session.add(Vocabulary(field="cuisine", value="korean", embedding=[1.0, 0.0, 0.0]))
-
-    with pytest.raises(DBAPIError, match=f"expected {TEST_EMBEDDING_DIMENSION} dimensions"):
-        await db_session.flush()
-
-
-async def test_deleting_a_user_keeps_the_shared_vocabulary(db_session: AsyncSession) -> None:
-    user = await add_user(db_session)
-    db_session.add_all(
-        [
-            reel_saved_by(user, category="car review"),
-            Vocabulary(field="category", value="car review", item_count=1),
-        ]
-    )
-    await db_session.flush()
-
-    await db_session.delete(user)
-    await db_session.flush()
-
-    assert await count_rows(db_session, SavedItem, SavedItem.user_id == user.id) == 0
-    assert await count_rows(db_session, Vocabulary, Vocabulary.value == "car review") == 1
 
 
 # --- other tables ----------------------------------------------------------------
