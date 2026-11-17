@@ -7,9 +7,10 @@
 1. **Capture where the user already is.** Sharing a post to the bot should take one tap, the same as tapping Save.
 2. **Official integrations only on the server.** We never store a user's social-media password or log in as them. Grey-area import tools run on the user's own device, are opt-in, and are never required.
 3. **One brain, many adapters.** Each platform is a small adapter that turns its input into a common `CaptureEvent`. Everything after that doesn't depend on the platform.
-4. **Any kind of content.** Places, movies, study material, recipes, products… are **content types** in a registry (§3.4). Adding a new type means adding a schema and, optionally, a resolver. The pipeline doesn't change.
-5. **Analyze once, search many times.** Videos are understood when they're saved, never when the user asks a question.
-6. **Ask when unsure.** If we can't confidently identify something, the bot asks ("Is this *Kronotrop Bebek* or *Kronotrop Karaköy*?", "*Dune* (2021) or *Dune: Part Two*?") instead of guessing.
+4. **Any kind of content.** Every saved item gets an open category and tags in plain words, so nothing is forced into a fixed list. Places, movies, books and the like are **built-in types** only where we add special behaviour such as a resolver (§3.4). New types can be added as config; the pipeline doesn't change.
+5. **Anyone, anywhere, any language.** No city, country or language is built in. Values come from real saves through a growing vocabulary, places use Google Places' address fields for any country, and replies use the user's language (decision record 0005).
+6. **Analyze once, search many times.** Videos are understood when they're saved, never when the user asks a question.
+7. **Ask when unsure.** If we can't confidently identify something, the bot asks ("Is this *Kronotrop Bebek* or *Kronotrop Karaköy*?", "*Dune* (2021) or *Dune: Part Two*?") instead of guessing.
 
 ## 2. System overview
 
@@ -104,19 +105,21 @@ class CaptureEvent(BaseModel):
 ```mermaid
 flowchart TD
   A[CaptureEvent] --> B[1. Fetch<br/>caption, location tag, media URL<br/>→ download thumbnail + video now, links expire]
-  B --> C[2. Classify + route — Gemini Decision 1 on the video, one pass<br/>choice: content type — place · movie/series · book · study · recipe · product · workout · other<br/>choice: subtype + tags for that type<br/>yes/no: has speech? · is it a list of several things?]
+  B --> C[2. Classify + route — Gemini Decision 1 on the video, one pass<br/>choice: built-in type — place · movie/series · book · … · none of these<br/>yes/no: is it a list of several things?<br/>has speech = the file has an audio track + speech check]
   C --> T[3. Speech-to-text<br/>only if has speech]
-  T --> X[4. Extract — text model with the type's schema<br/>caption + location tag + transcript<br/>→ entity candidates · type fields · summary]
-  X --> X2{Type needs an entity<br/>and none was found?}
+  T --> X[4. Extract — text model<br/>caption + location tag + transcript<br/>→ category + tags in open words · entity candidates<br/>· the type's fields · summary]
+  X --> NV[Normalize open values against the vocabulary<br/>decision model: an existing value or 'new']
+  NV --> X2
+  X2{Type needs an entity<br/>and none was found?}
   X2 -- "yes (e.g. silent reel)" --> V[Escalate: multimodal generative model<br/>watches the video itself]
   V --> F
-  X2 -- no --> F[5. Resolve — the type's resolver<br/>place → Google Places · movie → TMDB · book → Open Library<br/>study / recipe / other → no resolver]
+  X2 -- no --> F[5. Resolve — the type's resolver<br/>place → Google Places · movie → TMDB · book → Open Library<br/>types without a resolver and open categories → none]
   F --> G[Gemini Decision 1 choice:<br/>video + resolver candidates → which one? + confidence]
   G --> G2{Confident?}
   G2 -- yes --> I[6. Store entity/entities + link to saved item]
   G2 -- no --> J[Ask user in DM<br/>with top 2–3 options]
   J --> I
-  I --> K[7. Embed summary + transcript<br/>+ confirmation DM:<br/>'Saved: Inception 2010 · Sci-fi · on Netflix 🎬']
+  I --> K[7. Embed summary + transcript<br/>+ confirmation DM that says how it was saved:<br/>'Saved: Inception 2010 · Sci-fi · on Netflix 🎬'<br/>'Saved as 🚗 car review · BMW M3']
 ```
 
 Notes:
@@ -127,22 +130,39 @@ Notes:
 - **List posts.** "5 movies to watch this weekend" or "3 cafés in Kadıköy" is one post with **several entities**. The extractor returns a list, and each entity is resolved and linked to the same saved item.
 - **The user's collection is a hint, not the type.** A "Food" collection can hold a restaurant and a recipe. The collection name is stored and used as a search filter and as a hint during classification, but the type is decided per post.
 - **Cost control.** If the caption (or the location tag, for places) already identifies the entity, skip speech-to-text.
+- **Any language, anywhere.** Captions, speech and replies can be in any language, and places can be in any country. Nothing in the pipeline assumes a language, a city or a country (decision record 0005).
 
-### 3.4 Content-type registry
-Each type is a small plug-in: an extraction schema, the decision questions to ask, an optional resolver, and the filters it offers to search.
+### 3.4 Content types, open categories and the vocabulary
+SavedAgent works for **anything a user saves**, so it never forces a post into a fixed list (decision record 0005).
 
-| Type | Extracted by the text model | Resolver → enriched fields | Search filters |
+**Every saved item gets an open `category` and tags**, written by the text model in plain words: "restaurant", "sci-fi movie", "car review", "skincare routine", "guitar lesson". They are searchable at once ("show my car videos"), and the confirmation DM says how the item was saved, so the user can correct it ("no, it's a travel video").
+
+**Built-in types exist only where we add special behaviour:** a resolver that finds the real thing, extra fields, or special filters. A post that fits none of them isn't squeezed into the nearest one: it keeps its open category and tags, and is still fully searchable by meaning. When an open category keeps coming up across users, it can be promoted to a built-in type as config, without changing the pipeline.
+
+| Built-in type | Extracted by the text model | Resolver → enriched fields | Extra search filters |
 |---|---|---|---|
-| **place** (restaurant, café, bar, shop, attraction) | venue name(s), area hints, cuisine | Google Places → district (*ilçe*), neighbourhood (*mahalle*), coordinates, hours, price, rating | district, near me, open now, cuisine, price |
-| **movie / series** | title(s), year hints | TMDB → year, genres, runtime, rating, **where to stream in Turkey** (TMDB watch providers) | genre, year, streaming platform, watched / not watched |
+| **place** (restaurant, café, bar, shop, attraction…) | venue name(s), area hints, cuisine | Google Places → country, region, city, district, neighbourhood (whatever the address has), coordinates, hours, price, rating | area at any level, near me, open now, cuisine, price |
+| **movie / series** | title(s), year hints | TMDB → year, genres, runtime, rating, **where to stream in the user's country** (TMDB watch providers) | genre, year, streaming platform, watched / not watched |
 | **book** | title(s), author | Open Library / Google Books → author, genre, pages | genre, author, read / not read |
-| **study** (tips, tutorials, explanations, courses) | subject, topic, key points, resources mentioned | none | subject (maths, English, programming…), topic, format (tip, tutorial, explainer), exam (YKS, YDS, IELTS…) |
+| **study** (tips, tutorials, explanations, courses) | subject, topic, key points, resources mentioned | none | subject, topic, format, exam or course |
 | **recipe** | dish, main ingredients, time, diet | none | ingredient, cuisine, time, diet |
-| **product** | product, brand, price mentioned | none (later: shopping links) | category, brand, price |
+| **product** | product, brand, price mentioned | none (later: shopping links) | brand, price |
 | **workout** | exercise, muscle group, equipment | none | muscle group, equipment, duration |
-| **other** | summary + tags | none | tags, plus meaning search |
+| *(no built-in type)* | open category, tags, summary | none | category, tags, plus meaning search |
 
-**Phase 1 types:** place, movie/series, study and other (matching your Food, Movies and Studying collections). The rest are added later as config, without changing the pipeline.
+**Phase 1 built-in types:** place, movie/series and study. Everything else uses an open category from day one.
+
+**Open values, kept consistent: the vocabulary.** Category, tags, cuisine, genre, subject, exam, format, subtype and similar fields are **open text**; there are **no value lists in code**. To stop "korean", "Korean food" and "Kore mutfağı" becoming three values, each new value goes through the **vocabulary**, a table that grows from real saves:
+1. The text model writes the value in its own words.
+2. Similar existing values are found (embedding search within the same field), and Gemini Decision 1 picks one of them or **"new"**.
+3. A match reuses the existing value and stores the new wording as an alias; "new" adds a value.
+4. User corrections update the item and, when they rename a value, its aliases.
+
+Values are stored in one canonical form (English, lower case) with aliases in any language, so a question in Turkish, Spanish or English finds the same items. Search filters offer the values that **exist in this user's saves**.
+
+**Places are global.** Location fields come from Google Places' address components for any country: country, region or state, city, district, neighbourhood, plus coordinates. "Restaurants in Beşiktaş", "cafés in Brooklyn" and "bars in Shibuya" work the same way. A filter can match any of those levels.
+
+**Streaming platforms** come from TMDB's watch providers for the user's country (from their profile, or asked once). There is no platform list in code.
 
 ### 3.5 Answering questions (light work, every message)
 
@@ -152,7 +172,7 @@ The **response agent** (DeepSeek V4.1 Flash) never searches by itself and never 
 flowchart TD
   U["User: 'horror movies in my<br/>Movies collection on netflx'"] --> M[Memory: load short-term context<br/>+ relevant long-term memories]
   M --> R[Response agent — DeepSeek<br/>picks tool + arguments]
-  R --> N[Normalize args — Gemini Decision choice<br/>against the type's known values<br/>'netflx' → Netflix · 'beşilktaş' → Beşiktaş]
+  R --> N[Normalize args — Gemini Decision choice<br/>against the values in this user's saves + the vocabulary<br/>'netflx' → Netflix · 'beşilktaş' → Beşiktaş · 'bruklin' → Brooklyn]
   N --> S[Hybrid retrieval<br/>SQL/PostGIS filters + vector similarity]
   S --> Q{Can stored fields<br/>answer it?}
   Q -- "yes (most questions)" --> W[Response agent writes reply<br/>user's language: a short intro, then one<br/>reply per result quoting the saved reel]
@@ -164,7 +184,7 @@ flowchart TD
 ```
 
 **Hybrid retrieval (this is our RAG):**
-- **Structured filters** for hard facts: collection, type, and the type's filters (district, genre, streaming platform, subject…), plus distance (`ST_DWithin`) for places. Exact, fast and free.
+- **Structured filters** for hard facts: collection, type or open category, tags, and the type's filters (an area at any level, genre, streaming platform, subject…), plus distance (`ST_DWithin`) for places. Exact, fast and free. Filter values are normalized against what exists in the user's own saves, never against a fixed list.
 - **Vector search** for fuzzy requests: "cozy date-night place", "that mind-bending sci-fi movie", "the video explaining recursion simply". These match the embeddings of what was said and summarized in each post.
 - The two are combined: filter first, then rank by similarity. Long-term memories also affect ranking (§3.7).
 
@@ -172,7 +192,7 @@ flowchart TD
 
 | Tool | What it does |
 |---|---|
-| `search_items(collection?, type?, filters?, text?, platform?, saved_after?)` | Hybrid search. `filters` is checked against the type's schema (e.g. `{"district": "Beşiktaş"}`, `{"genre": "horror", "streaming": "Netflix"}`, `{"subject": "maths"}`) |
+| `search_items(collection?, type?, category?, tags?, filters?, text?, platform?, saved_after?)` | Hybrid search. `filters` is checked against the type's fields (e.g. `{"area": "Beşiktaş"}`, `{"area": "Brooklyn"}`, `{"genre": "horror", "streaming": "Netflix"}`, `{"subject": "maths"}`); `category` and `tags` work for every item (e.g. `category="car review"`) |
 | `near(lat, lng, radius_m, subtype?, open_now?)` | PostGIS search around a point (places only) |
 | `deep_look(item_ids, question)` | Fans out parallel subagents (see diagram) for questions the index can't answer |
 | `get_item(id)` | Full details: entity info, original post link, why we matched it |
@@ -196,7 +216,7 @@ Normal search should answer almost everything. The fallback covers two different
 |---|---|---|---|
 | **L0 Normal** | Always first | Hybrid retrieval: SQL/PostGIS filters + vector ranking | Free, ~1 s |
 | **L1 Degraded retrieval** | Vector search or embeddings fail | SQL filters + Postgres full-text keyword search on caption, summary and transcript | Free, ~1 s |
-| **L2 Relax and catch up** | 0 or very few results | Loosen filters (neighbouring districts, related genres or subjects, drop secondary filters). Also include items **not fully indexed yet** (`pending`, `failed`, `needs_user`) | Free, ~1 s |
+| **L2 Relax and catch up** | 0 or very few results | Loosen filters (a wider area such as the city instead of the district, related genres or subjects, drop secondary filters). Also include items **not fully indexed yet** (`pending`, `failed`, `needs_user`) | Free, ~1 s |
 | **L3 Decision scan over text** | Still nothing, or the database is unreachable | **Gemini Decision 1 does the search temporarily:** it checks each item's stored text against the question ("is this a horror movie?") in batched, parallel calls | Cents, a few seconds |
 | **L4 Decision scan over video** (last resort) | Items with no usable text (indexing failed) | Gemini Decision 1 on the stored videos themselves, **capped** (e.g. the 50 most recent), in parallel | Most expensive, ~5–10 s |
 
@@ -223,7 +243,7 @@ The agent has three kinds of memory:
 
 ```mermaid
 flowchart TD
-  A[Latest exchange<br/>+ user actions: marked watched / visited] --> B[1. Extract — text model<br/>candidate facts:<br/>'is vegetarian' · 'lives in Beşiktaş'<br/>'preparing for YDS' · 'already watched Interstellar']
+  A[Latest exchange<br/>+ user actions: marked watched / visited] --> B[1. Extract — text model<br/>candidate facts:<br/>'is vegetarian' · 'lives in Beşiktaş'<br/>'preparing for IELTS' · 'already watched Interstellar']
   B --> C[2. Gate — Gemini Decision 1 yes/no<br/>durable fact or preference?<br/>'I'm hungry now' → no]
   C -- yes --> D[3. Find similar memories<br/>vector search, top 5]
   D --> E[4. Consolidate — Gemini Decision 1 choice<br/>ADD · UPDATE existing · REPLACE contradicted · IGNORE duplicate]
@@ -232,8 +252,8 @@ flowchart TD
 ```
 
 How memory is used:
-- **Ranking and filtering:** a vegetarian user gets vegetarian places boosted, movies already watched are hidden or moved down, and "for my exam" means YDS.
-- **Fewer questions:** "near home" resolves to the stored home district.
+- **Ranking and filtering:** a vegetarian user gets vegetarian places boosted, movies already watched are hidden or moved down, and "for my exam" means the exam the user mentioned before (e.g. IELTS or the SAT).
+- **Fewer questions:** "near home" resolves to the stored home area.
 - **User control:** `list_memories` and `forget_memory` from chat, and everything is deleted with "delete my data". Sensitive categories (health, religion, etc.) are never stored. The gate rejects them.
 
 ### 3.8 Notifications (Phase 3)
@@ -247,11 +267,11 @@ Every model sits behind a small provider interface (`generator.generate`, `class
 | Role | Model | Why | Watch out for |
 |---|---|---|---|
 | **Fixed decisions:** content type, subtype/tags, has-speech, is-list, which resolver candidate, filter normalization, deep-look yes/no, memory gate + consolidation | **Gemini Decision 1** (Google, `gemini-decision-1`, launched 11 Nov 2026) | Takes **text, images, audio, video and PDFs directly**. Typed outputs with calibrated probabilities, up to 1,000 questions per pass, ~50–100 ms model time (Google's figures), $0.10/M input tokens, output free | Brand new, and all benchmarks are Google's own. Video is still token-heavy, so cost scales with video length. Do counting, maths and dates in code |
-| **Speech-to-text** (posts with speech only) | Whisper-class model (e.g. faster-whisper large-v3 self-hosted, or a hosted STT API) | Many reels say the name out loud. Good Turkish support | Background music lowers accuracy. Keep word timestamps for debugging |
+| **Speech-to-text** (posts with speech only) | Whisper-class model (e.g. faster-whisper large-v3 self-hosted, or a hosted STT API) | Many reels say the name out loud, in any language. Must handle many languages | Background music lowers accuracy. Keep word timestamps for debugging |
 | **Open-ended extraction** (entity names, type fields, summary) and **memory extraction** | DeepSeek V4.1 Flash (same provider as the response agent) | Names and summaries aren't fixed choices, so a decision model can't produce them. Text in, so it's cheap | Only as good as the caption + transcript it receives |
 | **Escalation:** watch the video when the text gave no entity | A multimodal generative model with native video + audio (e.g. Gemini Flash class) | Catches what the caption and speech missed (silent reels with text overlays, recognisable storefronts or movie scenes) | Most expensive per call. Track the escalation rate per type |
-| **Response agent** (understands the message, calls tools, writes the reply) | **DeepSeek V4.1 Flash** | Cheap, fast, good enough for tool calling + short replies | Check tool-call reliability and Turkish quality on our own tests. The first-party API is hosted in China, so consider another host for user data |
-| **Embeddings** | A multilingual embedding model | Turkish + English queries over Turkish captions | Re-embed everything if we switch models |
+| **Response agent** (understands the message, calls tools, writes the reply) | **DeepSeek V4.1 Flash** | Cheap, fast, good enough for tool calling + short replies | Check tool-call reliability and reply quality in several languages on our own tests. The first-party API is hosted in China, so consider another host for user data |
+| **Embeddings** | A multilingual embedding model | Queries in one language must find captions in another | Re-embed everything if we switch models |
 
 > **Fallback:** TypeSafe's **Jev** offers the same three question types and is cheaper ($0.042/M input), but its public docs describe text/structured input only. It's a good backup for text-only decisions (e.g. filter normalization, memory gate) behind the same `Classifier` interface.
 
@@ -271,17 +291,17 @@ erDiagram
   USER ||--o{ MEMORY : "long-term memory"
   USER ||--o{ CONVERSATION_MSG : has
 
-  USER { uuid id  text display_name  text home_city  text language  timestamptz created_at }
+  USER { uuid id  text display_name  text home_area  text country  text language  timestamptz created_at }
   PLATFORM_ACCOUNT { uuid id  uuid user_id  text platform  text platform_user_id  text username }
   SAVED_ITEM {
     uuid id  uuid user_id  text platform  text platform_post_id  text post_url
     text media_type  text caption  text transcript  text summary
-    text type  text subtype  text[] tags  text collection  jsonb fields  jsonb attributes
+    text type  text category  text subtype  text[] tags  text collection  jsonb fields  jsonb attributes
     text status  vector embedding  timestamptz saved_at  text source_message_id
   }
   ENTITY {
     uuid id  text type  text source  text external_id  text name  jsonb data
-    geography location  text district  text city  timestamptz refreshed_at
+    geography location  text country  text region  text city  text district  text neighbourhood  timestamptz refreshed_at
   }
   ITEM_ENTITY { uuid saved_item_id  uuid entity_id  int position  float confidence }
   USER_ENTITY { uuid user_id  uuid entity_id  text status  text note  int rating }
@@ -291,15 +311,18 @@ erDiagram
     uuid source_msg_id  uuid superseded_by  timestamptz created_at  timestamptz updated_at
   }
   CONVERSATION_MSG { uuid id  uuid user_id  text role  text content  timestamptz at }
+  VOCABULARY { uuid id  text field  text value  text[] aliases  vector embedding  int item_count  timestamptz created_at }
 ```
 
 - **`ENTITY`** is the real-world thing: a restaurant, a movie, a book. It's shared across all users, one record per `(source, external_id)`, e.g. `(google_places, ChIJ…)` or `(tmdb, 27205)`. Types without a resolver (study, recipe…) have no entity, and their info lives in `SAVED_ITEM.fields`.
-- `location`, `district` and `city` are only filled for places (PostGIS GIST index). Type-specific data goes in `data` (GIN index), e.g. genres and streaming providers for movies.
+- `location` and the address fields (`country`, `region`, `city`, `district`, `neighbourhood`) are only filled for places, from Google Places' address components for any country; any of them may be empty (PostGIS GIST index on `location`). Type-specific data goes in `data` (GIN index), e.g. genres and streaming providers for movies.
 - **`ITEM_ENTITY`** is many-to-many, because one list post can mention several entities.
 - **`USER_ENTITY.status`**: `want | done` (visited / watched / read), per user. Memory and ranking use it.
 - `SAVED_ITEM.fields` holds the extracted type fields (e.g. `{"subject": "maths", "topic": "integrals", "format": "tutorial"}`). `attributes` holds facts learned later by deep look.
 - `SAVED_ITEM.status` goes `pending → enriching → needs_user → done | failed`.
 - `SAVED_ITEM.source_message_id` is the Instagram message id (`mid`) of the DM or collection save that brought the item in. Answers reply to it so the saved reel shows again (§3.5). It's empty for items from imports.
+- `SAVED_ITEM.category` is the open category the text model gives every item ("restaurant", "car review"), and `type` is the built-in type when one applies (empty otherwise). `subtype`, `tags` and open values inside `fields` use the vocabulary.
+- **`VOCABULARY`** holds one canonical value per `field` (category, tag, cuisine, genre, subject, exam…) in English lower case, with `aliases` in any language and an `embedding` for matching new wordings. It's shared by all users and grows from real saves (§3.4). It stores generic words only: anything personal stays on the item, so "delete my data" never needs to touch it, and a value no item uses any more can be cleaned up.
 - Opening hours, ratings and streaming availability go out of date, so refresh `ENTITY.data` regularly (e.g. every 30 days), and also when the user asks for `open_now` or a platform.
 
 ## 5. Tech stack
@@ -311,7 +334,7 @@ erDiagram
 | DB | Postgres 16 + PostGIS + pgvector | One database for location queries, JSON filters and semantic search |
 | Models | Gemini Decision 1 for decisions, faster-whisper for speech, DeepSeek V4.1 Flash for extraction + replies, multimodal model for rare escalations, multilingual embeddings | See §3.9 |
 | Media | ffmpeg (downscale stored videos, thumbnails, audio extraction) | Standard tool |
-| Resolvers | Google Places API (New) · TMDB API · Open Library / Google Books | Best coverage in each area. TMDB includes streaming availability for Turkey |
+| Resolvers | Google Places API (New) · TMDB API · Open Library / Google Books | Best coverage in each area. TMDB includes streaming availability per country |
 | Hosting | Fly.io / Railway / Render to start | Public HTTPS URL for Meta's webhooks, and cheap |
 | Local dev | Docker Compose + ngrok/cloudflared tunnel | Meta needs a public HTTPS webhook URL |
 
@@ -387,7 +410,7 @@ savedagent/
 |---|---|---|
 | Instagram | ❌ No API for saved posts or collections | DM bot (official) → browser-extension import (optional) → share extension |
 | Facebook | ❌ | Messenger bot, share extension |
-| TikTok | ❌ In general. The Data Portability API may include favorites but needs approval and may be region-limited | Share extension. Check whether the portability API covers Turkey |
+| TikTok | ❌ In general. The Data Portability API may include favorites but needs approval and may be region-limited | Share extension. Check which countries the portability API covers |
 | X | ✅ Bookmarks API (paid tier) | OAuth + periodic sync |
 | YouTube | Partial (playlists via the Data API) | Share extension or playlist sync |
 
@@ -409,7 +432,7 @@ Instagram supports **collaborative collections**: you create a new collection, s
 - Ingestion → indexing pipeline (decision model on the video → speech-to-text → text-model extraction → resolver) → confirmation DM.
 - Content types: **place, movie/series, study, other**, with Google Places and TMDB resolvers.
 - Response agent (DeepSeek) with `search_items`, `near`, `set_status`, hybrid SQL + vector retrieval, and fallback levels L1–L2.
-- Short-term memory (history + working set) and a basic always-on profile (home district, language).
+- Short-term memory (history + working set) and a basic always-on profile (home area, country, language).
 - "Which one?" follow-up when we're not sure.
 - Label ~100 real saves as the evaluation set.
 - Runs in development mode, for your own account and testers.
