@@ -1,0 +1,19 @@
+{
+  "id": "gen-synthetic-0002",
+  "provider": "CoreWeave",
+  "model": "deepseek/deepseek-v4.1-flash",
+  "object": "chat.completion",
+  "created": 1794000000,
+  "choices": [
+    {
+      "index": 0,
+      "finish_reason": "stop",
+      "native_finish_reason": "stop",
+      "message": {
+        "role": "assistant",
+        "content": "{\"category\": \"cafe\", \"entities\": [{\"name\": \"Example Roasters\"}]}"
+      }
+    }
+  ],
+  "usage": {"prompt_tokens": 310, "completion_tokens": 24, "total_tokens": 334, "cost": 0.0000559}
+}

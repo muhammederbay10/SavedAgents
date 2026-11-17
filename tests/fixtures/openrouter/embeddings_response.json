@@ -1,0 +1,10 @@
+{
+  "id": "embd-synthetic-0001",
+  "object": "list",
+  "model": "openai/text-embedding-3-large",
+  "data": [
+    {"object": "embedding", "index": 1, "embedding": [0.5, 0.5, 0.5, 0.5]},
+    {"object": "embedding", "index": 0, "embedding": [1.0, 0.0, 0.0, 0.0]}
+  ],
+  "usage": {"prompt_tokens": 8, "total_tokens": 8, "cost": 0.00000104}
+}
