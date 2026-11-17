@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import re
@@ -9,10 +10,19 @@ from typing import Any
 import httpx
 import pytest
 
-from scripts.spikes.model_choices import cli
+from scripts.spikes.model_choices import cli, stt
 from scripts.spikes.model_choices.cli import REPOSITORY_ROOT, main
-from scripts.spikes.model_choices.settings import API_KEY_ENVIRONMENT_VARIABLE
-from tests.spikes.clip_set import LANGUAGES, SENTENCE_IDS, wav_bytes, write_clip_set
+from scripts.spikes.model_choices.settings import (
+    API_KEY_ENVIRONMENT_VARIABLE,
+    SPEECH_TO_TEXT_MODELS,
+)
+from tests.spikes.clip_set import (
+    CLIP_SECONDS,
+    LANGUAGES,
+    SENTENCE_IDS,
+    wav_bytes,
+    write_clip_set,
+)
 
 FAKE_KEY = "sk-test-not-a-real-key"
 PRIVATE_WORDS = "words spoken in a private reel"
@@ -21,22 +31,32 @@ EMBEDDING_COST = 0.00002
 FULL_SIZES = {"openai/text-embedding-3-large": 3072, "qwen/qwen3-embedding-8b": 4096}
 STT_MODEL_COUNT = 4
 FLEURS_CLIP_COUNT = len(LANGUAGES) * len(SENTENCE_IDS)
+# Requests go clip by clip, so the fourth one is the first clip with the fourth model.
+COMPLETED_BEFORE_THE_BREAK = 3
+INTERRUPTED_REQUEST_ESTIMATE = stt.estimate_transcription_usd(
+    SPEECH_TO_TEXT_MODELS[COMPLETED_BEFORE_THE_BREAK], CLIP_SECONDS
+)
 
 
 class FakeOpenRouter:
     """Answers like OpenRouter, from memory, and keeps the requests it saw."""
 
     def __init__(
-        self, transcription_cost: float | str = TRANSCRIPTION_COST, fail_after: int | None = None
+        self,
+        transcription_cost: float | str = TRANSCRIPTION_COST,
+        fail_after: int | None = None,
+        failure: BaseException | None = None,
     ) -> None:
         """Create the fake.
 
         Args:
             transcription_cost: The charge for a transcription, or a raw JSON literal such as "NaN".
-            fail_after: Crash on the paid request after this many, to imitate a broken run.
+            fail_after: Fail on the paid request after this many, to imitate a broken run.
+            failure: What that request raises; a crash by default.
         """
         self.transcription_cost = str(transcription_cost)
         self.fail_after = fail_after
+        self.failure = failure or RuntimeError("the run broke")
         self.requests: list[httpx.Request] = []
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
@@ -44,7 +64,7 @@ class FakeOpenRouter:
         if request.url.path.endswith("/key"):
             return httpx.Response(200, json={"data": {"usage": 0.08541}})
         if self.fail_after is not None and len(self.paid_requests()) > self.fail_after:
-            raise RuntimeError("the run broke")
+            raise self.failure
         body = json.loads(request.content)
         if request.url.path.endswith("/audio/transcriptions"):
             answer = (
@@ -457,7 +477,7 @@ def test_run_that_breaks_midway_still_writes_what_it_spent(
     media_directory, provenance_path = clip_set
     monkeypatch.setenv(API_KEY_ENVIRONMENT_VARIABLE, FAKE_KEY)
     output_directory = tmp_path / "out"
-    broken_api = FakeOpenRouter(fail_after=3)
+    broken_api = FakeOpenRouter(fail_after=COMPLETED_BEFORE_THE_BREAK)
 
     with pytest.raises(RuntimeError, match="the run broke"):
         run(live_arguments(media_directory, output_directory), provenance_path, broken_api)
@@ -465,6 +485,9 @@ def test_run_that_breaks_midway_still_writes_what_it_spent(
     report = load_report(output_directory)
     assert report["spend"]["run_finished"] is False
     assert report["spend"]["returned_this_run_usd"] == pytest.approx(3 * TRANSCRIPTION_COST)
+    assert report["spend"]["unconfirmed_this_run_usd"] == pytest.approx(
+        INTERRUPTED_REQUEST_ESTIMATE
+    )
     assert len(report["speech_to_text"]["requests"]) == 3
 
 
@@ -492,3 +515,77 @@ def test_report_that_cannot_be_written_is_reported_with_the_spending(
     ]
     expected = FLEURS_CLIP_COUNT * STT_MODEL_COUNT * TRANSCRIPTION_COST + 4 * EMBEDDING_COST
     assert spend_lines[-1]["returned_this_run_usd"] == pytest.approx(expected)
+
+
+def spend_log_lines(capsys: pytest.CaptureFixture[str]) -> list[dict[str, Any]]:
+    return [
+        json.loads(line)
+        for line in capsys.readouterr().out.splitlines()
+        if '"message": "spend"' in line
+    ]
+
+
+def assert_interrupted_spend(spend: dict[str, Any]) -> None:
+    """Three requests were charged; the fourth was cut off and counts once, as an estimate."""
+    assert spend["run_finished"] is False
+    assert spend["returned_this_run_usd"] == pytest.approx(
+        COMPLETED_BEFORE_THE_BREAK * TRANSCRIPTION_COST
+    )
+    assert spend["unconfirmed_this_run_usd"] == pytest.approx(INTERRUPTED_REQUEST_ESTIMATE)
+    assert spend["cumulative_usd"] == pytest.approx(
+        0.08541 + COMPLETED_BEFORE_THE_BREAK * TRANSCRIPTION_COST + INTERRUPTED_REQUEST_ESTIMATE
+    )
+
+
+def test_cancelled_request_is_reserved_once_in_the_report_and_the_spending_log(
+    clip_set: tuple[Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    media_directory, provenance_path = clip_set
+    monkeypatch.setenv(API_KEY_ENVIRONMENT_VARIABLE, FAKE_KEY)
+    output_directory = tmp_path / "out"
+    cancelled_api = FakeOpenRouter(
+        fail_after=COMPLETED_BEFORE_THE_BREAK, failure=asyncio.CancelledError()
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        run(live_arguments(media_directory, output_directory), provenance_path, cancelled_api)
+
+    assert len(cancelled_api.paid_requests()) == COMPLETED_BEFORE_THE_BREAK + 1
+    report = load_report(output_directory)
+    assert_interrupted_spend(report["spend"])
+    assert len(report["speech_to_text"]["requests"]) == COMPLETED_BEFORE_THE_BREAK
+    (logged_spend,) = spend_log_lines(capsys)
+    assert_interrupted_spend(logged_spend)
+
+
+def test_cancelled_run_whose_report_cannot_be_written_still_logs_the_reservation(
+    clip_set: tuple[Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    media_directory, provenance_path = clip_set
+    monkeypatch.setenv(API_KEY_ENVIRONMENT_VARIABLE, FAKE_KEY)
+    output_directory = tmp_path / "out"
+    cancelled_api = FakeOpenRouter(
+        fail_after=COMPLETED_BEFORE_THE_BREAK, failure=asyncio.CancelledError()
+    )
+
+    def disk_is_full(path: Path, report: dict[str, object]) -> None:
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(cli, "_write_report", disk_is_full)
+
+    # The cancellation must come through, not be replaced by the write error.
+    with pytest.raises(asyncio.CancelledError):
+        run(live_arguments(media_directory, output_directory), provenance_path, cancelled_api)
+
+    output = capsys.readouterr().out
+    (logged_spend,) = [
+        json.loads(line) for line in output.splitlines() if '"message": "spend"' in line
+    ]
+    assert_interrupted_spend(logged_spend)
+    assert '"message": "report_not_written"' in output

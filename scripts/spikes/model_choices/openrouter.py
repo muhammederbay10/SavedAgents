@@ -1,7 +1,9 @@
 """A minimal OpenRouter client for the spike: transcription, embeddings, key usage.
 
-Every paid request goes through the spending ledger first. The client never
-logs request or response bodies, and it never sees where the API key came from.
+Every paid request reserves its estimate in the spending ledger before it is
+sent, and the reservation is replaced only by a usable returned charge. The
+client never logs request or response bodies, and it never sees where the API
+key came from.
 
 Contracts (OpenRouter docs, 17 Nov 2026):
 
@@ -159,19 +161,21 @@ class OpenRouterClient:
         return _amount(data.get("usage")) if isinstance(data, dict) else None
 
     async def _post(self, path: str, payload: JsonObject, estimate_usd: float) -> ApiResult:
-        self._ledger.authorize(estimate_usd)
+        # Reserved before the await: if the request is cancelled or the run breaks while
+        # it is in flight, nothing below runs, and the estimate must already be counted.
+        reservation = self._ledger.reserve(estimate_usd)
         started = time.perf_counter()
         try:
             response = await self._http_client.post(path, json=payload)
         except httpx.HTTPError as error:
-            # A timeout can still be charged, so the estimate is counted as spent.
-            self._ledger.record(None, estimate_usd)
+            # A timeout can still be charged, so the estimate stays reserved.
+            self._ledger.settle(reservation, None)
             return ApiResult(None, time.perf_counter() - started, {}, None, type(error).__name__)
         latency_seconds = time.perf_counter() - started
         body = _json_object(response)
         usage = body.get("usage")
         returned_cost_usd = _amount(usage.get("cost")) if isinstance(usage, dict) else None
-        self._ledger.record(returned_cost_usd, estimate_usd)
+        self._ledger.settle(reservation, returned_cost_usd)
         return ApiResult(response.status_code, latency_seconds, body, returned_cost_usd)
 
 

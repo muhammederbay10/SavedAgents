@@ -236,9 +236,15 @@ def _run_live(
     measurements = Measurements()
     try:
         asyncio.run(_measure(api_key, ledger, samples, clips, transport, measurements))
-    finally:
-        # Requests may have been charged, so the spending is kept even if the run broke.
-        _save_report(report_path, build_report(provenance, plan, ledger, measurements))
+    except BaseException:
+        # The run broke or was cancelled after requests were sent. Keep the spending,
+        # then let the original error through: a failed write must not replace it.
+        try:
+            _save_report(report_path, build_report(provenance, plan, ledger, measurements))
+        except ReportNotWrittenError as error:
+            logger.error("report_not_written", extra={"reason": str(error)})
+        raise
+    _save_report(report_path, build_report(provenance, plan, ledger, measurements))
     return report_path
 
 

@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import json
 
@@ -16,13 +17,13 @@ VERBOSE_MODEL = SpeechToTextModel("vendor/verbose", "verbose_json", 0.003)
 class Recorder:
     """A mock transport handler that keeps the requests it saw."""
 
-    def __init__(self, response: httpx.Response | Exception) -> None:
+    def __init__(self, response: httpx.Response | BaseException) -> None:
         self.response = response
         self.requests: list[httpx.Request] = []
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
-        if isinstance(self.response, Exception):
+        if isinstance(self.response, BaseException):
             raise self.response
         return self.response
 
@@ -174,3 +175,49 @@ async def test_malformed_key_usage_is_none(usage_literal: str) -> None:
     recorder = Recorder(httpx.Response(200, content=body.encode("utf-8")))
 
     assert await client_for(recorder, roomy_ledger()).key_usage_usd() is None
+
+
+async def test_cancelled_request_keeps_its_estimate_reserved() -> None:
+    """A request cancelled after it was sent may still be charged."""
+    recorder = Recorder(asyncio.CancelledError())
+    ledger = SpendLedger(cap_usd=1.0, spent_before_usd=0.0)
+    client = client_for(recorder, ledger)
+
+    with pytest.raises(asyncio.CancelledError):
+        await client.transcribe(PLAIN_MODEL, b"RIFFdata", 0.6)
+
+    assert len(recorder.requests) == 1
+    assert ledger.returned_usd == 0.0
+    assert ledger.unconfirmed_usd == pytest.approx(0.6)
+    assert ledger.cumulative_usd == pytest.approx(0.6)
+    with pytest.raises(SpendCapExceededError):
+        await client.transcribe(PLAIN_MODEL, b"RIFFdata", 0.5)
+    assert len(recorder.requests) == 1
+
+
+async def test_estimate_is_reserved_before_the_request_is_sent() -> None:
+    ledger = SpendLedger(cap_usd=1.0, spent_before_usd=0.0)
+    reserved_while_sending: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        reserved_while_sending.append(ledger.unconfirmed_usd)
+        return httpx.Response(200, json={"text": "hi", "usage": {"cost": 0.0002}})
+
+    client = OpenRouterClient(build_http_client(FAKE_KEY, httpx.MockTransport(handler)), ledger)
+
+    await client.transcribe(PLAIN_MODEL, b"RIFFdata", 0.6)
+
+    assert reserved_while_sending == [pytest.approx(0.6)]
+
+
+async def test_usable_charge_replaces_the_reservation_exactly_once() -> None:
+    recorder = Recorder(httpx.Response(200, json={"text": "hi", "usage": {"cost": 0.0002}}))
+    ledger = SpendLedger(cap_usd=1.0, spent_before_usd=0.0)
+    client = client_for(recorder, ledger)
+
+    for _ in range(3):
+        await client.transcribe(PLAIN_MODEL, b"RIFFdata", 0.1)
+
+    assert ledger.unconfirmed_usd == 0.0
+    assert ledger.returned_usd == pytest.approx(0.0006)
+    assert ledger.cumulative_usd == pytest.approx(0.0006)
