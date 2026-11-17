@@ -121,7 +121,7 @@ The schema is defined twice, and a test keeps the two in step:
 
 Alembic reads `DATABASE_URL` and `EMBEDDING_DIMENSION` through `app/config.py`, from `.env` or the environment. Run it from the repository root.
 
-The first migration creates `saved_item.embedding` with `EMBEDDING_DIMENSION` components. To change the dimension after that, write a new migration that resizes the column, and re-embed every saved item.
+The first migration creates the two embedding columns (`saved_item.embedding` and `vocabulary.embedding`) with `EMBEDDING_DIMENSION` components. To change the dimension after that, write a new migration that resizes both columns, and embed every saved item and vocabulary value again.
 
 ## Configuration
 
