@@ -112,6 +112,8 @@ The schema is defined twice, and a test keeps the two in step:
 - [`app/db/models.py`](app/db/models.py): SQLAlchemy models, used for queries.
 - [`app/db/migrations/versions/`](app/db/migrations/versions/): Alembic migrations, the only thing that changes the database.
 
+"Delete my data" is `delete_user_data()` in [`app/db/deletion.py`](app/db/deletion.py). It deletes one user's rows and lowers the item counts of the shared vocabulary. The shared tables (entities, streaming availability, vocabulary and aliases) keep their rows.
+
 | Command | What it does |
 |---|---|
 | `make migrate` | Apply every migration (`alembic upgrade head`) |
@@ -230,6 +232,7 @@ app/
   db/
     models.py         # SQLAlchemy models
     types.py          # column types for pgvector and PostGIS
+    deletion.py       # "delete my data" for one user
     migrations/       # Alembic environment and revisions
 alembic.ini           # Alembic configuration
 tests/                # pytest suite

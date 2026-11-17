@@ -414,6 +414,7 @@ savedagent/
     db/
       models.py             # SQLAlchemy models for the tables in §4
       types.py              # column types for pgvector and PostGIS
+      deletion.py           # "delete my data": removes a user's rows, lowers vocabulary counts
       migrations/           # Alembic environment and revisions
   evals/
     labeled_saves.jsonl     # ~100 hand-labeled saves for model comparison
