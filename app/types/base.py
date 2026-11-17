@@ -2,6 +2,11 @@
 
 A content type is data, not code paths: the pipeline and the search read these
 declarations, so adding a type never needs an `if type == ...` anywhere else.
+
+No declaration lists real-world values. Categories, cuisines, genres, subjects
+and the like are open text in any language. The shared vocabulary keeps them
+consistent, and a field or filter only says which part of the vocabulary its
+values belong to.
 """
 
 from dataclasses import dataclass
@@ -10,7 +15,8 @@ from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
-MINIMUM_SUBTYPE_OPTIONS = 2
+CATEGORY_VOCABULARY = "category"
+TAG_VOCABULARY = "tag"
 
 NonEmptyText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 
@@ -19,122 +25,22 @@ class ContentTypeDefinitionError(ValueError):
     """A content type, or one of its parts, is declared in a way that cannot work."""
 
 
-def values_of(vocabulary: type[StrEnum]) -> tuple[str, ...]:
-    """List the values of a closed vocabulary, in declaration order.
-
-    Args:
-        vocabulary: The enum that holds the allowed values.
-
-    Returns:
-        The enum's values as plain strings.
-    """
-    return tuple(member.value for member in vocabulary)
-
-
-def _require_unique(values: tuple[str, ...], what: str) -> None:
-    """Reject a declaration that names the same value twice.
-
-    Args:
-        values: The declared values.
-        what: What the values are, for the error message.
-
-    Raises:
-        ContentTypeDefinitionError: If a value appears more than once.
-    """
-    duplicates = sorted({value for value in values if values.count(value) > 1})
-    if duplicates:
-        raise ContentTypeDefinitionError(f"Duplicate {what}: {', '.join(duplicates)}")
-
-
 @dataclass(frozen=True)
-class SubtypeQuestion:
-    """The choice question the decision model answers to pick a post's subtype.
+class Vocabulary:
+    """Marks an open-text schema field whose values are normalized against the vocabulary.
+
+    The text model writes such a value in its own words, in any language. The
+    normalization step then matches it with the existing values of the same
+    vocabulary field, so "korean", "Korean food" and "Kore mutfağı" end up as
+    one value. Put the marker on the whole field, also when the field can be
+    null or holds several values:
+    `Annotated[NonEmptyText | None, Vocabulary("cuisine")]`.
 
     Attributes:
-        text: The question, as it is put to the decision model.
-        options: The subtypes to choose from. Exactly one is picked.
-
-    Raises:
-        ContentTypeDefinitionError: If there are fewer than two options, or an
-            option is listed twice.
+        field: The part of the vocabulary the values belong to, e.g. `cuisine`.
     """
 
-    text: str
-    options: tuple[str, ...]
-
-    def __post_init__(self) -> None:
-        """Check that the options form a real choice."""
-        if len(self.options) < MINIMUM_SUBTYPE_OPTIONS:
-            raise ContentTypeDefinitionError(
-                f"A subtype question needs at least {MINIMUM_SUBTYPE_OPTIONS} options"
-            )
-        _require_unique(self.options, "subtype options")
-
-
-@dataclass(frozen=True)
-class TagQuestion:
-    """A yes/no question the decision model answers. "Yes" adds the tag to the post.
-
-    Attributes:
-        tag: The tag that is stored when the answer is yes.
-        text: The question, as it is put to the decision model.
-    """
-
-    tag: str
-    text: str
-
-
-class FilterKind(StrEnum):
-    """The kind of value a search filter takes.
-
-    Attributes:
-        CHOICE: One of the filter's allowed values.
-        BOOLEAN: True or false.
-        INTEGER: A whole number.
-        TEXT: Free text.
-        LOCATION: A point and a distance around it.
-    """
-
-    CHOICE = "choice"
-    BOOLEAN = "boolean"
-    INTEGER = "integer"
-    TEXT = "text"
-    LOCATION = "location"
-
-
-@dataclass(frozen=True)
-class SearchFilter:
-    """A filter that a content type offers to search.
-
-    Attributes:
-        name: The key used in a search's `filters` argument, e.g. `district`.
-        kind: The kind of value the filter takes.
-        description: What the filter selects, written for the response agent.
-        allowed_values: The values a `CHOICE` filter accepts. User input is
-            normalized to one of them. Empty for every other kind.
-
-    Raises:
-        ContentTypeDefinitionError: If a `CHOICE` filter has no allowed values,
-            another kind has some, or a value is listed twice.
-    """
-
-    name: str
-    kind: FilterKind
-    description: str
-    allowed_values: tuple[str, ...] = ()
-
-    def __post_init__(self) -> None:
-        """Check that allowed values are given exactly when the kind needs them."""
-        is_choice = self.kind is FilterKind.CHOICE
-        if is_choice and not self.allowed_values:
-            raise ContentTypeDefinitionError(
-                f"Filter '{self.name}' is a choice and needs allowed values"
-            )
-        if not is_choice and self.allowed_values:
-            raise ContentTypeDefinitionError(
-                f"Filter '{self.name}' is not a choice, so it cannot have allowed values"
-            )
-        _require_unique(self.allowed_values, f"allowed values in filter '{self.name}'")
+    field: str
 
 
 class ExtractionModel(BaseModel):
@@ -147,6 +53,26 @@ class ExtractionModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
+def vocabulary_fields(model: type[ExtractionModel]) -> dict[str, str]:
+    """Find the fields of a schema model that are normalized against the vocabulary.
+
+    Only the model's own fields are listed. Models nested inside it, such as
+    the mentions of an `EntityExtraction`, are asked separately.
+
+    Args:
+        model: The schema model to inspect.
+
+    Returns:
+        The vocabulary field of each marked field, by the field's name.
+    """
+    return {
+        name: marker.field
+        for name, field in model.model_fields.items()
+        for marker in field.metadata
+        if isinstance(marker, Vocabulary)
+    }
+
+
 class EntityMention(ExtractionModel):
     """One real-world thing a post mentions, before a resolver has looked it up.
 
@@ -154,15 +80,25 @@ class EntityMention(ExtractionModel):
     """
 
 
+# A post that fits no built-in type is extracted with exactly this schema, so it keeps
+# its category, tags and summary. A built-in type's schema extends it.
 class Extraction(ExtractionModel):
-    """What the text model extracts from one post. Every type's schema extends it.
-
-    Attributes:
-        summary: One or two sentences on what the post is about.
-    """
+    """What the text model extracts from every post, whatever it is about."""
 
     summary: NonEmptyText = Field(
         description="One or two sentences on what the post is about, in the post's language."
+    )
+    category: Annotated[NonEmptyText, Vocabulary(CATEGORY_VOCABULARY)] = Field(
+        description=(
+            "What the post is, in a few plain words of your own, e.g. 'restaurant', "
+            "'car review', 'skincare routine' or 'guitar lesson'. There is no list to pick from."
+        )
+    )
+    tags: Annotated[tuple[NonEmptyText, ...], Vocabulary(TAG_VOCABULARY)] = Field(
+        description=(
+            "A few short labels in plain words for what the post is about, e.g. 'rooftop', "
+            "'budget' or 'beginner'. There is no list to pick from. May be empty."
+        )
     )
 
 
@@ -178,48 +114,104 @@ class EntityExtraction(Extraction):
     entities: tuple[EntityMention, ...]
 
 
+class FilterKind(StrEnum):
+    """The kind of value a search filter takes.
+
+    Attributes:
+        VALUE: An open value, such as a cuisine or a genre. What the user typed
+            is normalized to a value that exists in their own saves.
+        AREA: The name of a place at any level: a country, region, city,
+            district or neighbourhood, anywhere in the world.
+        LOCATION: A point and a distance around it.
+        BOOLEAN: True or false.
+        INTEGER: A whole number.
+        TEXT: Free text that is matched as it is.
+    """
+
+    VALUE = "value"
+    AREA = "area"
+    LOCATION = "location"
+    BOOLEAN = "boolean"
+    INTEGER = "integer"
+    TEXT = "text"
+
+
+@dataclass(frozen=True)
+class SearchFilter:
+    """An extra filter that a content type offers to search.
+
+    `category` and `tags` are not declared here. Search offers them for every item.
+
+    Attributes:
+        name: The key used in a search's `filters` argument, e.g. `area`.
+        kind: The kind of value the filter takes.
+        description: What the filter selects, written for the response agent.
+        vocabulary: The vocabulary field a `VALUE` filter's values belong to,
+            e.g. `cuisine`. Its aliases let a question in one language find a
+            value saved in another. `None` when the values come from somewhere
+            else, such as a resolver, and for every other kind.
+
+    Raises:
+        ContentTypeDefinitionError: If a filter that is not a `VALUE` names a
+            vocabulary field.
+    """
+
+    name: str
+    kind: FilterKind
+    description: str
+    vocabulary: str | None = None
+
+    def __post_init__(self) -> None:
+        """Check that only an open-value filter points at the vocabulary."""
+        if self.vocabulary is not None and self.kind is not FilterKind.VALUE:
+            raise ContentTypeDefinitionError(
+                f"Filter '{self.name}' is not an open value, so it cannot use the vocabulary"
+            )
+
+
 @dataclass(frozen=True)
 class ContentType:
-    """Everything the system needs to know about one kind of saved post.
+    """Everything the system needs to know about one built-in kind of saved post.
 
     Attributes:
         name: The identifier stored on a saved item, e.g. `place`.
         description: What the type covers. The decision model sees it as one of
-            the options when it picks a post's type.
+            the options when it picks a post's type, next to "none of these".
         extraction_schema: The Pydantic model the text model fills in.
-        subtype_question: The question that picks the subtype, or `None` when
-            the type has no subtypes.
-        tag_questions: The yes/no questions that tag a post. May be empty.
         resolver: The name of the resolver in `app/resolvers/` that looks up
             this type's entities, e.g. `tmdb`. `None` means the type has no
             real-world entity, and everything it knows stays on the saved item.
-        search_filters: The filters the type offers to search.
+        search_filters: The filters the type adds to search.
 
     Raises:
-        ContentTypeDefinitionError: If two tags or two filters share a name, or
-            the resolver and the extraction schema disagree on whether the type
+        ContentTypeDefinitionError: If two filters share a name, or the
+            resolver and the extraction schema disagree on whether the type
             has entities.
     """
 
     name: str
     description: str
     extraction_schema: type[Extraction]
-    subtype_question: SubtypeQuestion | None
-    tag_questions: tuple[TagQuestion, ...]
     resolver: str | None
     search_filters: tuple[SearchFilter, ...]
 
     def __post_init__(self) -> None:
         """Check that the parts of the declaration fit together."""
-        _require_unique(
-            tuple(question.tag for question in self.tag_questions),
-            f"tags in content type '{self.name}'",
-        )
-        _require_unique(
-            tuple(search_filter.name for search_filter in self.search_filters),
-            f"filters in content type '{self.name}'",
-        )
+        self._require_unique_filter_names()
         self._require_resolver_matches_schema()
+
+    def _require_unique_filter_names(self) -> None:
+        """Check that no two filters share a name.
+
+        Raises:
+            ContentTypeDefinitionError: If a filter name appears more than once.
+        """
+        names = [search_filter.name for search_filter in self.search_filters]
+        duplicates = sorted({name for name in names if names.count(name) > 1})
+        if duplicates:
+            raise ContentTypeDefinitionError(
+                f"Duplicate filters in content type '{self.name}': {', '.join(duplicates)}"
+            )
 
     def _require_resolver_matches_schema(self) -> None:
         """Check that a resolver is declared exactly when the schema lists entities.

@@ -51,7 +51,7 @@ select = [
     "SIM", # simplifications
     "RUF", # ruff-specific rules
 ]
-# Turkish names such as Kadıköy use the dotless ı on purpose. It is not a mistyped i.
+# Names such as Kadıköy use the dotless ı on purpose. It is not a mistyped i.
 allowed-confusables = ["ı"]
 
 [tool.ruff.lint.pydocstyle]

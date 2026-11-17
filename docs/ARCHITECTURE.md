@@ -381,9 +381,9 @@ savedagent/
       multimodal.py         # video model for escalations
       embeddings.py
     types/                  # built-in types only — one module each; items with no built-in type need none
-      base.py               # what a type declares: ContentType, questions, filters, schema bases
+      base.py               # what a type declares: ContentType, filters, schema bases, vocabulary marks
       registry.py           # the list of types, looked up by name
-      place.py              # schema, decision questions, filters, resolver
+      place.py              # schema, filters, resolver
       movie.py
       study.py
     resolvers/

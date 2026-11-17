@@ -1,6 +1,6 @@
 """The `study` content type: a tip, tutorial, explanation or course for learning something."""
 
-from enum import StrEnum
+from typing import Annotated
 
 from pydantic import Field
 
@@ -10,64 +10,31 @@ from app.types.base import (
     FilterKind,
     NonEmptyText,
     SearchFilter,
-    SubtypeQuestion,
-    TagQuestion,
-    values_of,
+    Vocabulary,
 )
 
-
-class StudyFormat(StrEnum):
-    """The formats a study post comes in. A post's format is its subtype."""
-
-    TIP = "tip"
-    TUTORIAL = "tutorial"
-    EXPLAINER = "explainer"
-    COURSE = "course"
-
-
-class StudySubject(StrEnum):
-    """The subjects a study post can be filtered by. `OTHER` covers everything else."""
-
-    MATHS = "maths"
-    PHYSICS = "physics"
-    CHEMISTRY = "chemistry"
-    BIOLOGY = "biology"
-    TURKISH = "turkish"
-    ENGLISH = "english"
-    FOREIGN_LANGUAGES = "foreign languages"
-    HISTORY = "history"
-    GEOGRAPHY = "geography"
-    PHILOSOPHY = "philosophy"
-    PROGRAMMING = "programming"
-    STUDY_SKILLS = "study skills"
-    OTHER = "other"
-
-
-class Exam(StrEnum):
-    """The exams a study post can prepare for."""
-
-    YKS = "YKS"
-    LGS = "LGS"
-    KPSS = "KPSS"
-    ALES = "ALES"
-    DGS = "DGS"
-    YDS = "YDS"
-    YOKDIL = "YÖKDİL"
-    IELTS = "IELTS"
-    TOEFL = "TOEFL"
+SUBJECT_VOCABULARY = "subject"
+FORMAT_VOCABULARY = "format"
+EXAM_VOCABULARY = "exam"
 
 
 class StudyExtraction(Extraction):
     """What the text model extracts from a study post."""
 
-    subject: StudySubject = Field(
+    subject: Annotated[NonEmptyText, Vocabulary(SUBJECT_VOCABULARY)] = Field(
         description=(
-            "The subject the post teaches. Use 'study skills' for advice on how to study "
-            "and 'other' when no subject fits."
+            "The subject the post teaches, in a few plain words of your own, e.g. 'maths', "
+            "'organic chemistry' or 'study skills'. There is no list to pick from."
         )
     )
     topic: NonEmptyText = Field(
         description="The specific topic, e.g. 'integrals', 'phrasal verbs' or 'spaced repetition'."
+    )
+    format: Annotated[NonEmptyText, Vocabulary(FORMAT_VOCABULARY)] = Field(
+        description=(
+            "The form the post takes, in a few plain words of your own, e.g. 'tip', "
+            "'tutorial', 'explainer' or 'course'. There is no list to pick from."
+        )
     )
     key_points: tuple[NonEmptyText, ...] = Field(
         description="The main things the post teaches, one short sentence each. May be empty."
@@ -77,8 +44,11 @@ class StudyExtraction(Extraction):
             "Books, apps, channels, sites or courses the post mentions by name. May be empty."
         )
     )
-    exam: Exam | None = Field(
-        description="The exam the post prepares for, only if it names one. Null otherwise."
+    exam: Annotated[NonEmptyText | None, Vocabulary(EXAM_VOCABULARY)] = Field(
+        description=(
+            "The exam or course the post prepares for, as the post names it, in any country, "
+            "e.g. 'IELTS', 'SAT' or 'YKS'. Null if it names none."
+        )
     )
 
 
@@ -86,34 +56,13 @@ STUDY = ContentType(
     name="study",
     description="Study material: a tip, tutorial, explanation or course for learning something.",
     extraction_schema=StudyExtraction,
-    subtype_question=SubtypeQuestion(
-        text=(
-            "What format is the post: a short tip, a step-by-step tutorial, an explainer "
-            "of one idea, or a course with several lessons?"
-        ),
-        options=values_of(StudyFormat),
-    ),
-    tag_questions=(
-        TagQuestion(
-            tag="practice",
-            text="Does the post solve or share practice questions?",
-        ),
-        TagQuestion(
-            tag="notes",
-            text="Does the post show written notes, a summary sheet or a mind map?",
-        ),
-        TagQuestion(
-            tag="resources",
-            text="Does the post recommend books, apps, channels or other study resources?",
-        ),
-    ),
     resolver=None,
     search_filters=(
         SearchFilter(
             name="subject",
-            kind=FilterKind.CHOICE,
+            kind=FilterKind.VALUE,
             description="The subject the post teaches.",
-            allowed_values=values_of(StudySubject),
+            vocabulary=SUBJECT_VOCABULARY,
         ),
         SearchFilter(
             name="topic",
@@ -122,15 +71,15 @@ STUDY = ContentType(
         ),
         SearchFilter(
             name="format",
-            kind=FilterKind.CHOICE,
-            description="The post's format.",
-            allowed_values=values_of(StudyFormat),
+            kind=FilterKind.VALUE,
+            description="The form the post takes, e.g. a tip or a tutorial.",
+            vocabulary=FORMAT_VOCABULARY,
         ),
         SearchFilter(
             name="exam",
-            kind=FilterKind.CHOICE,
-            description="The exam the post prepares for.",
-            allowed_values=values_of(Exam),
+            kind=FilterKind.VALUE,
+            description="The exam or course the post prepares for.",
+            vocabulary=EXAM_VOCABULARY,
         ),
     ),
 )

@@ -1,4 +1,4 @@
-"""The registry lists the Phase 1 types, and a type's declaration must be coherent."""
+"""The registry lists the built-in types, and a type's declaration must be coherent."""
 
 import ast
 from pathlib import Path
@@ -13,13 +13,10 @@ from app.types.base import (
     Extraction,
     FilterKind,
     SearchFilter,
-    SubtypeQuestion,
-    TagQuestion,
 )
 from app.types.registry import CONTENT_TYPES, ContentTypeRegistry, UnknownContentTypeError
 
-PHASE_1_TYPE_NAMES = ["place", "movie", "study", "other"]
-ISTANBUL_DISTRICT_COUNT = 39
+BUILT_IN_TYPE_NAMES = ["place", "movie", "study"]
 
 APP_DIR = Path(__file__).parent.parent / "app"
 # The only folders that may hold logic for one specific content type (ARCHITECTURE §6).
@@ -48,7 +45,6 @@ def make_content_type(
     *,
     name: str = "recipe",
     extraction_schema: type[Extraction] = RecipeExtraction,
-    tag_questions: tuple[TagQuestion, ...] = (),
     resolver: str | None = None,
     search_filters: tuple[SearchFilter, ...] = (),
 ) -> ContentType:
@@ -56,39 +52,56 @@ def make_content_type(
         name=name,
         description="A made-up type for tests.",
         extraction_schema=extraction_schema,
-        subtype_question=None,
-        tag_questions=tag_questions,
         resolver=resolver,
         search_filters=search_filters,
     )
 
 
-def filter_names(type_name: str) -> list[str]:
-    return [search_filter.name for search_filter in CONTENT_TYPES.get(type_name).search_filters]
-
-
-def allowed_values(type_name: str, filter_name: str) -> tuple[str, ...]:
+def search_filter(type_name: str, filter_name: str) -> SearchFilter:
     matches = [
-        search_filter
-        for search_filter in CONTENT_TYPES.get(type_name).search_filters
-        if search_filter.name == filter_name
+        candidate
+        for candidate in CONTENT_TYPES.get(type_name).search_filters
+        if candidate.name == filter_name
     ]
     assert len(matches) == 1
-    return matches[0].allowed_values
+    return matches[0]
 
 
-def test_registry_lists_every_phase_1_type() -> None:
-    assert [content_type.name for content_type in CONTENT_TYPES.all()] == PHASE_1_TYPE_NAMES
+def test_registry_lists_every_built_in_type() -> None:
+    assert [content_type.name for content_type in CONTENT_TYPES.all()] == BUILT_IN_TYPE_NAMES
 
 
-@pytest.mark.parametrize("type_name", PHASE_1_TYPE_NAMES)
+@pytest.mark.parametrize("type_name", BUILT_IN_TYPE_NAMES)
 def test_registry_returns_a_type_by_its_name(type_name: str) -> None:
     assert CONTENT_TYPES.get(type_name).name == type_name
 
 
 def test_unknown_type_name_fails_and_names_the_registered_types() -> None:
-    with pytest.raises(UnknownContentTypeError, match=r"'podcast'.*place, movie, study, other"):
+    with pytest.raises(UnknownContentTypeError, match=r"'podcast'.*place, movie, study"):
         CONTENT_TYPES.get("podcast")
+
+
+def test_there_is_no_catch_all_type() -> None:
+    with pytest.raises(UnknownContentTypeError):
+        CONTENT_TYPES.get("other")
+
+
+def test_a_post_without_a_built_in_type_uses_the_shared_schema() -> None:
+    assert CONTENT_TYPES.extraction_schema(None) is Extraction
+
+
+@pytest.mark.parametrize("type_name", BUILT_IN_TYPE_NAMES)
+def test_a_built_in_type_extends_the_shared_schema(type_name: str) -> None:
+    schema = CONTENT_TYPES.extraction_schema(type_name)
+
+    assert schema is CONTENT_TYPES.get(type_name).extraction_schema
+    assert issubclass(schema, Extraction)
+    assert schema is not Extraction
+
+
+def test_schema_for_an_unknown_type_name_fails() -> None:
+    with pytest.raises(UnknownContentTypeError, match="'podcast'"):
+        CONTENT_TYPES.extraction_schema("podcast")
 
 
 def test_a_new_type_is_found_once_it_is_registered() -> None:
@@ -97,8 +110,9 @@ def test_a_new_type_is_found_once_it_is_registered() -> None:
     registry = ContentTypeRegistry((*CONTENT_TYPES.all(), recipe))
 
     assert registry.get("recipe") is recipe
+    assert registry.extraction_schema("recipe") is RecipeExtraction
     assert [content_type.name for content_type in registry.all()] == [
-        *PHASE_1_TYPE_NAMES,
+        *BUILT_IN_TYPE_NAMES,
         "recipe",
     ]
 
@@ -108,47 +122,14 @@ def test_registering_the_same_name_twice_is_rejected() -> None:
         ContentTypeRegistry((make_content_type(name="recipe"), make_content_type(name="recipe")))
 
 
-@pytest.mark.parametrize("type_name", PHASE_1_TYPE_NAMES)
+@pytest.mark.parametrize("type_name", BUILT_IN_TYPE_NAMES)
 def test_every_type_describes_itself_for_the_type_decision(type_name: str) -> None:
     assert CONTENT_TYPES.get(type_name).description.strip()
 
 
 @pytest.mark.parametrize(
-    ("type_name", "subtypes"),
-    [
-        ("place", ("restaurant", "cafe", "bar", "shop", "attraction")),
-        ("movie", ("movie", "series")),
-        ("study", ("tip", "tutorial", "explainer", "course")),
-    ],
-)
-def test_type_declares_its_subtype_question(type_name: str, subtypes: tuple[str, ...]) -> None:
-    question = CONTENT_TYPES.get(type_name).subtype_question
-
-    assert question is not None
-    assert question.text.endswith("?")
-    assert question.options == subtypes
-
-
-@pytest.mark.parametrize("type_name", ["place", "movie", "study"])
-def test_type_declares_its_tag_questions(type_name: str) -> None:
-    questions = CONTENT_TYPES.get(type_name).tag_questions
-
-    assert questions
-    for question in questions:
-        assert question.tag == question.tag.strip().lower()
-        assert question.text.endswith("?")
-
-
-def test_other_asks_the_decision_model_nothing() -> None:
-    other = CONTENT_TYPES.get("other")
-
-    assert other.subtype_question is None
-    assert other.tag_questions == ()
-
-
-@pytest.mark.parametrize(
     ("type_name", "resolver"),
-    [("place", "google_places"), ("movie", "tmdb"), ("study", None), ("other", None)],
+    [("place", "google_places"), ("movie", "tmdb"), ("study", None)],
 )
 def test_type_declares_its_resolver(type_name: str, resolver: str | None) -> None:
     assert CONTENT_TYPES.get(type_name).resolver == resolver
@@ -157,53 +138,59 @@ def test_type_declares_its_resolver(type_name: str, resolver: str | None) -> Non
 @pytest.mark.parametrize(
     ("type_name", "expected_filters"),
     [
-        ("place", ["district", "near", "open_now", "cuisine", "price"]),
+        ("place", ["area", "near", "open_now", "cuisine", "price"]),
         ("movie", ["genre", "year", "streaming", "watched"]),
         ("study", ["subject", "topic", "format", "exam"]),
-        ("other", ["tags"]),
     ],
 )
 def test_type_offers_the_filters_from_the_design(
     type_name: str, expected_filters: list[str]
 ) -> None:
-    assert filter_names(type_name) == expected_filters
+    names = [candidate.name for candidate in CONTENT_TYPES.get(type_name).search_filters]
+
+    assert names == expected_filters
 
 
-@pytest.mark.parametrize("type_name", PHASE_1_TYPE_NAMES)
+@pytest.mark.parametrize("type_name", BUILT_IN_TYPE_NAMES)
 def test_every_filter_is_described_for_the_response_agent(type_name: str) -> None:
-    for search_filter in CONTENT_TYPES.get(type_name).search_filters:
-        assert search_filter.description.strip()
+    for candidate in CONTENT_TYPES.get(type_name).search_filters:
+        assert candidate.description.strip()
 
 
-def test_district_filter_allows_the_39_istanbul_districts() -> None:
-    districts = allowed_values("place", "district")
+def test_place_is_filtered_by_an_area_at_any_level_not_by_a_district_list() -> None:
+    place_filters = {candidate.name for candidate in CONTENT_TYPES.get("place").search_filters}
 
-    assert len(districts) == ISTANBUL_DISTRICT_COUNT
-    assert {"Beşiktaş", "Kadıköy", "Üsküdar", "Şişli", "Eyüpsultan"} <= set(districts)
+    assert search_filter("place", "area").kind is FilterKind.AREA
+    assert "district" not in place_filters
 
 
 @pytest.mark.parametrize(
-    ("type_name", "filter_name", "example_values"),
+    ("type_name", "filter_name", "vocabulary"),
     [
-        ("place", "cuisine", {"turkish", "seafood", "other"}),
-        ("place", "price", {"inexpensive", "very expensive"}),
-        ("movie", "genre", {"horror", "science fiction", "documentary"}),
-        ("movie", "streaming", {"Netflix", "Disney+", "MUBI"}),
-        ("study", "subject", {"maths", "english", "programming"}),
-        ("study", "exam", {"YKS", "YDS", "IELTS"}),
+        ("place", "cuisine", "cuisine"),
+        ("movie", "genre", "genre"),
+        ("study", "subject", "subject"),
+        ("study", "format", "format"),
+        ("study", "exam", "exam"),
     ],
 )
-def test_choice_filter_allows_the_values_from_the_design(
-    type_name: str, filter_name: str, example_values: set[str]
+def test_open_value_filter_declares_its_vocabulary_field(
+    type_name: str, filter_name: str, vocabulary: str
 ) -> None:
-    assert example_values <= set(allowed_values(type_name, filter_name))
+    declared = search_filter(type_name, filter_name)
+
+    assert declared.kind is FilterKind.VALUE
+    assert declared.vocabulary == vocabulary
 
 
-def test_study_format_filter_allows_exactly_the_study_subtypes() -> None:
-    question = CONTENT_TYPES.get("study").subtype_question
+@pytest.mark.parametrize(("type_name", "filter_name"), [("place", "price"), ("movie", "streaming")])
+def test_filter_with_resolver_values_is_open_but_outside_the_vocabulary(
+    type_name: str, filter_name: str
+) -> None:
+    declared = search_filter(type_name, filter_name)
 
-    assert question is not None
-    assert allowed_values("study", "format") == question.options
+    assert declared.kind is FilterKind.VALUE
+    assert declared.vocabulary is None
 
 
 @pytest.mark.parametrize(
@@ -214,64 +201,28 @@ def test_study_format_filter_allows_exactly_the_study_subtypes() -> None:
         ("movie", "year", FilterKind.INTEGER),
         ("movie", "watched", FilterKind.BOOLEAN),
         ("study", "topic", FilterKind.TEXT),
-        ("other", "tags", FilterKind.TEXT),
     ],
 )
-def test_open_ended_filter_declares_its_kind_and_no_allowed_values(
-    type_name: str, filter_name: str, kind: FilterKind
-) -> None:
-    matches = [
-        search_filter
-        for search_filter in CONTENT_TYPES.get(type_name).search_filters
-        if search_filter.name == filter_name
-    ]
+def test_other_filter_declares_its_kind(type_name: str, filter_name: str, kind: FilterKind) -> None:
+    declared = search_filter(type_name, filter_name)
 
-    assert [search_filter.kind for search_filter in matches] == [kind]
-    assert matches[0].allowed_values == ()
-
-
-@pytest.mark.parametrize("options", [(), ("only",)])
-def test_subtype_question_needs_at_least_two_options(options: tuple[str, ...]) -> None:
-    with pytest.raises(ContentTypeDefinitionError, match="at least 2 options"):
-        SubtypeQuestion(text="Which one?", options=options)
-
-
-def test_subtype_question_rejects_a_repeated_option() -> None:
-    with pytest.raises(ContentTypeDefinitionError, match="Duplicate subtype options: cafe"):
-        SubtypeQuestion(text="Which one?", options=("cafe", "bar", "cafe"))
-
-
-def test_choice_filter_needs_allowed_values() -> None:
-    with pytest.raises(ContentTypeDefinitionError, match="'diet' is a choice"):
-        SearchFilter(name="diet", kind=FilterKind.CHOICE, description="The diet.")
+    assert declared.kind is kind
+    assert declared.vocabulary is None
 
 
 @pytest.mark.parametrize(
-    "kind", [FilterKind.BOOLEAN, FilterKind.INTEGER, FilterKind.TEXT, FilterKind.LOCATION]
+    "kind",
+    [
+        FilterKind.AREA,
+        FilterKind.LOCATION,
+        FilterKind.BOOLEAN,
+        FilterKind.INTEGER,
+        FilterKind.TEXT,
+    ],
 )
-def test_open_ended_filter_cannot_have_allowed_values(kind: FilterKind) -> None:
-    with pytest.raises(ContentTypeDefinitionError, match="'diet' is not a choice"):
-        SearchFilter(name="diet", kind=kind, description="The diet.", allowed_values=("vegan",))
-
-
-def test_choice_filter_rejects_a_repeated_allowed_value() -> None:
-    with pytest.raises(ContentTypeDefinitionError, match="filter 'diet': vegan"):
-        SearchFilter(
-            name="diet",
-            kind=FilterKind.CHOICE,
-            description="The diet.",
-            allowed_values=("vegan", "halal", "vegan"),
-        )
-
-
-def test_type_rejects_two_questions_for_the_same_tag() -> None:
-    questions = (
-        TagQuestion(tag="quick", text="Is it quick?"),
-        TagQuestion(tag="quick", text="Does it take under 30 minutes?"),
-    )
-
-    with pytest.raises(ContentTypeDefinitionError, match="tags in content type 'recipe': quick"):
-        make_content_type(tag_questions=questions)
+def test_only_an_open_value_filter_can_use_the_vocabulary(kind: FilterKind) -> None:
+    with pytest.raises(ContentTypeDefinitionError, match="'diet' is not an open value"):
+        SearchFilter(name="diet", kind=kind, description="The diet.", vocabulary="diet")
 
 
 def test_type_rejects_two_filters_with_the_same_name() -> None:
@@ -280,7 +231,9 @@ def test_type_rejects_two_filters_with_the_same_name() -> None:
         SearchFilter(name="time", kind=FilterKind.TEXT, description="When to eat it."),
     )
 
-    with pytest.raises(ContentTypeDefinitionError, match="filters in content type 'recipe': time"):
+    with pytest.raises(
+        ContentTypeDefinitionError, match="Duplicate filters in content type 'recipe': time"
+    ):
         make_content_type(search_filters=filters)
 
 
@@ -332,7 +285,7 @@ def lines_comparing_against(source: str, names: set[str]) -> list[int]:
     ],
 )
 def test_guard_spots_a_comparison_with_a_type_name(source: str) -> None:
-    assert lines_comparing_against(source, set(PHASE_1_TYPE_NAMES))
+    assert lines_comparing_against(source, set(BUILT_IN_TYPE_NAMES))
 
 
 @pytest.mark.parametrize(
@@ -344,7 +297,7 @@ def test_guard_spots_a_comparison_with_a_type_name(source: str) -> None:
     ],
 )
 def test_guard_allows_code_that_reads_the_registry(source: str) -> None:
-    assert lines_comparing_against(source, set(PHASE_1_TYPE_NAMES)) == []
+    assert lines_comparing_against(source, set(BUILT_IN_TYPE_NAMES)) == []
 
 
 def test_no_code_outside_the_type_modules_branches_on_a_type_name() -> None:
