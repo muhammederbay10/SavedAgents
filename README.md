@@ -127,6 +127,10 @@ The first migration creates the two embedding columns (`saved_item.embedding` an
 
 The dimension stays a setting, so another model can be tried on a fresh database. To change it on a database that is already migrated, write a new migration that resizes both columns, and embed every saved item and vocabulary value again.
 
+## Spikes
+
+[`scripts/spikes/`](scripts/spikes/README.md) holds small experiments that back a decision record. `model_choices` compares speech-to-text and embedding models through OpenRouter (SAV-7, [record 0008](docs/decisions/0008-model-choices.md)). By default it sends nothing; a live run costs money, reads `OPENROUTER_API_KEY` from the environment and needs the owner's approval first.
+
 ## Configuration
 
 All configuration comes from environment variables. Locally they live in `.env`, and `.env.example` lists every variable.
@@ -235,6 +239,7 @@ app/
     deletion.py       # "delete my data" for one user
     migrations/       # Alembic environment and revisions
 alembic.ini           # Alembic configuration
+scripts/spikes/       # reproducible experiments behind decision records (see its README)
 tests/                # pytest suite
 docker/postgres/      # Postgres 16 image with PostGIS and pgvector
 docker-compose.yml    # local stack: db, redis, api
