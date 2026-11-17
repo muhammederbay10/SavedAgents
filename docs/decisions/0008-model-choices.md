@@ -43,7 +43,7 @@ Every model call goes through OpenRouter (`https://openrouter.ai/api/v1`, key `O
 3. After round 3 the Reviewer proposed keeping `google/gemini-2.5-flash`. Muhammed first chose the newer `google/gemini-3.8-flash`, which was not in round 3, on condition that the Reviewer verified it.
 4. He then dropped it for its price and kept **`google/gemini-2.5-flash`**: "lets keep 2.5 flash since google/gemini-3.8-flash is expensive". OpenRouter's model list showed $0.825 per million input tokens against $0.30, about 2.75 times as much, and $4.125 against $2.50 for output.
 
-**The Gemini 3.8 Flash verification was cancelled before it posted any result. It neither passed nor failed, so this record holds no measurement of that model.** Whether the cancelled run sent any paid request is [not reconciled yet](#still-open).
+**The Gemini 3.8 Flash verification was cancelled part-way. It establishes neither a pass nor a fail, and this record draws no conclusion about that model.** It did send requests before it was stopped; they are listed under [the cancelled verification](#the-cancelled-gemini-38-flash-verification).
 
 ## What was measured
 
@@ -54,9 +54,10 @@ The Reviewer made all live calls. Charges are the `usage.cost` values OpenRouter
 | Round 1 (16 Nov) | $0.02412 |
 | Round 2 (17 Nov) | $0.06130 |
 | Round 3 (17 Nov) | $0.08591 |
-| **Total of rounds 1 to 3** | **$0.17132** of the $2.00 cap |
+| Cancelled Gemini 3.8 Flash verification (17 Nov) | $0.00216 |
+| **Total returned charges** | **$0.17348** of the $2.00 cap |
 
-The key's own usage counter agreed with the total: $0.171323 against a ledger of $0.17132333. The cancelled Gemini 3.8 Flash verification is not in this table: whether it was charged anything is not reconciled yet, so the true total may be slightly higher.
+The exact total is $0.17348408. The key's own usage counter agreed with it: $0.173484057 at 16:48 UTC on 17 Nov. One request of the cancelled verification may add to this; see [the cancelled verification](#the-cancelled-gemini-38-flash-verification).
 
 ### Round 1: access and first checks
 
@@ -165,6 +166,21 @@ Muhammed asked for this round to reconsider the escalation model, and to see whe
 
 Round 3 made 168 calls: 156 returned HTTP 200 and 12 returned HTTP 400 (the GLM video requests). No call was rate-limited.
 
+### The cancelled Gemini 3.8 Flash verification
+
+This check was cancelled when Muhammed dropped the model. It had already started. Of the two runs that were cancelled, one was still queued and never started. The other sent:
+
+| Request | Outcome | Charge |
+|---|---|---|
+| Model list and key usage lookups | Answered | Free |
+| First model request | HTTP 400 | None returned |
+| Second model request | HTTP 200 | $0.00216075 |
+| A further request, interrupted by the cancellation | No response recorded. It is not known whether OpenRouter received it | None confirmed |
+
+- **Confirmed spending:** $0.00216075. The key's usage rose by exactly that amount, from $0.171323307 before the check to $0.173484057 after it, and no other charge appeared.
+- **Not confirmed:** the interrupted request. The Reviewer had reserved an estimated $0.03305610 for it. That figure is an estimate set aside before sending, not a charge and not a sign that a bill is pending. Returned charges plus this reservation come to $0.20654018, still far below the cap.
+- **No result:** the plan was six videos. One charged answer is not that verification, and it says nothing about whether the model passes or fails.
+
 ## Limits of this evidence
 
 - **Small samples.** Three clips per language; three reels, all Turkish. One wrong word moves a language's error rate by 1.4 to 2.3 points. GPT's lead in Japanese is one wrong character against two, out of 159.
@@ -185,7 +201,8 @@ So these are first choices. SAV-19 and SAV-20 score them again on labelled saves
 - By default it sends nothing. A live run needs `--live`, the key in the environment, and the amount already spent; it refuses any request that could take the total over $2.
 - The repository holds no audio and no sentences, only the FLEURS provenance (`fleurs_provenance.json`): dataset revision, sentence ids, file names and SHA-256 hashes. The spike refuses clips that don't match.
 - **Checked offline:** fed the public FLEURS transcripts the Reviewer stored in round 2, the spike's scoring gives the same edit errors for every request and the same error rate and cost per minute for all 24 cells of the table above.
-- **Not re-run live.** The Reviewer's own ad hoc scripts were not kept, so the spike's requests follow OpenRouter's documented contracts and are tested against a mocked transport. A new live run needs Muhammed's approval (SAV-22 §8).
+- **Not re-run live.** The Reviewer's own ad hoc scripts were not kept, so the spike's requests follow OpenRouter's documented contracts and are tested against a mocked transport. A new live run needs Muhammed's approval (SAV-22 §8). To stay on the safe side of the cap, pass the higher figure, $0.20654018, as the amount already spent.
+- **The spike stays in the repository.** Muhammed decided ("Yes, keep it") that `scripts/spikes/model_choices/` and its offline tests are kept with SAV-7, so the comparison can be run again for a later model swap such as `deepseek/deepseek-v4.1-flash-1017`.
 - **Not repeated by the spike:** the round 1 checks, the automated reel ratings, and round 3.
 
 The per-request metrics of all rounds stay next to the private test media, outside the repository. They were not attached to the ticket.
@@ -199,7 +216,7 @@ The per-request metrics of all rounds stay next to the private test media, outsi
 - **Self-hosted faster-whisper** (the earlier design): not tested. One provider and one key is simpler for the MVP.
 - **`qwen/qwen3-embedding-8b` at 1024 dimensions:** the Reviewer's proposal; the same retrieval result at about one sixteenth of the charge. Muhammed chose OpenAI.
 - **Full-size embeddings** (3072 or 4096): no better here, and three to four times the storage.
-- **`google/gemini-3.8-flash` for the escalation:** newer, and chosen briefly on condition of a verification. Dropped for its price before the verification produced a result, so it was never measured here.
+- **`google/gemini-3.8-flash` for the escalation:** newer, and chosen briefly on condition of a verification. Dropped for its price. Its verification was cancelled after one answered request, so there is no pass or fail result for it.
 - **`qwen/qwen3.8-flash` for the escalation:** cheaper per video than Gemini 2.5 Flash, but a median of 28 s, and no audio input.
 - **`z-ai/glm-5.3-flash`:** its advertised video input was rejected on the route tested.
 - **`openai/gpt-6.1-terra` or `deepseek/deepseek-v4.1-flash-1017` for the escalation:** they take images only. Sending frames instead of the video would be a design change.
@@ -222,6 +239,6 @@ The per-request metrics of all rounds stay next to the private test media, outsi
 
 None of these is an owner decision.
 
-1. **Spending of the cancelled verification.** The Reviewer is checking whether the cancelled Gemini 3.8 Flash run sent any OpenRouter request. Until that is reported, the $0.17132 total is the last confirmed figure, not a final one.
+1. **One request of the cancelled verification.** It is not known whether it reached OpenRouter. Nothing further is being checked: the account showed no charge for it, and its $0.03305610 reservation is kept on the books as an estimate (see [the cancelled verification](#the-cancelled-gemini-38-flash-verification)).
 2. **The "nearly empty" transcript rule.** SAV-14 defines it as a setting and documents it.
 3. **The DeepSeek provider.** SAV-10 finds a provider hosted outside China and verifies it.
