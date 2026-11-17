@@ -1,6 +1,6 @@
 # 0008: Model choices, all through OpenRouter
 
-- Status: accepted by Muhammed in chat on 2026-11-17 (recorded on SAV-7 and in SAV-22's owner-approved updates), **except the escalation model**: Muhammed chose `google/gemini-3.8-flash` on condition that a verification check passes, and that check's result is not in this record yet. These are first choices from a small test; the evals (SAV-19, SAV-20) re-check them.
+- Status: accepted by Muhammed in chat on 2026-11-17 (recorded on SAV-7 and in SAV-22's owner-approved updates). These are first choices from a small test; the evals (SAV-19, SAV-20) re-check them.
 - Date: 2026-11-17
 - Ticket: SAV-7 (the ticket first asked for `0003-…`, then `0005-…`; both numbers were taken, so this is `0008`)
 
@@ -8,7 +8,7 @@
 
 `docs/ARCHITECTURE.md` §3.9 names a model for each role, but none of them had been tried on our own saves. Gemini Decision 1 launched on 11 Nov 2026, the speech-to-text and embedding models were still open (SAV-22 §11), and Muhammed decided that every model call goes through **OpenRouter** with one key. SavedAgent is a product for **any language**, so a model that only handles Turkish and English is not enough.
 
-The Reviewer ran three rounds of live checks with Muhammed's approval, under a cap of $2 for the whole ticket. Muhammed chose the models after rounds 2 and 3. This record keeps the two apart: [what was measured](#what-was-measured), and [what Muhammed decided](#decision). One check is still running, for the [escalation model](#escalation-gemini-38-flash-awaiting-verification).
+The Reviewer ran three rounds of live checks with Muhammed's approval, under a cap of $2 for the whole ticket. Muhammed chose the models after rounds 2 and 3. This record keeps the two apart: [what was measured](#what-was-measured), and [what Muhammed decided](#decision).
 
 ## Decision
 
@@ -17,41 +17,33 @@ Every model call goes through OpenRouter (`https://openrouter.ai/api/v1`, key `O
 | Role | Model (exact OpenRouter id) | Endpoint |
 |---|---|---|
 | Fixed decisions | `google/gemini-decision-1` | `POST /api/alpha/decisions`: its own contract, with the media in `state`, typed questions, and probabilities in the answer. Not chat completions |
-| Extraction, response agent, memory extraction | `deepseek/deepseek-v4.1-flash` | `POST /api/v1/chat/completions` |
-| Escalation for silent reels | `google/gemini-3.8-flash`, **awaiting verification** ([details](#escalation-gemini-38-flash-awaiting-verification)) | `POST /api/v1/chat/completions` with the MP4 as input; the verification confirms this |
+| Extraction, response agent, memory extraction | `deepseek/deepseek-v4.1-flash`, pinned to a provider hosted outside China | `POST /api/v1/chat/completions` |
+| Escalation for silent reels | `google/gemini-2.5-flash` | `POST /api/v1/chat/completions`, with the MP4 as input |
 | Speech-to-text | `microsoft/mai-transcribe-2`; fallback `openai/gpt-transcribe` | `POST /api/v1/audio/transcriptions` |
 | Embeddings | `openai/text-embedding-3-large` with `dimensions=1024` | `POST /api/v1/embeddings` |
 
 1. **Speech-to-text fallback.** `openai/gpt-transcribe` is used when `microsoft/mai-transcribe-2` returns an error or an empty transcript. There is **no routing by language** yet: three clips per language are not enough to justify it.
 2. **Transcript metadata.** MAI's detected language, word timestamps and segment timestamps are kept. The GPT fallback may return none of them; they are then stored explicitly as unavailable, not left out silently.
 3. **Embedding size.** Vectors have 1024 dimensions, the size SAV-9 stores (`EMBEDDING_DIMENSION=1024`). The client checks the size of every returned vector.
-4. **Speech gate.** The pipeline first checks whether the file has an audio track. No audio track means `has_speech=false`, and speech-to-text is skipped. For files with audio, model-based speech detection stays **provisional** (see [the speech-gate failure](#round-1-access-and-first-checks)).
-5. **Any language.** Speech-to-text, extraction, replies and evals must work in any language. Turkish examples are only examples.
+4. **Speech routing uses the audio track and the transcript, never a model's opinion.**
+   - No audio track: `has_speech=false`, and speech-to-text is skipped.
+   - An audio track: speech-to-text always runs (MAI, then the GPT fallback on an error or an empty transcript).
+   - If the final transcript is empty or nearly empty, the item has no speech.
+   - No model's "has speech" answer decides the route. For videos with no audio track, Gemini Decision 1 gave speech probabilities of up to 0.86, and Gemini 2.5 Flash and Qwen 3.8 Flash claimed speech every time (see [round 1](#round-1-access-and-first-checks) and [round 3](#round-3-five-models-for-escalation-and-for-text)).
+   - What counts as "nearly empty" is a documented setting of the pipeline (SAV-14). This record does not fix a number.
+5. **DeepSeek's host.** `deepseek/deepseek-v4.1-flash` is pinned on OpenRouter to a provider hosted outside China. The provider is a setting, not hard-coded. Which provider that is, and where it is hosted, is checked in SAV-10; none is proven yet.
+6. **Any language.** Speech-to-text, extraction, replies and evals must work in any language. Turkish examples are only examples.
 
-**Where the owner's choices differ from the measurements' proposals:**
+**Where the owner's choice differs from the measurements' proposal:** the Reviewer proposed `qwen/qwen3-embedding-8b` at 1024 dimensions, because both embedding models scored the same and Qwen was cheaper. Muhammed chose `openai/text-embedding-3-large` at 1024 dimensions ("Yes, with OpenAI"). The other rows follow the Reviewer's proposals.
 
-- **Embeddings.** The Reviewer proposed `qwen/qwen3-embedding-8b` at 1024 dimensions, because both embedding models scored the same and Qwen was cheaper. Muhammed chose `openai/text-embedding-3-large` at 1024 dimensions ("Yes, with OpenAI").
-- **Escalation.** After round 3 the Reviewer proposed `google/gemini-2.5-flash`. Muhammed chose the newer `google/gemini-3.8-flash`, which was not in round 3, and accepts its higher price.
-
-The other rows follow the Reviewer's proposals.
-
-### Escalation: Gemini 3.8 Flash, awaiting verification
-
-How the choice moved:
+### How the escalation model was chosen
 
 1. After round 2, Muhammed approved `google/gemini-2.5-flash`, the model tested in round 1.
 2. The same day he reopened it. His reason: it is an older model, and it was only tested because the round 1 instructions said "Gemini Flash-class". He asked for [round 3](#round-3-five-models-for-escalation-and-for-text).
-3. After round 3 he chose **`google/gemini-3.8-flash`**, on one condition: the Reviewer verifies it first, because it was not part of round 3.
+3. After round 3 the Reviewer proposed keeping `google/gemini-2.5-flash`. Muhammed first chose the newer `google/gemini-3.8-flash`, which was not in round 3, on condition that the Reviewer verified it.
+4. He then dropped it for its price and kept **`google/gemini-2.5-flash`**: "lets keep 2.5 flash since google/gemini-3.8-flash is expensive". OpenRouter's model list showed $0.825 per million input tokens against $0.30, about 2.75 times as much, and $4.125 against $2.50 for output.
 
-**The verification** uses the round 3 prompt, schema and media: the same three reels and their three muted copies, sent as native MP4, not as sampled frames. It reports schema compliance, whether the names it returns have support in the frames, speech claims on the muted copies, latency and returned cost. It must stop before its own calls pass $0.30.
-
-- It is compared with the stored Gemini 2.5 Flash results from round 3: 9.06 s median and 11.40 s slowest, and a mean of $0.00295268 per video.
-- **If it passes**, `google/gemini-3.8-flash` is the escalation default. Muhammed has already authorized that.
-- **If native video fails, or the results are clearly worse than 2.5 Flash**, the choice goes back to Muhammed. A higher price alone is not a failure: he accepted it.
-
-Catalog prices Muhammed read from OpenRouter's model list, not yet checked against routed charges: $0.825 per million input tokens, $4.125 output, $0.825 audio input. Gemini 2.5 Flash lists $0.30, $2.50 and $1.00.
-
-**Nothing in this record is a result of that verification.** Its results and charges are added when the Reviewer reports them.
+**The Gemini 3.8 Flash verification was cancelled before it posted any result. It neither passed nor failed, so this record holds no measurement of that model.** Whether the cancelled run sent any paid request is [not reconciled yet](#still-open).
 
 ## What was measured
 
@@ -64,7 +56,7 @@ The Reviewer made all live calls. Charges are the `usage.cost` values OpenRouter
 | Round 3 (17 Nov) | $0.08591 |
 | **Total of rounds 1 to 3** | **$0.17132** of the $2.00 cap |
 
-The key's own usage counter agreed with the total: $0.171323 against a ledger of $0.17132333. The escalation verification's charges are not in this table yet.
+The key's own usage counter agreed with the total: $0.171323 against a ledger of $0.17132333. The cancelled Gemini 3.8 Flash verification is not in this table: whether it was charged anything is not reconciled yet, so the true total may be slightly higher.
 
 ### Round 1: access and first checks
 
@@ -169,7 +161,7 @@ Muhammed asked for this round to reconsider the escalation model, and to see whe
 - Qwen left the district out of the structured filter in the Turkish and Hindi tool checks. One of GLM's extractions was cut off at the output limit and was not valid JSON.
 - `-1017` cost about 71% less per extraction and 74% less per agent call than the approved model, with a higher median latency.
 
-**The Reviewer's proposals after round 3:** `google/gemini-2.5-flash` for the escalation, and keep `deepseek/deepseek-v4.1-flash` for extraction and the response agent, with `-1017` as a cheaper challenger to score on labelled saves. Muhammed's escalation choice is [above](#escalation-gemini-38-flash-awaiting-verification). He has not changed the text model.
+**The Reviewer's proposals after round 3:** `google/gemini-2.5-flash` for the escalation, and keep `deepseek/deepseek-v4.1-flash` for extraction and the response agent, with `-1017` as a cheaper challenger to score on labelled saves. Muhammed's choices are [above](#how-the-escalation-model-was-chosen): Gemini 2.5 Flash for the escalation, and no change to the text model.
 
 Round 3 made 168 calls: 156 returned HTTP 200 and 12 returned HTTP 400 (the GLM video requests). No call was rate-limited.
 
@@ -207,25 +199,29 @@ The per-request metrics of all rounds stay next to the private test media, outsi
 - **Self-hosted faster-whisper** (the earlier design): not tested. One provider and one key is simpler for the MVP.
 - **`qwen/qwen3-embedding-8b` at 1024 dimensions:** the Reviewer's proposal; the same retrieval result at about one sixteenth of the charge. Muhammed chose OpenAI.
 - **Full-size embeddings** (3072 or 4096): no better here, and three to four times the storage.
-- **`google/gemini-2.5-flash` for the escalation:** the Reviewer's proposal after round 3: native video worked, and it was about three times faster than Qwen. Muhammed chose the newer Gemini 3.8 Flash.
+- **`google/gemini-3.8-flash` for the escalation:** newer, and chosen briefly on condition of a verification. Dropped for its price before the verification produced a result, so it was never measured here.
 - **`qwen/qwen3.8-flash` for the escalation:** cheaper per video than Gemini 2.5 Flash, but a median of 28 s, and no audio input.
 - **`z-ai/glm-5.3-flash`:** its advertised video input was rejected on the route tested.
 - **`openai/gpt-6.1-terra` or `deepseek/deepseek-v4.1-flash-1017` for the escalation:** they take images only. Sending frames instead of the video would be a design change.
 - **`deepseek/deepseek-v4.1-flash-1017` for extraction and the agent:** cheaper and passed every check, but three reels and four captions without labels don't justify a switch. It is a candidate for the evals.
 - **Trusting the models for has-speech:** rejected after the muted-video tests in rounds 1 and 3.
+- **A separate speech detector for files with audio:** not chosen. Running speech-to-text and reading the transcript needs no extra model.
+- **Letting OpenRouter route DeepSeek to any provider:** rejected for user data. Round 1 showed it uses more than one provider by default.
 - **Routing speech-to-text by language:** not justified by three clips per language.
 
 ## Consequences
 
-- **SAV-10 (model clients):** build the clients for OpenRouter with the ids and endpoints above. The escalation model is a setting: `google/gemini-3.8-flash` once its verification passes, and Muhammed's next choice if it fails. The decision client uses `/api/alpha/decisions`, not chat completions. The transcriber falls back to GPT on an error or an empty transcript, and marks language and timestamps as unavailable when they are missing. The embedder sends `dimensions=1024` and checks the returned size. Model ids, the base URL and `OPENROUTER_API_KEY` become settings in `app/config.py`, `.env.example` and the README there.
+- **SAV-10 (model clients):** build the clients for OpenRouter with the ids and endpoints above. The DeepSeek provider is a setting; SAV-10 picks one hosted outside China and checks that requests really go there. The decision client uses `/api/alpha/decisions`, not chat completions. The transcriber falls back to GPT on an error or an empty transcript, and marks language and timestamps as unavailable when they are missing. The embedder sends `dimensions=1024` and checks the returned size. Model ids, the base URL and `OPENROUTER_API_KEY` become settings in `app/config.py`, `.env.example` and the README there.
 - **SAV-9 (schema):** embedding columns have 1024 dimensions.
-- **SAV-14 (pipeline):** check for an audio track before speech-to-text, and skip speech-to-text when there is none. The speech decision for files with audio is provisional (open point 1).
-- **SAV-19, SAV-20 (evals):** score speech-to-text, extraction and retrieval on labelled saves in more than one language, and track how often the fallback and the escalation run. `deepseek/deepseek-v4.1-flash-1017` is worth scoring against the approved text model there.
-- **`docs/ARCHITECTURE.md` §3.9 and §5** are updated to these models in this ticket, after SAV-26's design change lands, because SAV-26 edits the same sections. The escalation row there follows the verification's outcome.
+- **SAV-14 (pipeline):** route by decision 4. Check for an audio track; with one, always run speech-to-text; set `has_speech` from the final transcript. The "nearly empty" rule is a documented setting. No model's has-speech answer is used for routing. Speech-to-text now also runs on reels that have only music, so its cost applies to every item with an audio track (MAI was charged about $0.0017 per audio minute in round 2).
+- **SAV-19, SAV-20 (evals):** score speech-to-text, extraction and retrieval on labelled saves in more than one language, and track how often the fallback and the escalation run. `deepseek/deepseek-v4.1-flash-1017` is scored against the approved text model there, as a later candidate. Music-only reels show whether the "nearly empty" rule works.
+- **`docs/ARCHITECTURE.md` §3.9 and §5** are updated to these models in this ticket, after SAV-26's design change lands, because SAV-26 edits the same sections.
 - **Switching the embedding model later** means re-embedding every item.
 
-## Open points for Muhammed
+## Still open
 
-1. **Speech handling for files with audio.** An audio track doesn't mean speech (a reel can have only music), and no model tested detects speech reliably. A proposal is on the ticket: always run speech-to-text on files with audio, and treat an empty transcript as no speech. **Not decided.**
-2. **Where DeepSeek runs.** OpenRouter routed `deepseek/deepseek-v4.1-flash` to more than one provider. Whether to pin it to a host outside China for user data (SAV-22 §11, question 3) is **not decided**.
-3. **The escalation verification.** If Gemini 3.8 Flash fails it, Muhammed chooses again.
+None of these is an owner decision.
+
+1. **Spending of the cancelled verification.** The Reviewer is checking whether the cancelled Gemini 3.8 Flash run sent any OpenRouter request. Until that is reported, the $0.17132 total is the last confirmed figure, not a final one.
+2. **The "nearly empty" transcript rule.** SAV-14 defines it as a setting and documents it.
+3. **The DeepSeek provider.** SAV-10 finds a provider hosted outside China and verifies it.
