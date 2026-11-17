@@ -57,7 +57,7 @@ What keeps a live run inside the rules:
 
 **Embeddings.** The reference sentences are embedded by `openai/text-embedding-3-large` and `qwen/qwen3-embedding-8b`, once with `dimensions=1024` and once at full size (`POST /api/v1/embeddings`). The returned vectors must have the expected size and be finite and non-zero. Then, for each sentence, the spike checks whether its translation ranks first in each other language, and whether its translations fill the top places among all sentences in the other languages.
 
-**Not repeated by this spike:** the round 1 access checks (Gemini Decision 1, DeepSeek V4.1 Flash, the Gemini 2.5 Flash escalation) and the automated judging of private-reel transcripts. The Reviewer ran those by hand; record 0008 has the results.
+**Not repeated by this spike:** the round 1 access checks (Gemini Decision 1, DeepSeek V4.1 Flash, the Gemini 2.5 Flash escalation), the automated judging of private-reel transcripts, and round 3 (the escalation and text-model comparison). The Reviewer ran those by hand; record 0008 has the results.
 
 ### The test clips
 
