@@ -338,6 +338,7 @@ def pipeline_settings(**overrides: object) -> PipelineSettings:
         "indexing_max_tries": 3,
         "indexing_retry_delay_seconds": 0.01,
         "indexing_run_deadline_seconds": 30,
+        "indexing_failure_recording_seconds": 10,
         "indexing_job_timeout_seconds": 60,
     }
     return PipelineSettings(_env_file=None, **{**values, **overrides})  # type: ignore[arg-type]

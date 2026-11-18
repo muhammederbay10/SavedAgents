@@ -195,6 +195,23 @@ class _Run:
         self.costs = self.costs + costs
 
 
+@dataclass
+class _Attempt:
+    """One run of one job: whose item it is, and the steps once they started."""
+
+    user_id: uuid.UUID
+    item_id: uuid.UUID
+    run: _Run | None = None
+
+    def log_details(self, error: BaseException) -> dict[str, object]:
+        """Return the log fields of a failure: ids, where it happened, what it was."""
+        return {
+            "saved_item_id": str(self.item_id),
+            "step": self.run.current if self.run is not None else _START,
+            "error": describe(error),
+        }
+
+
 def describe(error: BaseException) -> str:
     """Describe an error for `enrichment_run.error` and logs, without any content.
 
@@ -223,6 +240,7 @@ class ItemIndexer:
         *,
         alias_min_probability: float,
         run_deadline_seconds: float,
+        failure_recording_seconds: float,
     ) -> None:
         """Create the indexer.
 
@@ -233,8 +251,11 @@ class ItemIndexer:
             registry: The built-in types.
             prompts: The wording; its version is recorded with each step.
             alias_min_probability: `VOCAB_ALIAS_MIN_PROBABILITY`.
-            run_deadline_seconds: `INDEXING_RUN_DEADLINE_SECONDS`: how long the
-                steps of one run may take before the run is stopped and retried.
+            run_deadline_seconds: `INDEXING_RUN_DEADLINE_SECONDS`: how long a whole
+                run may take, from before the payload is read, before it is stopped
+                and retried.
+            failure_recording_seconds: `INDEXING_FAILURE_RECORDING_SECONDS`: how
+                long recording a failure may take after the run stopped.
         """
         self._sessions = sessions
         self._payloads = payloads
@@ -243,11 +264,17 @@ class ItemIndexer:
         self._prompts = prompts
         self._alias_min_probability = alias_min_probability
         self._run_deadline_seconds = run_deadline_seconds
+        self._failure_recording_seconds = failure_recording_seconds
 
     async def index(
         self, user_id: uuid.UUID, saved_item_id: uuid.UUID, *, last_try: bool
     ) -> IndexOutcome:
         """Index one item, continuing after the steps an earlier try finished.
+
+        One deadline covers the whole run, from before the payload is read:
+        reading the payload and the item, and every step. Recording a failure
+        afterwards has its own, separate allowance. Both together end before
+        arq's own job timeout, so the job always ends itself.
 
         Args:
             user_id: The item's owner, from the job.
@@ -259,87 +286,49 @@ class ItemIndexer:
             How the run ended.
 
         Raises:
-            RetryLaterError: If a step failed in a way that may pass later,
+            RetryLaterError: If the run failed in a way that may pass later,
                 and this is not the last try.
             Exception: Any other error, after the item is marked `failed`.
         """
+        attempt = _Attempt(user_id=user_id, item_id=saved_item_id)
+        deadline = asyncio.timeout(self._run_deadline_seconds)
         try:
-            event = await self._payloads.capture(user_id, saved_item_id)
-            if event is None:
-                logger.info("indexing_payload_missing", extra={"saved_item_id": str(saved_item_id)})
-                return IndexOutcome.GONE
-            started = await self._start(user_id, saved_item_id)
-        except RETRYABLE_ERRORS as error:
-            return await self._start_failed(user_id, saved_item_id, error, last_try=last_try)
-        if isinstance(started, IndexOutcome):
-            return started
-        run = _Run(user_id=user_id, item_id=saved_item_id, finished=started)
-        try:
-            await self._run_steps_before_deadline(run, event)
+            try:
+                async with deadline:
+                    return await self._index_within_deadline(attempt)
+            except TimeoutError as error:
+                if not deadline.expired():
+                    raise
+                raise IndexingDeadlineError(
+                    f"indexing ran past its deadline of {self._run_deadline_seconds} s"
+                ) from error
         except _ItemGoneError:
             logger.info("indexing_item_gone", extra={"saved_item_id": str(saved_item_id)})
             return IndexOutcome.GONE
         except NothingToIndexError as error:
-            await self._fail(run, error)
-            return IndexOutcome.FAILED
+            return await self._fail(attempt, error)
         except RETRYABLE_ERRORS as error:
             if last_try:
-                await self._fail(run, error)
-                return IndexOutcome.FAILED
-            await self._record_retry(run, error)
-            raise RetryLaterError(run.current, error) from error
+                return await self._fail(attempt, error)
+            await self._record_retry(attempt, error)
+            step = attempt.run.current if attempt.run is not None else None
+            raise RetryLaterError(step, error) from error
         except Exception as error:
             # A bug, not a passing failure: trying again would fail the same way.
-            await self._fail(run, error)
+            await self._fail(attempt, error)
             raise
+
+    async def _index_within_deadline(self, attempt: _Attempt) -> IndexOutcome:
+        event = await self._payloads.capture(attempt.user_id, attempt.item_id)
+        if event is None:
+            logger.info("indexing_payload_missing", extra={"saved_item_id": str(attempt.item_id)})
+            return IndexOutcome.GONE
+        started = await self._start(attempt.user_id, attempt.item_id)
+        if isinstance(started, IndexOutcome):
+            return started
+        attempt.run = _Run(user_id=attempt.user_id, item_id=attempt.item_id, finished=started)
+        await self._run_steps(attempt.run, event)
         return IndexOutcome.INDEXED
-
-    async def _start_failed(
-        self, user_id: uuid.UUID, saved_item_id: uuid.UUID, error: BaseException, *, last_try: bool
-    ) -> IndexOutcome:
-        """Handle a failure before the first step: try again, or mark the item failed.
-
-        No step is recorded, so every step that already finished stays finished.
-
-        Raises:
-            RetryLaterError: If this is not the last try.
-        """
-        details = {"saved_item_id": str(saved_item_id), "step": _START, "error": describe(error)}
-        if not last_try:
-            logger.info("saved_item_indexing_retry", extra=details)
-            raise RetryLaterError(None, error) from error
-        logger.warning("saved_item_indexing_failed", extra=details)
-        try:
-            async with self._sessions() as session, session.begin():
-                if not await lock_user(session, user_id):
-                    return IndexOutcome.FAILED
-                item = await load_item(session, saved_item_id)
-                if item is not None and item.status in _RESUMABLE_STATUSES:
-                    item.status = ItemStatus.FAILED
-        except (SQLAlchemyError, OSError) as record_error:
-            logger.error(
-                "indexing_failure_not_recorded",
-                extra={"saved_item_id": str(saved_item_id), "error": describe(record_error)},
-            )
-        return IndexOutcome.FAILED
-
-    async def _run_steps_before_deadline(self, run: _Run, event: CaptureEvent) -> None:
-        """Run the steps, but stop them at the run's deadline, before arq's own timeout.
-
-        Raises:
-            IndexingDeadlineError: If the deadline passed; `run.current` is the
-                step that was interrupted.
-        """
-        deadline = asyncio.timeout(self._run_deadline_seconds)
-        try:
-            async with deadline:
-                await self._run_steps(run, event)
-        except TimeoutError as error:
-            if not deadline.expired():
-                raise
-            raise IndexingDeadlineError(
-                f"indexing ran past its deadline of {self._run_deadline_seconds} s"
-            ) from error
 
     async def _start(
         self, user_id: uuid.UUID, saved_item_id: uuid.UUID
@@ -590,44 +579,65 @@ class ItemIndexer:
                 raise _ItemGoneError
             yield session, item
 
-    async def _fail(self, run: _Run, error: BaseException) -> None:
-        logger.warning(
-            "saved_item_indexing_failed",
-            extra={
-                "saved_item_id": str(run.item_id),
-                "step": run.current,
-                "error": describe(error),
-            },
-        )
-        await self._record_failure(run, error, ItemStatus.FAILED)
+    async def _fail(self, attempt: _Attempt, error: BaseException) -> IndexOutcome:
+        logger.warning("saved_item_indexing_failed", extra=attempt.log_details(error))
+        await self._record_within_allowance(attempt, error, ItemStatus.FAILED)
+        return IndexOutcome.FAILED
 
-    async def _record_retry(self, run: _Run, error: BaseException) -> None:
-        logger.info(
-            "saved_item_indexing_retry",
-            extra={
-                "saved_item_id": str(run.item_id),
-                "step": run.current,
-                "error": describe(error),
-            },
-        )
-        await self._record_failure(run, error, ItemStatus.ENRICHING)
+    async def _record_retry(self, attempt: _Attempt, error: BaseException) -> None:
+        logger.info("saved_item_indexing_retry", extra=attempt.log_details(error))
+        await self._record_within_allowance(attempt, error, ItemStatus.ENRICHING)
+
+    async def _record_within_allowance(
+        self, attempt: _Attempt, error: BaseException, item_status: ItemStatus
+    ) -> None:
+        """Record a failure, but give up after `INDEXING_FAILURE_RECORDING_SECONDS`.
+
+        The run's deadline has passed by then, or is near, and arq cancels the
+        job without a retry at its own timeout. A database that is locked or
+        unreachable must not hold the job past it.
+        """
+        try:
+            async with asyncio.timeout(self._failure_recording_seconds):
+                await self._record_failure(attempt, error, item_status)
+        except TimeoutError:
+            logger.error(
+                "indexing_failure_not_recorded",
+                extra={
+                    "saved_item_id": str(attempt.item_id),
+                    "error": "recording took longer than INDEXING_FAILURE_RECORDING_SECONDS",
+                },
+            )
 
     async def _record_failure(
-        self, run: _Run, error: BaseException, item_status: ItemStatus
+        self, attempt: _Attempt, error: BaseException, item_status: ItemStatus
     ) -> None:
+        """Write the item's status and, once a step had started, that step's failure.
+
+        A failure before the first step records no step, so every step that
+        already finished stays finished.
+        """
         try:
-            async with self._locked(run) as (session, item):
+            async with self._sessions() as session, session.begin():
+                if not await lock_user(session, attempt.user_id):
+                    return
+                item = await load_item(session, attempt.item_id)
+                if item is None:
+                    return
                 # A run stopped after the item was done (while confirming) leaves it done.
                 if item.status in _RESUMABLE_STATUSES:
                     item.status = item_status
-                await record_step(
-                    session, run.item_id, run.current, RunStatus.FAILED, error=describe(error)
-                )
-        except _ItemGoneError:
-            return
-        except SQLAlchemyError as record_error:
+                if attempt.run is not None:
+                    await record_step(
+                        session,
+                        attempt.item_id,
+                        attempt.run.current,
+                        RunStatus.FAILED,
+                        error=describe(error),
+                    )
+        except (SQLAlchemyError, OSError) as record_error:
             # The database is what failed; the job's own outcome still stands.
             logger.error(
                 "indexing_failure_not_recorded",
-                extra={"saved_item_id": str(run.item_id), "error": describe(record_error)},
+                extra={"saved_item_id": str(attempt.item_id), "error": describe(record_error)},
             )

@@ -14,10 +14,14 @@ more slots. The providers' rate limits set the real ceiling.
 `RetryLaterError`; the job is tried again after a growing wait, up to
 `INDEXING_MAX_TRIES` runs. The last run marks the item `failed`. Each run
 continues after the steps that already finished (`app.pipeline.indexer`).
-Reading the payload and the item at the start is retried the same way, and so
-is a run that passes `INDEXING_RUN_DEADLINE_SECONDS`: the run stops itself,
-records the step it was in, and is tried again. arq's own limit,
-`INDEXING_JOB_TIMEOUT_SECONDS`, is longer and only a backstop.
+Reading the payload and the item at the start is retried the same way.
+
+**One budget per run.** `INDEXING_RUN_DEADLINE_SECONDS` starts before the
+payload is read and covers the start and every step; a run that passes it
+stops itself, records where it was, and is tried again. Recording a failure
+then has `INDEXING_FAILURE_RECORDING_SECONDS`. arq's own limit,
+`INDEXING_JOB_TIMEOUT_SECONDS`, is longer than both together and only a
+backstop.
 
 The job's arguments are ids, and its result is the outcome's name, so neither
 holds a caption, a link or any other content.
@@ -203,6 +207,7 @@ async def start_worker(ctx: JobContext) -> None:
             PIPELINE_PROMPTS,
             alias_min_probability=rules.alias_min_probability,
             run_deadline_seconds=pipeline_settings.indexing_run_deadline_seconds,
+            failure_recording_seconds=pipeline_settings.indexing_failure_recording_seconds,
         ),
         max_tries=pipeline_settings.indexing_max_tries,
         retry_delay_seconds=pipeline_settings.indexing_retry_delay_seconds,
@@ -263,8 +268,9 @@ def build_worker(
         on_startup=on_startup,
         on_shutdown=stop_worker,
         max_jobs=pipeline_settings.indexing_concurrency,
-        # The run stops itself at INDEXING_RUN_DEADLINE_SECONDS and records where;
-        # this outer limit is only a backstop, after the time that takes.
+        # The run stops itself at INDEXING_RUN_DEADLINE_SECONDS and records where
+        # within INDEXING_FAILURE_RECORDING_SECONDS; this outer limit, longer than
+        # both, is only a backstop.
         job_timeout=pipeline_settings.indexing_job_timeout_seconds,
         max_tries=pipeline_settings.indexing_max_tries,
     )

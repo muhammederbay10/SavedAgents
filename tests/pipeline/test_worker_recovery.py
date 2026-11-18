@@ -44,6 +44,7 @@ from tests.pipeline.support import (
 )
 
 DEADLINE_SECONDS = 0.5
+RECORDING_SECONDS = 2
 JOB_TIMEOUT_SECONDS = 10
 
 
@@ -100,6 +101,7 @@ async def run_worker(
     worker_settings = pipeline_settings(
         indexing_max_tries=max_tries,
         indexing_run_deadline_seconds=run_deadline_seconds,
+        indexing_failure_recording_seconds=RECORDING_SECONDS,
         indexing_job_timeout_seconds=job_timeout_seconds,
     )
     worker = build_worker(

@@ -290,7 +290,7 @@ Every saved item is understood once, when it is saved (`docs/ARCHITECTURE.md` §
 5. **Normalize:** open values (category, tags, cuisine, subject…) go through the shared vocabulary: exact hit, privacy gate, then match-or-new (§3.4).
 6. **Embed** the summary and transcript, mark the item `done`, and **confirm** by DM how it was saved, in the user's language, or in English while it isn't known.
 
-Each step's result is kept in `enrichment_run`, so a job that runs again continues where it stopped. A run that can't read its payload or item, or that passes `INDEXING_RUN_DEADLINE_SECONDS`, runs again too. The last of `INDEXING_MAX_TRIES` runs marks the item `failed`. The worker reads only the indexing queue; chat jobs wait in theirs. Logs hold, for each item, its type, whether it was escalated, and the cost of its model calls.
+Each step's result is kept in `enrichment_run`, so a job that runs again continues where it stopped. A run that can't read its payload or item, or that passes `INDEXING_RUN_DEADLINE_SECONDS`, runs again too. That deadline starts before the payload is read, so a slow start (for example, the user's row locked by "delete my data") uses the same budget as the steps. The last of `INDEXING_MAX_TRIES` runs marks the item `failed`. The worker reads only the indexing queue; chat jobs wait in theirs. Logs hold, for each item, its type, whether it was escalated, and the cost of its model calls.
 
 Run the worker on your machine (it reads `.env`, and needs ffmpeg, Postgres and Redis):
 
@@ -322,8 +322,9 @@ The worker reads `Settings`, `ModelSettings`, `MessengerSettings` and `PipelineS
 | `VOCAB_MATCH_CANDIDATES` | How many nearby values the decision model chooses from |
 | `INDEXING_CONCURRENCY` | Jobs one worker runs at once; a bulk import fans out over every slot of every worker |
 | `INDEXING_MAX_TRIES`, `INDEXING_RETRY_DELAY_SECONDS` | Runs of one job, and the wait before the next run, multiplied by the run's number |
-| `INDEXING_RUN_DEADLINE_SECONDS` | How long the steps of one run may take. A run that passes it stops itself, records the step it was in, and runs again; the last try marks the item `failed` |
-| `INDEXING_JOB_TIMEOUT_SECONDS` | arq's own limit on one run, a backstop. Must be longer than the run deadline, so a stopped run has time to record its step |
+| `INDEXING_RUN_DEADLINE_SECONDS` | How long one run may take, from before it reads the payload to the end of its last step. A run that passes it stops itself, records where it was, and runs again; the last try marks the item `failed` |
+| `INDEXING_FAILURE_RECORDING_SECONDS` | How long recording a failure may take after that. If the database doesn't answer in time, the failure is only logged, and the job still ends itself |
+| `INDEXING_JOB_TIMEOUT_SECONDS` | arq's own limit on one run, a backstop that cancels without a retry. Must be longer than the run deadline plus the recording time |
 
 ## Models
 

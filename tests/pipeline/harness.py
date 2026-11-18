@@ -34,6 +34,7 @@ from tests.pipeline.support import (
 
 SENDER_ID = "1000000000000141"
 RUN_DEADLINE_SECONDS = 30.0
+FAILURE_RECORDING_SECONDS = 10.0
 RULES = VocabularyRules(
     privacy_min_probability=0.9,
     alias_min_probability=0.9,
@@ -100,6 +101,7 @@ class Pipeline:
         sessions: object | None = None,
         payloads: object | None = None,
         run_deadline_seconds: float = RUN_DEADLINE_SECONDS,
+        failure_recording_seconds: float = FAILURE_RECORDING_SECONDS,
     ) -> ItemIndexer:
         """Build the indexer; tests may swap in failing sessions or payloads."""
         store = self.store
@@ -143,6 +145,7 @@ class Pipeline:
             TEST_PROMPTS,
             alias_min_probability=RULES.alias_min_probability,
             run_deadline_seconds=run_deadline_seconds,
+            failure_recording_seconds=failure_recording_seconds,
         )
 
 
