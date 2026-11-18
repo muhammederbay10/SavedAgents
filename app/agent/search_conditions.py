@@ -13,12 +13,13 @@ import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Final
+from typing import Any, Final
 
 from sqlalchemy import (
     Boolean,
     ColumnElement,
     Float,
+    Text,
     and_,
     bindparam,
     cast,
@@ -31,7 +32,8 @@ from sqlalchemy import (
     select,
     true,
 )
-from sqlalchemy.dialects.postgresql import JSONPATH, TSQUERY
+from sqlalchemy.dialects.postgresql import JSONB, JSONPATH, TSQUERY
+from sqlalchemy.orm import QueryableAttribute
 
 from app.agent.search_query import FilterValue, Near
 from app.db.models import (
@@ -59,6 +61,9 @@ ADDRESS_LEVELS: Final = (
 )
 # The levels L2 widens an area from, to the city they are in.
 WIDENED_LEVELS: Final = (Entity.district, Entity.neighbourhood)
+
+# The key of a post's mentions in `saved_item.fields`: `EntityExtraction.entities`.
+MENTIONS_KEY: Final = "entities"
 
 # Matches a provider name in any list of a providers object, e.g. {"flatrate": ["Netflix"]}.
 _PROVIDER_NAME_PATH: Final = "lax $.*[*] ? (@ == $name)"
@@ -143,7 +148,11 @@ class FilterPredicates:
 
 
 def filter_predicates(
-    search_filter: SearchFilter, value: FilterValue, context: FilterContext
+    search_filter: SearchFilter,
+    value: FilterValue,
+    context: FilterContext,
+    *,
+    item_wide: bool,
 ) -> FilterPredicates:
     """Build where one of a type's filters holds.
 
@@ -151,6 +160,10 @@ def filter_predicates(
         search_filter: The filter as the type declares it.
         value: The normalized value.
         context: The asking user and their country.
+        item_wide: Whether `saved_item.fields` holds the value for the whole
+            item. Otherwise only the linked entity's data and its own mention
+            in `fields.entities` decide; the list of every mention's values at
+            the top of `fields` never does.
 
     Returns:
         The filter's predicates on the item and on one linked entity.
@@ -165,8 +178,8 @@ def filter_predicates(
     if search_filter.kind is FilterKind.AREA:
         return area_predicates(str(value))
     if search_filter.kind is FilterKind.TEXT:
-        return _text_predicates(search_filter.name, str(value))
-    return _value_predicates(search_filter.name, value)
+        return _text_predicates(search_filter.name, str(value), item_wide=item_wide)
+    return _value_predicates(search_filter.name, value, item_wide=item_wide)
 
 
 def area_predicates(area: str) -> FilterPredicates:
@@ -281,20 +294,43 @@ def keyword_rank(query: ColumnElement[str]) -> ColumnElement[float]:
     return func.ts_rank(saved_item_search_vector(), query, type_=Float)
 
 
-def _value_predicates(key: str, value: FilterValue) -> FilterPredicates:
-    """The value under `key` in the item's fields or the entity's data, alone or in a list."""
-    return FilterPredicates(
-        or_(SavedItem.fields.contains({key: value}), SavedItem.fields.contains({key: [value]})),
-        or_(Entity.data.contains({key: value}), Entity.data.contains({key: [value]})),
-    )
+def _value_predicates(key: str, value: FilterValue, *, item_wide: bool) -> FilterPredicates:
+    """The value under `key`, alone or in a list: item-wide, or on the entity or its mention."""
+    on_entity = or_(_holds_value(Entity.data, key, value), _holds_value(_own_mention(), key, value))
+    on_item = _holds_value(SavedItem.fields, key, value) if item_wide else None
+    return FilterPredicates(on_item, on_entity)
 
 
-def _text_predicates(key: str, value: str) -> FilterPredicates:
+def _text_predicates(key: str, value: str, *, item_wide: bool) -> FilterPredicates:
     pattern = f"%{_escape_like(value)}%"
-    return FilterPredicates(
-        SavedItem.fields[key].astext.ilike(pattern, escape=_LIKE_ESCAPE),
+    on_entity = or_(
         Entity.data[key].astext.ilike(pattern, escape=_LIKE_ESCAPE),
+        _own_mention().op("->>", return_type=Text)(key).ilike(pattern, escape=_LIKE_ESCAPE),
     )
+    on_item = (
+        SavedItem.fields[key].astext.ilike(pattern, escape=_LIKE_ESCAPE) if item_wide else None
+    )
+    return FilterPredicates(on_item, on_entity)
+
+
+def _holds_value(
+    # A JSON column or expression; its Python type is the whole JSON document.
+    document: ColumnElement[Any] | QueryableAttribute[Any],
+    key: str,
+    value: FilterValue,
+) -> ColumnElement[bool]:
+    return or_(document.contains({key: value}), document.contains({key: [value]}))
+
+
+def _own_mention() -> ColumnElement[Any]:
+    """The mention in `saved_item.fields` that the linked entity was resolved from.
+
+    The resolver links the entity of the mention at index `i` of
+    `fields.entities` with `item_entity.position = i`.
+    """
+    return SavedItem.fields.op("->", return_type=JSONB)(literal(MENTIONS_KEY)).op(
+        "->", return_type=JSONB
+    )(ItemEntity.position)
 
 
 def _available_in_country(provider: str, country: str | None) -> ColumnElement[bool]:

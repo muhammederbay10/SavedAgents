@@ -235,6 +235,23 @@ async def seed_saves(session: AsyncSession) -> Saves:
     return saves
 
 
+def place_fields(*venues: tuple[str, str | None, str | None]) -> dict[str, object]:
+    """`saved_item.fields` of a place post, in the shape SAV-14 stores.
+
+    Each venue is one mention in `entities`, in order; its open values are also
+    listed once at the top of `fields` under their vocabulary field.
+
+    Args:
+        *venues: `(name, area_hint, cuisine)` per mention.
+    """
+    mentions = [
+        {"name": name, "area_hint": area_hint, "cuisine": cuisine}
+        for name, area_hint, cuisine in venues
+    ]
+    cuisines = list(dict.fromkeys(cuisine for _, _, cuisine in venues if cuisine is not None))
+    return {"entities": mentions, "cuisine": cuisines}
+
+
 def _item(user: User, name: str, **values: object) -> SavedItem:
     defaults: dict[str, object] = {
         "user_id": user.id,
@@ -257,7 +274,7 @@ def _add_items(saves: Saves) -> None:
             category="café",
             tags=["coffee", "brunch"],
             collection="Food",
-            fields={"cuisine": ["specialty coffee"]},
+            fields=place_fields(("Kronotrop", "Bebek", "specialty coffee")),
             summary="A cozy specialty coffee spot by the sea.",
             embedding=unit_vector(COFFEE_AXIS),
             saved_at=NOW - 6 * day,
@@ -269,7 +286,7 @@ def _add_items(saves: Saves) -> None:
             category="restaurant",
             tags=["dinner"],
             collection="Food",
-            fields={"cuisine": ["korean barbecue"]},
+            fields=place_fields(("Kimchi House", "Beyoğlu", "korean barbecue")),
             summary="Korean barbecue with a long queue.",
             embedding=unit_vector(KOREAN_AXIS),
             saved_at=NOW - 5 * day,
@@ -280,7 +297,7 @@ def _add_items(saves: Saves) -> None:
             type="place",
             category="restaurant",
             collection="Food",
-            fields={"cuisine": ["american breakfast"]},
+            fields=place_fields(("Corner Diner", "Brooklyn", "american breakfast")),
             summary="Pancakes and coffee all day.",
             saved_at=NOW - 4 * day,
         ),
@@ -351,7 +368,7 @@ def _add_items(saves: Saves) -> None:
             type="place",
             category="grandma ayşe's recipe",
             collection="Food",
-            fields={"cuisine": ["grandma ayşe's cooking"]},
+            fields=place_fields(("Kronotrop", "Bebek", "grandma ayşe's cooking")),
             saved_at=NOW - 1 * day,
         ),
         "other_place": _item(other, "place", type="place", category="café", collection="Food"),

@@ -515,7 +515,9 @@ def _conditions(
     for typed in plan.filters:
         slot = f"{FILTER_SLOT_PREFIX}{typed.search_filter.name}"
         value = _normalized_filter(typed, normalized).value
-        filters[slot] = filter_predicates(typed.search_filter, value, context)
+        filters[slot] = filter_predicates(
+            typed.search_filter, value, context, item_wide=typed.item_wide
+        )
         if typed.search_filter.source is FilterSource.COUNTRY_AVAILABILITY:
             availability.add(slot)
     return _Conditions(

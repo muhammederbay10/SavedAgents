@@ -3,6 +3,7 @@ from typing import Any
 
 import pytest
 
+from app.agent.search_conditions import MENTIONS_KEY
 from app.agent.search_query import (
     CountryRequiredError,
     Near,
@@ -13,6 +14,7 @@ from app.agent.search_query import (
     plan_search,
 )
 from app.db.types import GeoPoint
+from app.types.base import EntityExtraction
 from app.types.registry import CONTENT_TYPES
 
 USER_ID = uuid.UUID("00000000-0000-4000-8000-000000000001")
@@ -114,3 +116,17 @@ def test_a_radius_must_be_positive() -> None:
 def test_a_limit_must_be_positive() -> None:
     with pytest.raises(SearchQueryError, match="at least 1"):
         plan(limit=0)
+
+
+def test_only_top_level_schema_fields_describe_the_whole_item() -> None:
+    study = plan(type="study", filters={"subject": "maths", "topic": "integrals"})
+    place = plan(type="place", filters={"cuisine": "ramen", "price": "cheap"})
+    movie = plan(type="movie", filters={"genre": "horror", "year": 2018})
+
+    assert [typed.item_wide for typed in study.filters] == [True, True]
+    assert [typed.item_wide for typed in place.filters] == [False, False]
+    assert [typed.item_wide for typed in movie.filters] == [False, False]
+
+
+def test_mentions_are_read_from_the_entity_extractions_own_field() -> None:
+    assert MENTIONS_KEY in EntityExtraction.model_fields

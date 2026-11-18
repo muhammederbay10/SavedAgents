@@ -125,10 +125,16 @@ class TypedFilter:
     Attributes:
         search_filter: The filter as the type declares it.
         value: The value from the query. A `Wording` value is normalized first.
+        item_wide: Whether the type's extraction schema has a top-level field
+            of the filter's name, such as a study post's `subject`. Its value
+            describes the whole item. Any other value in `saved_item.fields`
+            under that name, such as the cuisines of a list of places, is only
+            a list of what its mentions say, and belongs to one mention each.
     """
 
     search_filter: SearchFilter
     value: FilterValue = field(repr=False)
+    item_wide: bool = False
 
 
 @dataclass(frozen=True)
@@ -241,7 +247,13 @@ def _typed_filters(query: SearchQuery, content_type: ContentType | None) -> tupl
                 f"Search cannot check '{name}' yet: it needs the opening hours the place "
                 "resolver stores"
             )
-        typed.append(TypedFilter(search_filter=search_filter, value=value))
+        typed.append(
+            TypedFilter(
+                search_filter=search_filter,
+                value=value,
+                item_wide=name in content_type.extraction_schema.model_fields,
+            )
+        )
     return tuple(typed)
 
 

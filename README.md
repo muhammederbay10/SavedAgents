@@ -506,7 +506,7 @@ A filter also declares its **source**, where search reads what it is checked aga
 
 | Source | Search reads | Used by |
 |---|---|---|
-| `saved_values` (the default) | The key named after the filter in the item's `fields` and in its entities' `data`; for `area` the entities' address levels, for `location` their coordinates | most filters |
+| `saved_values` (the default) | The key named after the filter: in the item's `fields` when the type's schema has it as a top-level field (study `subject`), otherwise in the linked entity's `data` or in that entity's own mention in `fields.entities` (place `cuisine`); for `area` the entities' address levels, for `location` their coordinates | most filters |
 | `country_availability` | `entity_availability` for the asking user's country. Only for `value` filters | `streaming` |
 | `user_status` | Whether the asking user marked the item's entity as done. Only for `boolean` filters | `watched` |
 | `opening_hours` | The entity's opening hours. Only for `boolean` filters. Search rejects it until the place resolver stores hours | `open_now` |

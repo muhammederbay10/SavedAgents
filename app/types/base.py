@@ -141,9 +141,11 @@ class FilterSource(StrEnum):
 
     Attributes:
         SAVED_VALUES: What indexing stored. A `VALUE`, `INTEGER`, `BOOLEAN` or
-            `TEXT` filter reads the key named after the filter in the item's
-            `fields` and in its entities' `data`. An `AREA` filter reads the
-            entities' address levels, a `LOCATION` filter their coordinates.
+            `TEXT` filter reads the key named after the filter: in the item's
+            `fields` when the extraction schema has it as a top-level field,
+            otherwise in a linked entity's `data` or that entity's own mention.
+            An `AREA` filter reads the entities' address levels, a `LOCATION`
+            filter their coordinates.
         COUNTRY_AVAILABILITY: Where an entity can be streamed in the asking
             user's country (`entity_availability`). Only for `VALUE` filters.
         USER_STATUS: Whether the asking user marked the item's entity as done

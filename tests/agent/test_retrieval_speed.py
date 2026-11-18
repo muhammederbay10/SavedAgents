@@ -11,10 +11,11 @@ import uuid
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agent.fallback import FallbackLevel
 from app.agent.search_query import SearchQuery
 from app.db.models import Entity, ItemEntity, ItemStatus, SavedItem, User
 from app.db.types import GeoPoint
-from tests.agent.retrieval_support import MappedEmbedder, build_retriever
+from tests.agent.retrieval_support import MappedEmbedder, build_retriever, place_fields
 from tests.database import TEST_EMBEDDING_DIMENSION
 
 TYPICAL_QUERY_LIMIT_SECONDS = 0.2
@@ -51,7 +52,7 @@ async def _seed(session: AsyncSession) -> uuid.UUID:
             type="place",
             category="restaurant" if index % 2 else "café",
             collection="Food",
-            fields={"cuisine": [f"cuisine {index % 9}"]},
+            fields=place_fields((f"Place {index}", district, f"cuisine {index % 9}")),
             summary=f"Saved place number {index}",
             embedding=_vector(index),
             status=ItemStatus.DONE,
@@ -72,7 +73,9 @@ async def test_a_typical_filtered_vector_search_takes_under_200_ms(
         collection="Food",
         type="place",
         category="restaurant",
-        filters={"area": "Brooklyn", "cuisine": "cuisine 3"},
+        # Brooklyn is every 6th place from the 2nd and "cuisine 4" every 9th from the 5th,
+        # so about 30 restaurants meet both and L0 answers on its own.
+        filters={"area": "Brooklyn", "cuisine": "cuisine 4"},
         text="cozy place for dinner",
     )
     retriever = build_retriever(embedder=MappedEmbedder(axes={"cozy place for dinner": 0}))
@@ -85,4 +88,5 @@ async def test_a_typical_filtered_vector_search_takes_under_200_ms(
         durations.append(time.perf_counter() - started)
 
     assert result.hits
+    assert result.level is FallbackLevel.NORMAL
     assert statistics.median(durations) < TYPICAL_QUERY_LIMIT_SECONDS

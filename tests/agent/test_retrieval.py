@@ -28,6 +28,7 @@ from tests.agent.retrieval_support import (
     PickingClassifier,
     Saves,
     build_retriever,
+    place_fields,
     retrieval_settings,
     seed_saves,
 )
@@ -670,3 +671,95 @@ async def test_availability_gaps_cover_titles_added_by_l2_in_the_asking_country_
         (saves.entities["inception"].id, "US", AvailabilityGapReason.MISSING),
         (saves.entities["conjuring"].id, "US", AvailabilityGapReason.STALE),
     }
+
+
+async def add_two_venue_list(session: AsyncSession, saves: Saves, *, cuisines_on: str) -> SavedItem:
+    """A list post of the Bebek coffee shop and the Korean restaurant in Beyoğlu.
+
+    `cuisines_on` says where each venue's own cuisine is stored: in its
+    `mention` in `fields.entities`, or in its `entity` data. Either way the item
+    also lists both cuisines at the top of `fields`, as SAV-14 does.
+    """
+    on_mentions = cuisines_on == "mention"
+    item = SavedItem(
+        user_id=saves.user.id,
+        platform="instagram",
+        platform_post_id=f"synthetic-two-venues-{cuisines_on}",
+        type="place",
+        category="café",
+        fields=place_fields(
+            ("Kronotrop", "Bebek", "specialty coffee" if on_mentions else None),
+            ("Kimchi House", "Beyoğlu", "korean barbecue" if on_mentions else None),
+        ),
+        status=ItemStatus.DONE,
+        saved_at=NOW,
+    )
+    if not on_mentions:
+        item.fields = {**item.fields, "cuisine": ["specialty coffee", "korean barbecue"]}
+        saves.entities["kronotrop"].data = {"cuisine": ["specialty coffee"]}
+        saves.entities["kimchi"].data = {"cuisine": ["korean barbecue"]}
+    session.add(item)
+    await session.flush()
+    session.add_all(
+        ItemEntity(saved_item_id=item.id, entity_id=saves.entities[entity].id, position=position)
+        for position, entity in enumerate(("kronotrop", "kimchi"))
+    )
+    await session.flush()
+    return item
+
+
+@pytest.mark.parametrize("cuisines_on", ["mention", "entity"])
+async def test_a_listed_cuisine_counts_only_for_its_own_venue(
+    db_session: AsyncSession, saves: Saves, cuisines_on: str
+) -> None:
+    listing = await add_two_venue_list(db_session, saves, cuisines_on=cuisines_on)
+    retriever = build_retriever()
+
+    other_venue = await retriever.search(
+        db_session,
+        SearchQuery(
+            user_id=saves.user.id,
+            type="place",
+            filters={"area": "Bebek", "cuisine": "korean barbecue"},
+        ),
+    )
+    same_venue = await retriever.search(
+        db_session,
+        SearchQuery(
+            user_id=saves.user.id,
+            type="place",
+            filters={"area": "Beyoğlu", "cuisine": "korean barbecue"},
+        ),
+    )
+
+    assert listing.id not in [hit.item_id for hit in other_venue.hits if hit.level == "L0"]
+    assert same_venue.level is FallbackLevel.NORMAL
+    assert ids(same_venue) == [listing.id, saves.items["kimchi"].id]
+
+
+async def test_a_single_venue_post_matches_its_own_cuisine_and_area(
+    db_session: AsyncSession, saves: Saves
+) -> None:
+    query = SearchQuery(
+        user_id=saves.user.id,
+        type="place",
+        filters={"area": "Bebek", "cuisine": "specialty coffee"},
+    )
+
+    result = await build_retriever().search(db_session, query)
+
+    assert result.level is FallbackLevel.NORMAL
+    assert ids(result) == saves.ids("kronotrop")
+
+
+async def test_item_wide_study_fields_still_filter_items_without_entities(
+    db_session: AsyncSession, saves: Saves
+) -> None:
+    query = SearchQuery(
+        user_id=saves.user.id, type="study", filters={"subject": "maths", "format": "tutorial"}
+    )
+
+    result = await build_retriever().search(db_session, query)
+
+    assert result.level is FallbackLevel.NORMAL
+    assert ids(result) == saves.ids("integrals")
