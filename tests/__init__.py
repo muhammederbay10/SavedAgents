@@ -1,1 +1,1 @@
-"""Test suite for the SavedAgent backend."""
+"""Test suite for the Savely backend."""

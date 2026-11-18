@@ -77,7 +77,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         await redis.aclose(close_connection_pool=True)
         await engine.dispose()
 
-    app = FastAPI(title="SavedAgent", lifespan=close_connections_on_shutdown)
+    app = FastAPI(title="Savely", lifespan=close_connections_on_shutdown)
     app.add_api_route("/health", health, methods=["GET"])
     app.include_router(create_instagram_webhook_router(app_settings, ingestion))
 

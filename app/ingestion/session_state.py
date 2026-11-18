@@ -1,6 +1,6 @@
 """What ingestion keeps in Redis about a user's recent messages.
 
-Three keys per user, named `savedagent:ingestion:<user id>:<name>`, hold
+Three keys per user, named `savely:ingestion:<user id>:<name>`, hold
 everything ingestion writes to Redis about a user, so "delete my data" can
 erase it by deleting three keys:
 
@@ -35,7 +35,7 @@ from redis.asyncio import Redis
 
 from app.adapters.base import CaptureEvent, ChatMessage
 
-_KEY_PREFIX = "savedagent:ingestion"
+_KEY_PREFIX = "savely:ingestion"
 _PAYLOADS = "payloads"
 _RECEIPTS = "receipts"
 _SHARES = "shares"
