@@ -36,6 +36,8 @@
    - index reels from the caption first, and treat the video as unavailable unless an official route exists;
    - check whether an official API returns a reel's media from `reel_video_id` for an app-scoped share;
    - get the video through capture paths that have the file (the Phase 3 share extension).
+
+   **Result (SAV-28, record [0013](0013-dm-reel-media.md)):** in the tested setup (the bot's existing Unified-login token, development mode), the lookup by `reel_video_id` returned the video for a reel the bot owns. For the tested third-party reels and posts it returned an error whose cause wasn't established, and the message routes gave no media. Instagram Login with a valid token was not tested. DM-shared reels stay caption-only.
 2. **Carousels: one image and no caption (decision needed).** Treat a carousel as a single image with no caption, unless an official way to get the other items and the caption turns up. Ask the user when that isn't enough to identify it.
 3. **Post images must be downloaded right away.** The link works now, but there's no stated lifetime. Fetch and store the image (and a 360p copy, per §9) when the webhook arrives. Re-check the link after 24 hours to measure its life; still to do.
 4. **The adapter (SAV-11):**
