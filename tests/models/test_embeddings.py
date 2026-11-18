@@ -137,3 +137,43 @@ async def test_empty_batch_is_refused_before_any_request(connect: Connect) -> No
         await embedder(transport, FIXTURE_DIMENSIONS).embed([])
 
     assert server.requests == []
+
+
+@pytest.mark.parametrize(
+    "indices",
+    [
+        (-0.5, 1.9),
+        (0.0, 1.0),
+        (False, True),
+        ("0", "1"),
+        (0, None),
+        (-1, 0),
+        (0, 2),
+        (1, 1),
+    ],
+)
+async def test_index_that_is_not_an_integer_in_range_is_rejected_not_coerced(
+    connect: Connect, indices: tuple[object, object]
+) -> None:
+    body = load_fixture("embeddings_response.json")
+    body["data"] = [
+        {"object": "embedding", "index": index, "embedding": [0.0] * FIXTURE_DIMENSIONS}
+        for index in indices
+    ]
+    _, transport = connect([json_response(body)])
+
+    with pytest.raises(ModelResponseError):
+        await embedder(transport, FIXTURE_DIMENSIONS).embed(TEXTS)
+
+
+async def test_valid_indices_in_any_order_map_each_vector_to_its_text(connect: Connect) -> None:
+    vectors = {0: [1.0, 0.0, 0.0, 0.0], 1: [0.0, 1.0, 0.0, 0.0], 2: [0.0, 0.0, 1.0, 0.0]}
+    body = load_fixture("embeddings_response.json")
+    body["data"] = [
+        {"object": "embedding", "index": index, "embedding": vectors[index]} for index in (2, 0, 1)
+    ]
+    _, transport = connect([json_response(body)])
+
+    result = await embedder(transport, FIXTURE_DIMENSIONS).embed(["first", "second", "third"])
+
+    assert result.vectors == tuple(tuple(vectors[index]) for index in range(3))

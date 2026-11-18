@@ -87,16 +87,27 @@ class OpenRouterEmbedder(Embedder):
         self, body: JsonObject, expected_count: int
     ) -> tuple[tuple[float, ...], ...]:
         entries = list_or_none(body.get("data")) or []
+        if len(entries) != expected_count:
+            raise self._response_error("the response does not hold one embedding per text")
         vectors_by_index: dict[int, tuple[float, ...]] = {}
         for raw_entry in entries:
             entry = object_or_none(raw_entry) or {}
-            index = number_or_none(entry.get("index"))
-            if index is None:
-                raise self._response_error("an embedding has no index")
-            vectors_by_index[int(index)] = self._vector(entry.get("embedding"))
-        if len(entries) != expected_count or set(vectors_by_index) != set(range(expected_count)):
-            raise self._response_error("the response does not hold one embedding per text")
+            index = self._index(entry.get("index"), expected_count)
+            if index in vectors_by_index:
+                raise self._response_error("two embeddings have the same index")
+            vectors_by_index[index] = self._vector(entry.get("embedding"))
         return tuple(vectors_by_index[index] for index in range(expected_count))
+
+    def _index(self, raw_index: object, expected_count: int) -> int:
+        # Only a JSON integer in range names a text. A float such as 1.9 or 1.0,
+        # a boolean or a string is refused, never rounded or converted.
+        if (
+            isinstance(raw_index, bool)
+            or not isinstance(raw_index, int)
+            or not 0 <= raw_index < expected_count
+        ):
+            raise self._response_error("an embedding's index is not an integer in range")
+        return raw_index
 
     def _vector(self, raw_vector: object) -> tuple[float, ...]:
         raw_values = list_or_none(raw_vector)
