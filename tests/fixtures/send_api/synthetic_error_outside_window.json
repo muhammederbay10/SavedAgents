@@ -1,0 +1,9 @@
+{
+  "error": {
+    "message": "This message is sent outside of allowed window.",
+    "type": "OAuthException",
+    "code": 10,
+    "error_subcode": 2018278,
+    "fbtrace_id": "SyntheticTrace0002"
+  }
+}
