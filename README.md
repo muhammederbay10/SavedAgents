@@ -107,14 +107,14 @@ Each run creates its own databases named `savedagent_test_<random>` on that serv
 
 ### Redis tests
 
-Two tests check that a job really lands in Redis and that arq refuses a second job with the same id. They are **skipped** unless `TEST_REDIS_URL` is set. To run them, start the `redis` service and point the variable at it:
+The ingestion tests keep their state in a real Redis, and some check what arq stores there. They are **skipped** unless `TEST_REDIS_URL` is set; most of them also need `TEST_DATABASE_ADMIN_URL`. To run them, start the `redis` service and point the variable at it:
 
 ```bash
 docker compose up --detach --wait redis
 TEST_REDIS_URL=redis://localhost:6379/0 make test
 ```
 
-Each test queues one job under a random id and removes it again. No worker should be reading that Redis while the tests run. Both variables can be set in the same run.
+The tests use new random ids for every user and job, so they never touch each other's keys, and keys they leave expire. Use a Redis that holds nothing else: one test reads every key to check that "delete my data" erased a user's texts. No worker should be reading that Redis while the tests run. Both variables can be set in the same run.
 
 ## Instagram webhook
 
@@ -132,14 +132,16 @@ What happens to a message ([`app/adapters/instagram.py`](app/adapters/instagram.
 | A reel shared by DM (`ig_reel`) | A saved item with the reel's id, public link and caption |
 | A post shared by DM or saved into the collection (`ig_post`, or the older `share`) | A saved item with the post's id (`ig_post` only) and caption. The signed image link is passed to the indexing job and not stored |
 | A reel saved into the collection (`unsupported_type`) | A saved item with only its message id. The signed video link is passed to the indexing job and not stored |
-| A text sent at most `COLLECTION_HINT_WINDOW_SECONDS` after a share | Stored as that item's collection, e.g. "For my movies collection". No chat job |
+| A text sent at most `COLLECTION_HINT_WINDOW_SECONDS` after the user's latest share (also a repeated share of a saved post) | Stored as that share's item's collection, e.g. "For my movies collection", if it has none yet. No chat job |
 | Any other text | A chat job for the response agent |
 | Anything else (read receipts, reactions, the bot's own messages, other attachments) | Ignored, and logged without its content |
 
 - **First contact:** the first message from an Instagram account creates its `user` and `platform_account` rows.
 - **Message id:** every saved item keeps the id of the message it came in with (`source_message_id`), so answers can reply to it (decision record 0004).
 - **One item per post and per message:** sharing the same post twice, or a webhook that Meta delivers twice, creates one saved item. Two reels saved into the collection have no post id, so they stay two items (decision record 0007).
-- **Jobs:** new items are queued as `index_saved_item` and texts as `answer_chat_message` on Redis, through `arq` ([`app/ingestion/jobs.py`](app/ingestion/jobs.py)). The workers that run them come with the indexing pipeline and the response agent. Until then the jobs wait in Redis and expire after a day, and the items stay `pending`.
+- **Jobs:** new items are queued as `index_saved_item` and texts as `answer_chat_message` on Redis, through `arq` ([`app/ingestion/jobs.py`](app/ingestion/jobs.py)). A job holds only ids; the caption, text and media link it works on are in a per-user payload hash ([`app/ingestion/session_state.py`](app/ingestion/session_state.py)). The workers that run them come with the indexing pipeline and the response agent. Until then the jobs wait in Redis and expire after a day, and the items stay `pending`.
+- **Routing is decided once:** each text's route is kept as a receipt by its message id before anything changes, so a repeated delivery is routed the same way, also when a delayed share arrived in between.
+- **Ingestion state:** payloads, text receipts and each user's latest share stay in Redis for `INGESTION_STATE_TTL_SECONDS`, and "delete my data" erases them.
 - **Errors:** if Postgres or Redis is down, the endpoint answers 500 and Meta delivers the webhook again. Handling a webhook twice is safe.
 
 ### Connect the Meta app
@@ -165,7 +167,7 @@ The schema is defined twice, and a test keeps the two in step:
 - [`app/db/models.py`](app/db/models.py): SQLAlchemy models, used for queries.
 - [`app/db/migrations/versions/`](app/db/migrations/versions/): Alembic migrations, the only thing that changes the database.
 
-"Delete my data" is `delete_user_data()` in [`app/db/deletion.py`](app/db/deletion.py). It deletes one user's rows and lowers the item counts of the shared vocabulary. The shared tables (entities, streaming availability, vocabulary and aliases) keep their rows.
+"Delete my data" is `delete_user_data()` in [`app/db/deletion.py`](app/db/deletion.py). It deletes one user's rows and lowers the item counts of the shared vocabulary. It also takes an eraser for the stores outside Postgres: pass `IngestionDataEraser` from [`app/ingestion/erasure.py`](app/ingestion/erasure.py), which removes the user's queued jobs and ingestion's Redis state. Ingestion and deletion lock the same user row, so they never overlap. The shared tables (entities, streaming availability, vocabulary and aliases) keep their rows.
 
 | Command | What it does |
 |---|---|
@@ -197,6 +199,7 @@ All configuration comes from environment variables. Locally they live in `.env`,
 | `META_APP_SECRET` | API | The Meta app's secret. Every webhook is signed with it. **Secret** |
 | `META_WEBHOOK_VERIFY_TOKEN` | API | The text Meta repeats in the verification handshake. You choose it and enter it in the Meta app. **Secret** |
 | `COLLECTION_HINT_WINDOW_SECONDS` | API | A text sent this many seconds or less after a share becomes that item's collection hint. A whole number above 0 |
+| `INGESTION_STATE_TTL_SECONDS` | API | How long ingestion keeps a user's job payloads, text receipts and latest share in Redis. At least the hint window; 129600 (36 hours, Meta's documented retry period) in `.env.example` |
 | `TEST_DATABASE_ADMIN_URL` | Tests only | Postgres server for the database tests (see [Database tests](#database-tests)). Not read by the API |
 | `TEST_REDIS_URL` | Tests only | Redis server for the Redis tests (see [Redis tests](#redis-tests)). Not read by the API |
 | `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` | Docker Compose | Credentials and database name for the `db` container |
@@ -298,6 +301,8 @@ app/
     service.py        # stores captures, routes texts, queues jobs
     repository.py     # users on first contact, saved items, collection hints
     jobs.py           # job names and ids, the arq queue
+    session_state.py  # per-user state in Redis: payloads, text receipts, latest share
+    erasure.py        # erases a user's Redis state and jobs for "delete my data"
   types/              # content-type registry: one module per built-in type
   db/
     models.py         # SQLAlchemy models
