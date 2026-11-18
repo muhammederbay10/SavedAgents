@@ -10,6 +10,8 @@ import pytest
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "webhooks"
 REAL_DM_FIXTURES = sorted(FIXTURE_DIR.glob("instagram_*.json"))
+# Not a recording: no `share` attachment ever arrived, so this one follows Meta's documentation.
+SYNTHETIC_LEGACY_SHARE = FIXTURE_DIR / "synthetic_instagram_share_legacy.json"
 
 FAKE_BOT_ID = "17840000000000001"
 FAKE_SENDER_ID = "1000000000000001"
@@ -65,6 +67,35 @@ def test_fixture_media_links_are_fake(path: Path) -> None:
                 link = FAKE_POST_URL.match(payload["url"])
                 assert link is not None
                 assert link.group(1) == payload["ig_post_media_id"]
+
+
+def test_recorded_fixtures_hold_no_legacy_share_attachment() -> None:
+    attachment_types = {
+        attachment["type"]
+        for path in REAL_DM_FIXTURES
+        for event in messaging_events(load(path))
+        for attachment in event["message"].get("attachments", [])
+    }
+    assert attachment_types == {"ig_reel", "ig_post", "unsupported_type"}
+
+
+def test_synthetic_legacy_share_has_the_recorded_shape_and_fake_ids() -> None:
+    data = load(SYNTHETIC_LEGACY_SHARE)
+    recorded = load(FIXTURE_DIR / "instagram_post_share_carousel.json")
+    (event,) = messaging_events(data)
+    (recorded_event,) = messaging_events(recorded)
+    (attachment,) = event["message"]["attachments"]
+
+    assert data["object"] == "instagram"
+    assert data["entry"][0]["id"] == FAKE_BOT_ID
+    assert event["sender"]["id"] == FAKE_SENDER_ID
+    assert event["recipient"]["id"] == FAKE_BOT_ID
+    assert FAKE_MID.match(event["message"]["mid"])
+    assert len(event["message"]["mid"]) == len(recorded_event["message"]["mid"])
+    assert set(event) == set(recorded_event)
+    assert attachment["type"] == "share"
+    assert set(attachment["payload"]) == {"url"}
+    assert FAKE_POST_URL.match(attachment["payload"]["url"])
 
 
 def test_dashboard_sample_uses_changes_not_messaging() -> None:

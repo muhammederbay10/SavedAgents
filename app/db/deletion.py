@@ -6,9 +6,16 @@ the user's items are gone.
 
 The user row is locked first. A second request for the same user then waits for
 the first one to finish and finds no user, so the counts are lowered only once.
+Ingestion locks the same row while it handles a message, so no message of the
+user is half-stored while the user is deleted.
+
+What the user left outside Postgres (ingestion's job payloads and receipts in
+Redis) is erased through `UserDataOutsidePostgres`, while the lock is held.
 """
 
 import uuid
+from collections.abc import Sequence
+from typing import Protocol
 
 from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,6 +24,7 @@ from app.db.models import (
     CATEGORY_VOCABULARY_FIELD,
     SUBTYPE_VOCABULARY_FIELD,
     TAG_VOCABULARY_FIELD,
+    SavedItem,
     User,
 )
 
@@ -64,7 +72,22 @@ _LOWER_ITEM_COUNTS = text(
 )
 
 
-async def delete_user_data(session: AsyncSession, user_id: uuid.UUID) -> None:
+class UserDataOutsidePostgres(Protocol):
+    """Erases what a user left in stores other than Postgres."""
+
+    async def erase_user(self, user_id: uuid.UUID, saved_item_ids: Sequence[uuid.UUID]) -> None:
+        """Erase everything one user left outside Postgres.
+
+        Args:
+            user_id: The user.
+            saved_item_ids: The ids of the user's saved items.
+        """
+        ...
+
+
+async def delete_user_data(
+    session: AsyncSession, user_id: uuid.UUID, outside_postgres: UserDataOutsidePostgres
+) -> None:
     """Delete a user and every database row that belongs to them.
 
     The user's saved items go with their raw wording, entity links and
@@ -73,14 +96,19 @@ async def delete_user_data(session: AsyncSession, user_id: uuid.UUID) -> None:
     deleted item that used it. The shared tables keep their rows: entities,
     streaming availability, vocabulary values and aliases.
 
+    What the user left outside Postgres is erased first, through
+    `outside_postgres`. If that fails, nothing is deleted from Postgres either,
+    and the request can be repeated.
+
     The caller commits the session. The user row stays locked until then, so a
     second request for the same user waits and then changes nothing. Nothing
-    happens for an unknown user id either. Files and session state outside
-    Postgres are not touched.
+    happens for an unknown user id either. Stored media files are not touched.
 
     Args:
         session: The database session to run the statements on.
         user_id: The id of the user to delete.
+        outside_postgres: Erases the user's data in the other stores, such as
+            the job payloads and receipts ingestion keeps in Redis.
 
     Raises:
         sqlalchemy.exc.SQLAlchemyError: If the database rejects a statement.
@@ -90,6 +118,10 @@ async def delete_user_data(session: AsyncSession, user_id: uuid.UUID) -> None:
     locked_user = await session.execute(select(User.id).where(User.id == user_id).with_for_update())
     if locked_user.scalar_one_or_none() is None:
         return
+    saved_item_ids = (
+        await session.execute(select(SavedItem.id).where(SavedItem.user_id == user_id))
+    ).scalars()
+    await outside_postgres.erase_user(user_id, list(saved_item_ids))
     await session.execute(
         _LOWER_ITEM_COUNTS,
         {

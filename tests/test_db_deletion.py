@@ -6,7 +6,8 @@ All ids and texts are synthetic.
 
 import asyncio
 import uuid
-from dataclasses import dataclass
+from collections.abc import Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
@@ -39,6 +40,23 @@ from tests.db_factories import (
 )
 
 THIRD_REEL_ID = "18000000000000203"
+
+
+@dataclass
+class RecordingEraser:
+    """Stands in for the stores outside Postgres and remembers what it was asked to erase."""
+
+    erased: list[tuple[uuid.UUID, set[uuid.UUID]]] = field(default_factory=list)
+
+    async def erase_user(self, user_id: uuid.UUID, saved_item_ids: Sequence[uuid.UUID]) -> None:
+        self.erased.append((user_id, set(saved_item_ids)))
+
+
+class FailingEraser:
+    async def erase_user(self, user_id: uuid.UUID, saved_item_ids: Sequence[uuid.UUID]) -> None:
+        raise ConnectionError("synthetic Redis outage")
+
+
 # Wording the privacy gate would refuse: it stays on the user's own item only.
 PERSONAL_WORDING = "my cousin's garage tour"
 STAYING_USERS_WORDING = "car reviews"
@@ -172,7 +190,7 @@ async def test_delete_my_data_removes_the_users_items_raw_wording_and_enrichment
 ) -> None:
     world = await add_saved_world(db_session)
 
-    await delete_user_data(db_session, world.leaving_user_id)
+    await delete_user_data(db_session, world.leaving_user_id, RecordingEraser())
 
     assert await count_rows(db_session, User, User.id == world.leaving_user_id) == 0
     assert await count_rows(db_session, SavedItem, SavedItem.user_id == world.leaving_user_id) == 0
@@ -195,7 +213,7 @@ async def test_delete_my_data_lowers_each_item_count_by_the_users_items(
 ) -> None:
     world = await add_saved_world(db_session)
 
-    await delete_user_data(db_session, world.leaving_user_id)
+    await delete_user_data(db_session, world.leaving_user_id, RecordingEraser())
 
     assert await item_counts(db_session) == ITEM_COUNTS_AFTER
 
@@ -205,7 +223,7 @@ async def test_delete_my_data_keeps_other_users_items_and_the_shared_records(
 ) -> None:
     world = await add_saved_world(db_session)
 
-    await delete_user_data(db_session, world.leaving_user_id)
+    await delete_user_data(db_session, world.leaving_user_id, RecordingEraser())
 
     staying_items = await db_session.execute(
         select(SavedItem.id, SavedItem.raw_values).where(SavedItem.user_id == world.staying_user_id)
@@ -239,7 +257,7 @@ async def test_delete_my_data_counts_an_item_once_and_never_goes_below_zero(
     )
     await db_session.flush()
 
-    await delete_user_data(db_session, user.id)
+    await delete_user_data(db_session, user.id, RecordingEraser())
 
     assert await item_counts(db_session) == {("tag", "bmw"): 4, ("category", "car review"): 0}
 
@@ -249,11 +267,47 @@ async def test_delete_my_data_for_an_unknown_user_changes_nothing(
 ) -> None:
     world = await add_saved_world(db_session)
 
-    await delete_user_data(db_session, uuid.uuid4())
+    await delete_user_data(db_session, uuid.uuid4(), RecordingEraser())
 
     assert await item_counts(db_session) == ITEM_COUNTS_BEFORE
     assert await count_rows(db_session, User) == 2
     assert await count_rows(db_session, SavedItem, SavedItem.user_id == world.leaving_user_id) == 3
+
+
+async def test_delete_my_data_erases_the_users_data_outside_postgres_with_their_items(
+    db_session: AsyncSession,
+) -> None:
+    world = await add_saved_world(db_session)
+    leaving_items = await db_session.execute(
+        select(SavedItem.id).where(SavedItem.user_id == world.leaving_user_id)
+    )
+    eraser = RecordingEraser()
+
+    await delete_user_data(db_session, world.leaving_user_id, eraser)
+
+    assert eraser.erased == [(world.leaving_user_id, set(leaving_items.scalars()))]
+
+
+async def test_delete_my_data_for_an_unknown_user_erases_nothing_outside_postgres(
+    db_session: AsyncSession,
+) -> None:
+    eraser = RecordingEraser()
+
+    await delete_user_data(db_session, uuid.uuid4(), eraser)
+
+    assert eraser.erased == []
+
+
+async def test_delete_my_data_deletes_no_rows_when_the_other_stores_fail(
+    db_session: AsyncSession,
+) -> None:
+    world = await add_saved_world(db_session)
+
+    with pytest.raises(ConnectionError):
+        await delete_user_data(db_session, world.leaving_user_id, FailingEraser())
+
+    assert await count_rows(db_session, User, User.id == world.leaving_user_id) == 1
+    assert await item_counts(db_session) == ITEM_COUNTS_BEFORE
 
 
 # --- two requests at the same time -----------------------------------------------------
@@ -303,9 +357,9 @@ async def test_two_delete_requests_for_one_user_lower_the_item_count_only_once(
             second_pid = await second_request.scalar(text("SELECT pg_backend_pid()"))
             assert second_pid is not None
 
-            await delete_user_data(first_request, leaving_user.id)
+            await delete_user_data(first_request, leaving_user.id, RecordingEraser())
             overlapping_delete = asyncio.create_task(
-                delete_user_data(second_request, leaving_user.id)
+                delete_user_data(second_request, leaving_user.id, RecordingEraser())
             )
             try:
                 await wait_until_blocked_on_a_lock(observer, second_pid)
