@@ -7,11 +7,19 @@ synthetic app secret from `tests/conftest.py`, the way Meta signs a real body.
 import hashlib
 import hmac
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
+from redis.asyncio import Redis
+
+from app.ingestion.session_state import (
+    capture_payload_field,
+    chat_payload_field,
+    payloads_key,
+)
 from tests.conftest import TEST_META_APP_SECRET
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "webhooks"
@@ -75,6 +83,23 @@ def signed_headers(body: bytes) -> dict[str, str]:
     return {SIGNATURE_HEADER: signature_for(body), "Content-Type": "application/json"}
 
 
+async def capture_payload(redis: Redis, user_id: UUID, saved_item_id: UUID) -> dict[str, Any]:
+    """Read the capture event an indexing job works on, as a worker would."""
+    return await _payload(redis, user_id, capture_payload_field(saved_item_id))
+
+
+async def chat_payload(redis: Redis, user_id: UUID, receipt_id: UUID) -> dict[str, Any]:
+    """Read the chat message a chat job answers, as a worker would."""
+    return await _payload(redis, user_id, chat_payload_field(receipt_id))
+
+
+async def _payload(redis: Redis, user_id: UUID, field: str) -> dict[str, Any]:
+    value = await redis.hget(payloads_key(user_id), field)  # type: ignore[misc]
+    assert value is not None, f"no payload {field}"
+    payload: dict[str, Any] = json.loads(value)
+    return payload
+
+
 @dataclass(frozen=True)
 class QueuedJob:
     name: str
@@ -93,6 +118,9 @@ class RecordingJobQueue:
             return False
         self.jobs.append(QueuedJob(name=job_name, job_id=job_id, arguments=arguments))
         return True
+
+    async def discard(self, job_ids: Sequence[str]) -> None:
+        self.jobs = [job for job in self.jobs if job.job_id not in job_ids]
 
     def named(self, job_name: str) -> list[QueuedJob]:
         return [job for job in self.jobs if job.name == job_name]

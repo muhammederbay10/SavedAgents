@@ -2,6 +2,11 @@
 
 Every function runs inside the caller's transaction and never commits.
 
+Ingestion locks the user's row for the whole of its work on one message
+(`lock_user`). "Delete my data" locks the same row, so the two never overlap:
+a deletion waits for the message being ingested, and a message waits for the
+deletion and then finds no user.
+
 A saved item is stored once per post id and once per message id (decision
 record 0007). Both rules are unique keys in the database, so a second share of
 a post, or a webhook that Meta delivers twice, finds the item that is already
@@ -11,9 +16,8 @@ there instead of creating another.
 import logging
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta
 
-from sqlalchemy import ColumnElement, and_, func, or_, select
+from sqlalchemy import ColumnElement, and_, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -119,52 +123,65 @@ async def store_capture(session: AsyncSession, event: CaptureEvent) -> StoredCap
     return StoredCapture(saved_item_id=existing.id, status=existing.status, created=False)
 
 
-async def attach_collection_hint(
-    session: AsyncSession,
-    user_id: uuid.UUID,
-    platform: str,
-    hint: str,
-    sent_at: datetime,
-    window: timedelta,
-) -> bool:
-    """Attach a text to the item its sender captured just before, as the collection hint.
+async def lock_user(session: AsyncSession, user_id: uuid.UUID) -> bool:
+    """Lock a user's row until the transaction ends.
 
-    The text is a hint when the user's latest capture is at most `window` older
-    than the text and has no collection yet. A text that equals the collection
-    the item already has is the same hint delivered again.
+    The lock lets new rows refer to the user, but makes "delete my data" for
+    this user wait, and waits for it.
 
     Args:
         session: The session to work in.
-        user_id: The user who wrote the text.
-        platform: The platform the text was sent on.
-        hint: The text, stored as the user wrote it.
-        sent_at: When the user sent the text.
-        window: How long after a capture a text still counts as its hint.
+        user_id: The user to lock.
 
     Returns:
-        Whether the text is the collection hint of a just-captured item. `False`
-        means it is an ordinary chat message.
+        Whether the user exists. `False` means the user was deleted.
     """
-    latest_capture = (
-        select(SavedItem)
-        .where(
-            SavedItem.user_id == user_id,
-            SavedItem.platform == platform,
-            SavedItem.source_message_id.is_not(None),
-            SavedItem.saved_at.between(sent_at - window, sent_at),
-        )
-        .order_by(SavedItem.saved_at.desc())
-        .limit(1)
-        .with_for_update()
+    statement = select(User.id).where(User.id == user_id).with_for_update(key_share=True)
+    return (await session.execute(statement)).scalar_one_or_none() is not None
+
+
+async def is_unlabelled_item(
+    session: AsyncSession, user_id: uuid.UUID, saved_item_id: uuid.UUID
+) -> bool:
+    """Check that a user's saved item exists and has no collection yet.
+
+    Args:
+        session: The session to work in.
+        user_id: The user the item must belong to.
+        saved_item_id: The item's id.
+
+    Returns:
+        Whether the item can take a collection hint.
+    """
+    statement = select(SavedItem.collection).where(
+        SavedItem.id == saved_item_id, SavedItem.user_id == user_id
     )
-    item = (await session.execute(latest_capture)).scalar_one_or_none()
-    if item is None:
-        return False
-    if item.collection is None:
-        item.collection = hint
-        await session.flush()
-        return True
-    return item.collection == hint
+    row = (await session.execute(statement)).one_or_none()
+    return row is not None and row.collection is None
+
+
+async def set_collection_if_missing(
+    session: AsyncSession, user_id: uuid.UUID, saved_item_id: uuid.UUID, collection: str
+) -> None:
+    """Give a user's saved item its collection, unless it already has one.
+
+    Setting the same hint again changes nothing, so a repeated delivery is safe.
+
+    Args:
+        session: The session to work in.
+        user_id: The user the item must belong to.
+        saved_item_id: The item's id.
+        collection: The collection, as the user wrote it.
+    """
+    await session.execute(
+        update(SavedItem)
+        .where(
+            SavedItem.id == saved_item_id,
+            SavedItem.user_id == user_id,
+            SavedItem.collection.is_(None),
+        )
+        .values(collection=collection)
+    )
 
 
 async def _find_user_id(

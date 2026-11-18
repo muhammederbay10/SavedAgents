@@ -10,14 +10,16 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
+from arq.connections import ArqRedis
 from redis.exceptions import ConnectionError as RedisConnectionError
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.adapters.base import CaptureEvent, ChatMessage
 from app.db.models import ItemStatus, PlatformAccount, SavedItem, User
 from app.ingestion.jobs import ANSWER_CHAT_MESSAGE_JOB, INDEX_SAVED_ITEM_JOB
-from app.ingestion.service import IngestionOutcome, IngestionService
+from app.ingestion.service import IngestionOutcome, IngestionService, UnknownUserError
+from app.ingestion.session_state import RedisIngestionState
 from tests.db_factories import (
     INSTAGRAM,
     MESSAGE_ID,
@@ -28,7 +30,7 @@ from tests.db_factories import (
     SENDER_ID,
     count_rows,
 )
-from tests.webhooks import RecordingJobQueue
+from tests.webhooks import RecordingJobQueue, capture_payload, chat_payload
 
 OTHER_SENDER_ID = "1000000000000002"
 THIRD_MESSAGE_ID = "aWdfZAGFAKEMID0009"
@@ -66,9 +68,11 @@ def job_queue() -> RecordingJobQueue:
 
 @pytest.fixture
 def ingestion(
-    session_factory: async_sessionmaker[AsyncSession], job_queue: RecordingJobQueue
+    session_factory: async_sessionmaker[AsyncSession],
+    job_queue: RecordingJobQueue,
+    ingestion_state: RedisIngestionState,
 ) -> IngestionService:
-    return IngestionService(session_factory, job_queue, HINT_WINDOW)
+    return IngestionService(session_factory, job_queue, ingestion_state, HINT_WINDOW)
 
 
 @pytest.fixture
@@ -226,10 +230,11 @@ async def test_collection_save_is_stored_without_a_post_id_or_post_link(
     assert item.media_type == "reel"
 
 
-async def test_new_item_queues_one_indexing_job_that_carries_the_capture(
+async def test_new_item_queues_one_indexing_job_whose_payload_is_the_capture(
     ingestion: IngestionService,
     session_factory: async_sessionmaker[AsyncSession],
     job_queue: RecordingJobQueue,
+    ingestion_redis: ArqRedis,
     user_id: uuid.UUID,
 ) -> None:
     event = collection_save(user_id, MESSAGE_ID)
@@ -238,12 +243,14 @@ async def test_new_item_queues_one_indexing_job_that_carries_the_capture(
 
     item = await only_saved_item(session_factory)
     (job,) = job_queue.jobs
+    payload = await capture_payload(ingestion_redis, user_id, item.id)
     assert job.name == INDEX_SAVED_ITEM_JOB
     assert job.job_id == f"index:{item.id}"
-    assert job.arguments["saved_item_id"] == str(item.id)
-    # The signed media link is not stored on the item, so the job must carry it.
-    assert job.arguments["capture_event"]["media_url"] == SIGNED_VIDEO_URL
-    assert CaptureEvent.model_validate(job.arguments["capture_event"]) == event
+    # Ids only: captions, texts and links stay in the payload "delete my data" erases.
+    assert job.arguments == {"user_id": str(user_id), "saved_item_id": str(item.id)}
+    # The signed media link is not stored on the item, so the payload must carry it.
+    assert payload["media_url"] == SIGNED_VIDEO_URL
+    assert CaptureEvent.model_validate(payload) == event
 
 
 # --- Duplicates --------------------------------------------------------------
@@ -377,10 +384,12 @@ async def test_share_of_an_item_that_is_already_indexed_queues_no_new_job(
 
 
 async def test_item_whose_job_could_not_be_queued_is_queued_when_the_share_is_redelivered(
-    session_factory: async_sessionmaker[AsyncSession], user_id: uuid.UUID
+    session_factory: async_sessionmaker[AsyncSession],
+    ingestion_state: RedisIngestionState,
+    user_id: uuid.UUID,
 ) -> None:
     job_queue = QueueThatFailsOnce()
-    ingestion = IngestionService(session_factory, job_queue, HINT_WINDOW)
+    ingestion = IngestionService(session_factory, job_queue, ingestion_state, HINT_WINDOW)
 
     with pytest.raises(RedisConnectionError):
         await ingestion.ingest_capture(reel_share(user_id))
@@ -456,10 +465,11 @@ async def test_text_after_the_window_is_a_chat_message(
 async def test_window_length_comes_from_the_service_setting(
     session_factory: async_sessionmaker[AsyncSession],
     job_queue: RecordingJobQueue,
+    ingestion_state: RedisIngestionState,
     user_id: uuid.UUID,
 ) -> None:
     short_window = timedelta(seconds=5)
-    ingestion = IngestionService(session_factory, job_queue, short_window)
+    ingestion = IngestionService(session_factory, job_queue, ingestion_state, short_window)
     await ingestion.ingest_capture(reel_share(user_id))
 
     outcome = await ingestion.ingest_chat_message(text_message(user_id))
@@ -469,17 +479,23 @@ async def test_window_length_comes_from_the_service_setting(
 
 
 async def test_text_from_a_user_without_a_capture_is_a_chat_message(
-    ingestion: IngestionService, job_queue: RecordingJobQueue, user_id: uuid.UUID
+    ingestion: IngestionService,
+    job_queue: RecordingJobQueue,
+    ingestion_redis: ArqRedis,
+    user_id: uuid.UUID,
 ) -> None:
     message = text_message(user_id, text=QUESTION, message_id=QUESTION_MESSAGE_ID)
 
     outcome = await ingestion.ingest_chat_message(message)
 
     (job,) = job_queue.jobs
+    receipt_id = uuid.UUID(job.arguments["message_receipt_id"])
+    payload = await chat_payload(ingestion_redis, user_id, receipt_id)
     assert outcome is IngestionOutcome.CHAT_QUEUED
     assert job.name == ANSWER_CHAT_MESSAGE_JOB
-    assert job.job_id == f"chat:instagram:{QUESTION_MESSAGE_ID}"
-    assert ChatMessage.model_validate(job.arguments["chat_message"]) == message
+    assert job.job_id == f"chat:{receipt_id}"
+    assert job.arguments == {"user_id": str(user_id), "message_receipt_id": str(receipt_id)}
+    assert ChatMessage.model_validate(payload) == message
 
 
 async def test_text_sent_before_the_share_is_a_chat_message(
@@ -593,3 +609,155 @@ async def test_two_different_texts_are_two_chat_jobs(
     )
 
     assert len(job_queue.named(ANSWER_CHAT_MESSAGE_JOB)) == 2
+
+
+# --- Regressions from the first review (fix round 1) ---------------------------
+
+POST_A = "18000000000000211"
+POST_B = "18000000000000212"
+SHARE_A_MESSAGE_ID = "aWdfZAGFAKEMID0021"
+SHARE_B_MESSAGE_ID = "aWdfZAGFAKEMID0022"
+SHARE_A_AGAIN_MESSAGE_ID = "aWdfZAGFAKEMID0023"
+LATE_HINT_MESSAGE_ID = "aWdfZAGFAKEMID0024"
+
+
+async def item_with_post_id(
+    session_factory: async_sessionmaker[AsyncSession], post_id: str
+) -> SavedItem:
+    async with session_factory() as session:
+        statement = select(SavedItem).where(SavedItem.platform_post_id == post_id)
+        return (await session.execute(statement)).scalar_one()
+
+
+async def test_hint_after_a_repeated_share_labels_the_repeated_post_not_a_later_saved_one(
+    ingestion: IngestionService,
+    session_factory: async_sessionmaker[AsyncSession],
+    user_id: uuid.UUID,
+) -> None:
+    await ingestion.ingest_capture(
+        reel_share(user_id, platform_post_id=POST_A, source_message_id=SHARE_A_MESSAGE_ID)
+    )
+    await ingestion.ingest_capture(
+        reel_share(
+            user_id,
+            platform_post_id=POST_B,
+            source_message_id=SHARE_B_MESSAGE_ID,
+            received_at=SHARED_AT + timedelta(seconds=60),
+        )
+    )
+    repeat = await ingestion.ingest_capture(
+        reel_share(
+            user_id,
+            platform_post_id=POST_A,
+            source_message_id=SHARE_A_AGAIN_MESSAGE_ID,
+            received_at=SHARED_AT + timedelta(seconds=65),
+        )
+    )
+
+    outcome = await ingestion.ingest_chat_message(
+        text_message(user_id, message_id=LATE_HINT_MESSAGE_ID, sent_after=timedelta(seconds=70))
+    )
+
+    post_a = await item_with_post_id(session_factory, POST_A)
+    post_b = await item_with_post_id(session_factory, POST_B)
+    assert repeat is IngestionOutcome.ITEM_ALREADY_SAVED
+    assert outcome is IngestionOutcome.COLLECTION_HINT
+    assert post_a.collection == HINT
+    assert post_b.collection is None
+    # The item keeps the message it came in with, so answers still reply to it.
+    assert post_a.source_message_id == SHARE_A_MESSAGE_ID
+    assert post_a.saved_at == SHARED_AT
+    assert await count(session_factory, SavedItem) == 2
+
+
+async def test_redelivered_text_keeps_its_chat_route_after_a_delayed_earlier_share(
+    ingestion: IngestionService,
+    session_factory: async_sessionmaker[AsyncSession],
+    job_queue: RecordingJobQueue,
+    user_id: uuid.UUID,
+) -> None:
+    question = text_message(user_id, text=QUESTION, message_id=QUESTION_MESSAGE_ID)
+    first = await ingestion.ingest_chat_message(question)
+    # The share was sent 9 seconds before the question but delivered after it.
+    await ingestion.ingest_capture(reel_share(user_id))
+
+    replay = await ingestion.ingest_chat_message(question)
+
+    assert first is IngestionOutcome.CHAT_QUEUED
+    assert replay is IngestionOutcome.CHAT_ALREADY_QUEUED
+    assert (await only_saved_item(session_factory)).collection is None
+    assert len(job_queue.named(ANSWER_CHAT_MESSAGE_JOB)) == 1
+
+
+async def test_text_whose_chat_job_failed_to_queue_keeps_its_route_on_redelivery(
+    session_factory: async_sessionmaker[AsyncSession],
+    ingestion_state: RedisIngestionState,
+    user_id: uuid.UUID,
+) -> None:
+    job_queue = QueueThatFailsOnce()
+    ingestion = IngestionService(session_factory, job_queue, ingestion_state, HINT_WINDOW)
+    question = text_message(user_id, text=QUESTION, message_id=QUESTION_MESSAGE_ID)
+
+    with pytest.raises(RedisConnectionError):
+        await ingestion.ingest_chat_message(question)
+    await ingestion.ingest_capture(reel_share(user_id))
+    replay = await ingestion.ingest_chat_message(question)
+    second_replay = await ingestion.ingest_chat_message(question)
+
+    assert replay is IngestionOutcome.CHAT_QUEUED
+    assert second_replay is IngestionOutcome.CHAT_ALREADY_QUEUED
+    assert (await only_saved_item(session_factory)).collection is None
+    assert len(job_queue.named(ANSWER_CHAT_MESSAGE_JOB)) == 1
+
+
+async def test_redelivered_hint_stays_on_its_item_after_a_delayed_share(
+    ingestion: IngestionService,
+    session_factory: async_sessionmaker[AsyncSession],
+    job_queue: RecordingJobQueue,
+    user_id: uuid.UUID,
+) -> None:
+    await ingestion.ingest_capture(reel_share(user_id))
+    hint = text_message(user_id)
+    await ingestion.ingest_chat_message(hint)
+    # Sent between the first share and the hint, but delivered after the hint.
+    await ingestion.ingest_capture(
+        reel_share(
+            user_id,
+            platform_post_id=OTHER_REEL_ID,
+            source_message_id=OTHER_MESSAGE_ID,
+            received_at=SHARED_AT + timedelta(seconds=5),
+        )
+    )
+
+    replay = await ingestion.ingest_chat_message(hint)
+
+    first_item = await item_with_post_id(session_factory, REEL_ID)
+    later_item = await item_with_post_id(session_factory, OTHER_REEL_ID)
+    assert replay is IngestionOutcome.COLLECTION_HINT
+    assert first_item.collection == HINT
+    assert later_item.collection is None
+    assert job_queue.named(ANSWER_CHAT_MESSAGE_JOB) == []
+
+
+@pytest.mark.parametrize("message_kind", ["capture", "text"])
+async def test_message_of_a_user_deleted_meanwhile_is_refused_and_leaves_nothing_in_redis(
+    ingestion: IngestionService,
+    session_factory: async_sessionmaker[AsyncSession],
+    job_queue: RecordingJobQueue,
+    ingestion_state: RedisIngestionState,
+    user_id: uuid.UUID,
+    message_kind: str,
+) -> None:
+    async with session_factory.begin() as session:
+        await session.execute(delete(User).where(User.id == user_id))
+
+    with pytest.raises(UnknownUserError):
+        if message_kind == "capture":
+            await ingestion.ingest_capture(reel_share(user_id))
+        else:
+            await ingestion.ingest_chat_message(text_message(user_id))
+
+    assert await ingestion_state.latest_share(user_id, INSTAGRAM) is None
+    assert await ingestion_state.text_receipt(user_id, INSTAGRAM, HINT_MESSAGE_ID) is None
+    assert job_queue.jobs == []
+    assert await count(session_factory, SavedItem) == 0

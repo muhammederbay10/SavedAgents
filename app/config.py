@@ -5,9 +5,9 @@ rest of the code never hard-codes configuration.
 """
 
 from functools import lru_cache
-from typing import Literal
+from typing import Literal, Self
 
-from pydantic import Field, PostgresDsn, RedisDsn, SecretStr
+from pydantic import Field, PostgresDsn, RedisDsn, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
@@ -43,6 +43,11 @@ class Settings(BaseSettings):
         collection_hint_window_seconds: How long after a share a text from the
             same user still counts as that item's collection hint
             (`COLLECTION_HINT_WINDOW_SECONDS`).
+        ingestion_state_ttl_seconds: How long ingestion keeps a user's job
+            payloads, text receipts and latest share in Redis after its last
+            write (`INGESTION_STATE_TTL_SECONDS`). It must cover the time Meta
+            keeps delivering a failed webhook again, so a late delivery is
+            still recognized, and it must be at least the hint window.
     """
 
     model_config = SettingsConfigDict(
@@ -58,6 +63,15 @@ class Settings(BaseSettings):
     meta_app_secret: SecretStr = Field(min_length=1)
     meta_webhook_verify_token: SecretStr = Field(min_length=1)
     collection_hint_window_seconds: int = Field(gt=0)
+    ingestion_state_ttl_seconds: int = Field(gt=0)
+
+    @model_validator(mode="after")
+    def _state_outlives_the_hint_window(self) -> Self:
+        if self.ingestion_state_ttl_seconds < self.collection_hint_window_seconds:
+            raise ValueError(
+                "ingestion_state_ttl_seconds must be at least collection_hint_window_seconds"
+            )
+        return self
 
 
 @lru_cache

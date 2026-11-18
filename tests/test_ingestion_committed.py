@@ -15,20 +15,27 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from arq.connections import ArqRedis
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import URL, select
+from redis.asyncio import Redis
+from sqlalchemy import URL, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.adapters.base import CaptureEvent
+from app.adapters.base import CaptureEvent, ChatMessage
 from app.api.webhooks import create_instagram_webhook_router
 from app.config import Settings
+from app.db.deletion import delete_user_data
 from app.db.models import PlatformAccount, SavedItem, User
 from app.db.session import create_engine, create_session_factory
+from app.ingestion.erasure import IngestionDataEraser
 from app.ingestion.service import IngestionOutcome, IngestionService
+from app.ingestion.session_state import RedisIngestionState
+from tests.conftest import TEST_INGESTION_STATE_TTL_SECONDS
 from tests.database import run_alembic
 from tests.db_factories import INSTAGRAM, MESSAGE_ID, REEL_ID, REEL_URL, SENDER_ID, count_rows
+from tests.redis_inspection import all_stored_bytes
 from tests.webhooks import (
     HINT_AFTER_REEL,
     REEL_BEFORE_HINT,
@@ -44,6 +51,45 @@ OVERLAPPING_REQUESTS = 8
 HINT_WINDOW = timedelta(seconds=30)
 SHARED_AT = datetime(2026, 1, 15, 12, 0, 0, tzinfo=UTC)
 PRIVATE_CAPTION = "synthetic private caption 3d9a"
+LOCK_WAIT_ATTEMPTS = 200
+LOCK_WAIT_POLL_SECONDS = 0.01
+BLOCKED_TASK_TIMEOUT_SECONDS = 10.0
+BACKEND_WAIT_STATE = "SELECT wait_event_type FROM pg_stat_activity WHERE pid = :backend_pid"
+
+
+class StateThatPausesInsideTheTransaction(RedisIngestionState):
+    """Holds a capture or a text inside its database transaction until the test lets it go on."""
+
+    def __init__(self, redis: Redis) -> None:
+        super().__init__(redis, timedelta(seconds=TEST_INGESTION_STATE_TTL_SECONDS))
+        self.reached = asyncio.Event()
+        self.resume = asyncio.Event()
+
+    async def save_capture_payload(
+        self, user_id: uuid.UUID, saved_item_id: uuid.UUID, event: CaptureEvent
+    ) -> None:
+        self.reached.set()
+        await self.resume.wait()
+        await super().save_capture_payload(user_id, saved_item_id, event)
+
+    async def save_chat_payload(
+        self, user_id: uuid.UUID, receipt_id: uuid.UUID, message: ChatMessage
+    ) -> None:
+        self.reached.set()
+        await self.resume.wait()
+        await super().save_chat_payload(user_id, receipt_id, message)
+
+
+async def wait_until_waiting_for_a_lock(
+    session_factory: async_sessionmaker[AsyncSession], backend_pid: int
+) -> None:
+    async with session_factory() as observer:
+        for _ in range(LOCK_WAIT_ATTEMPTS):
+            state = await observer.execute(text(BACKEND_WAIT_STATE), {"backend_pid": backend_pid})
+            if state.scalar_one_or_none() == "Lock":
+                return
+            await asyncio.sleep(LOCK_WAIT_POLL_SECONDS)
+    raise AssertionError("the deletion never waited for the message being ingested")
 
 
 @pytest.fixture
@@ -66,9 +112,11 @@ def job_queue() -> RecordingJobQueue:
 
 @pytest.fixture
 def ingestion(
-    session_factory: async_sessionmaker[AsyncSession], job_queue: RecordingJobQueue
+    session_factory: async_sessionmaker[AsyncSession],
+    job_queue: RecordingJobQueue,
+    ingestion_state: RedisIngestionState,
 ) -> IngestionService:
-    return IngestionService(session_factory, job_queue, HINT_WINDOW)
+    return IngestionService(session_factory, job_queue, ingestion_state, HINT_WINDOW)
 
 
 def reel_share(user_id: uuid.UUID, message_id: str = MESSAGE_ID) -> CaptureEvent:
@@ -186,3 +234,54 @@ async def test_logs_hold_no_message_content_or_platform_ids_even_at_debug_level(
     assert "capture_ingested" in logged
     assert "chat_message_ingested" in logged
     assert [value for value in private_values if value in logged] == []
+
+
+@pytest.mark.parametrize("message_kind", ["capture", "text"])
+async def test_deletion_waits_for_a_message_being_ingested_and_then_erases_it(
+    session_factory: async_sessionmaker[AsyncSession],
+    job_queue: RecordingJobQueue,
+    ingestion_state: RedisIngestionState,
+    ingestion_redis: ArqRedis,
+    redis_url: str,
+    message_kind: str,
+) -> None:
+    paused_state = StateThatPausesInsideTheTransaction(ingestion_redis)
+    ingestion = IngestionService(session_factory, job_queue, paused_state, HINT_WINDOW)
+    user_id = await ingestion.resolve_user(INSTAGRAM, SENDER_ID)
+    # Unique to this run: Redis is shared with the other tests.
+    private_text = f"{PRIVATE_CAPTION} {uuid.uuid4().hex}"
+    if message_kind == "capture":
+        share = reel_share(user_id).model_copy(update={"caption": private_text})
+        ingesting = ingestion.ingest_capture(share)
+    else:
+        ingesting = ingestion.ingest_chat_message(
+            ChatMessage(
+                user_id=user_id,
+                platform=INSTAGRAM,
+                text=private_text,
+                message_id=MESSAGE_ID,
+                received_at=SHARED_AT,
+            )
+        )
+    ingestion_task = asyncio.create_task(ingesting)
+    await asyncio.wait_for(paused_state.reached.wait(), BLOCKED_TASK_TIMEOUT_SECONDS)
+
+    async with session_factory() as deleting_session:
+        backend_pid = (await deleting_session.execute(text("SELECT pg_backend_pid()"))).scalar_one()
+        deletion = asyncio.create_task(
+            delete_user_data(
+                deleting_session, user_id, IngestionDataEraser(ingestion_state, job_queue)
+            )
+        )
+        await wait_until_waiting_for_a_lock(session_factory, backend_pid)
+        paused_state.resume.set()
+        await asyncio.wait_for(deletion, BLOCKED_TASK_TIMEOUT_SECONDS)
+        await deleting_session.commit()
+    await asyncio.wait_for(ingestion_task, BLOCKED_TASK_TIMEOUT_SECONDS)
+
+    assert await count(session_factory, SavedItem) == 0
+    stored = await all_stored_bytes(redis_url)
+    assert private_text.encode() not in stored
+    assert str(user_id).encode() not in stored
+    # Queued after the commit, so it was not there to discard. It holds only ids.
+    assert [job.arguments["user_id"] for job in job_queue.jobs] in ([], [str(user_id)])

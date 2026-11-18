@@ -17,6 +17,7 @@ REQUIRED_VARIABLES = {
     "META_APP_SECRET": TEST_META_APP_SECRET,
     "META_WEBHOOK_VERIFY_TOKEN": TEST_META_WEBHOOK_VERIFY_TOKEN,
     "COLLECTION_HINT_WINDOW_SECONDS": "30",
+    "INGESTION_STATE_TTL_SECONDS": "129600",
 }
 
 
@@ -42,6 +43,7 @@ def test_settings_are_read_from_environment_variables(environment: pytest.Monkey
     assert settings.meta_app_secret.get_secret_value() == TEST_META_APP_SECRET
     assert settings.meta_webhook_verify_token.get_secret_value() == TEST_META_WEBHOOK_VERIFY_TOKEN
     assert settings.collection_hint_window_seconds == 30
+    assert settings.ingestion_state_ttl_seconds == 129600
 
 
 @pytest.mark.parametrize("missing_variable", sorted(REQUIRED_VARIABLES))
@@ -136,4 +138,22 @@ def test_collection_hint_window_must_be_a_positive_number_of_seconds(
     environment.setenv("COLLECTION_HINT_WINDOW_SECONDS", window)
 
     with pytest.raises(ValidationError, match="collection_hint_window_seconds"):
+        load_settings_from_environment_only()
+
+
+@pytest.mark.parametrize("lifetime", ["0", "-1", "a day"])
+def test_ingestion_state_lifetime_must_be_a_positive_number_of_seconds(
+    environment: pytest.MonkeyPatch, lifetime: str
+) -> None:
+    environment.setenv("INGESTION_STATE_TTL_SECONDS", lifetime)
+
+    with pytest.raises(ValidationError, match="ingestion_state_ttl_seconds"):
+        load_settings_from_environment_only()
+
+
+def test_ingestion_state_must_outlive_the_hint_window(environment: pytest.MonkeyPatch) -> None:
+    environment.setenv("COLLECTION_HINT_WINDOW_SECONDS", "60")
+    environment.setenv("INGESTION_STATE_TTL_SECONDS", "59")
+
+    with pytest.raises(ValidationError, match="ingestion_state_ttl_seconds"):
         load_settings_from_environment_only()

@@ -34,6 +34,7 @@ UNUSED_WEBHOOK_SETTINGS = {
     "META_APP_SECRET": "unused-by-migrations",
     "META_WEBHOOK_VERIFY_TOKEN": "unused-by-migrations",
     "COLLECTION_HINT_WINDOW_SECONDS": "30",
+    "INGESTION_STATE_TTL_SECONDS": "30",
 }
 
 

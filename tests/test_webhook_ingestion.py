@@ -6,10 +6,12 @@ database. Only the job queue is an in-memory stand-in for Redis.
 These tests need Postgres with PostGIS and pgvector. See `tests/database.py`.
 """
 
+import uuid
 from collections.abc import AsyncIterator
 from datetime import timedelta
 
 import pytest
+from arq.connections import ArqRedis
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
@@ -20,6 +22,7 @@ from app.config import Settings
 from app.db.models import ItemStatus, PlatformAccount, SavedItem, User
 from app.ingestion.jobs import ANSWER_CHAT_MESSAGE_JOB, INDEX_SAVED_ITEM_JOB
 from app.ingestion.service import IngestionService
+from app.ingestion.session_state import RedisIngestionState
 from tests.db_factories import count_rows
 from tests.webhooks import (
     COLLECTION_PHOTO,
@@ -34,6 +37,8 @@ from tests.webhooks import (
     TEXT_QUESTION,
     RecordingJobQueue,
     body_of,
+    capture_payload,
+    chat_payload,
     fixture_body,
     fixture_json,
     fixture_message,
@@ -55,10 +60,12 @@ async def webhooks(
     settings: Settings,
     session_factory: async_sessionmaker[AsyncSession],
     job_queue: RecordingJobQueue,
+    ingestion_state: RedisIngestionState,
 ) -> AsyncIterator[AsyncClient]:
     ingestion = IngestionService(
         session_factory,
         job_queue,
+        ingestion_state,
         timedelta(seconds=settings.collection_hint_window_seconds),
     )
     app = FastAPI()
@@ -163,6 +170,7 @@ async def test_signed_media_link_reaches_the_indexing_job_but_not_the_database(
     webhooks: AsyncClient,
     session_factory: async_sessionmaker[AsyncSession],
     job_queue: RecordingJobQueue,
+    ingestion_redis: ArqRedis,
     name: str,
 ) -> None:
     signed_link = fixture_message(name)["attachments"][0]["payload"]["url"]
@@ -171,11 +179,13 @@ async def test_signed_media_link_reaches_the_indexing_job_but_not_the_database(
 
     (item,) = await saved_items(session_factory)
     (job,) = job_queue.named(INDEX_SAVED_ITEM_JOB)
+    payload = await capture_payload(ingestion_redis, item.user_id, item.id)
     assert item.post_url is None
     assert job.arguments["saved_item_id"] == str(item.id)
-    assert job.arguments["capture_event"]["media_url"] == signed_link
-    assert job.arguments["capture_event"]["post_url"] is None
-    assert job.arguments["capture_event"]["source_message_id"] == item.source_message_id
+    assert signed_link not in str(job.arguments)
+    assert payload["media_url"] == signed_link
+    assert payload["post_url"] is None
+    assert payload["source_message_id"] == item.source_message_id
 
 
 async def test_first_message_from_an_account_creates_its_user(
@@ -213,14 +223,20 @@ async def test_question_with_no_share_before_it_is_queued_for_the_response_agent
     webhooks: AsyncClient,
     session_factory: async_sessionmaker[AsyncSession],
     job_queue: RecordingJobQueue,
+    ingestion_redis: ArqRedis,
 ) -> None:
     await deliver(webhooks, fixture_body(TEXT_QUESTION))
     await deliver(webhooks, fixture_body(TEXT_QUESTION))
 
     (job,) = job_queue.jobs
+    payload = await chat_payload(
+        ingestion_redis,
+        uuid.UUID(job.arguments["user_id"]),
+        uuid.UUID(job.arguments["message_receipt_id"]),
+    )
     assert job.name == ANSWER_CHAT_MESSAGE_JOB
-    assert job.arguments["chat_message"]["text"] == "Restaurants in beşiktaş"
-    assert job.arguments["chat_message"]["message_id"] == fixture_message(TEXT_QUESTION)["mid"]
+    assert payload["text"] == "Restaurants in beşiktaş"
+    assert payload["message_id"] == fixture_message(TEXT_QUESTION)["mid"]
     assert await saved_items(session_factory) == []
 
 
