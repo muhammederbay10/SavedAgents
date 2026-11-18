@@ -530,9 +530,9 @@ result.availability_gaps   # (movie, country) rows to fetch or refresh (SAV-15)
 
 1. **Check** the query against the content types: an unknown type or filter, or a value of the wrong kind, raises `SearchQueryError`. A streaming filter without the user's country raises `CountryRequiredError`, so the agent asks once.
 2. **Normalize** what the user wrote to a value in **their own** saves: an exact hit (their value, or a canonical value or verified alias in the vocabulary) needs no model call; otherwise Gemini Decision 1 picks one of their values or "none of these". No other user's values are ever read, and search never writes to the vocabulary.
-3. **L0:** SQL/PostGIS filters, then pgvector ranking by the query text. Without a text, places near a point come nearest first, and everything else newest first.
+3. **L0:** SQL/PostGIS filters, then pgvector ranking by the query text. The type's filters must all hold on the same place or title of a list post. Without a text, places near a point come nearest first, and everything else newest first.
 4. **L1:** if the embedding or the vector search fails, the same filters plus Postgres full-text search on the caption, summary and transcript.
-5. **L2:** with fewer than `SEARCH_MIN_RESULTS` results, a district or neighbourhood widens to its city, tags and the type's other filters are dropped, and items that are not fully indexed yet are searched by the words of the query. The result lists what was relaxed.
+5. **L2:** with fewer than `SEARCH_MIN_RESULTS` results, a district or neighbourhood widens to its city, tags and the type's other filters are dropped (a keyword match from L1 is kept), and items that are not fully indexed yet are searched by the words of the query. The result lists what was relaxed.
 
 Every step up the ladder is logged as `search_fallback` with its level and reason, never with the query's text. The whole search runs within `SEARCH_TIME_BUDGET_SECONDS`; when it runs out, the result has what was found and `incomplete=True`.
 

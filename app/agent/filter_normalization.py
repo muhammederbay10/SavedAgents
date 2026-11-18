@@ -26,6 +26,7 @@ from enum import StrEnum
 from itertools import chain, zip_longest
 from typing import Final
 
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.prompts import RetrievalPrompts
@@ -201,23 +202,55 @@ class FilterNormalizer:
             return []
         limit = self._settings.filter_normalization_max_options
         form = comparison_form(wording.wording)
-        excluded: set[str] = set()
-        by_meaning: list[str] = []
+        excluded_forms: set[str] = set()
         if wording.vocabulary is not None:
-            excluded = await rejected_values(session, wording.vocabulary, form)
-            if embedding is not None:
-                by_meaning = await nearest_vocabulary_values(
-                    session,
-                    wording.vocabulary,
-                    embedding,
-                    among=[value for value in values if value not in excluded],
-                    limit=limit,
-                )
+            rejected = await rejected_values(session, wording.vocabulary, form)
+            excluded_forms = {comparison_form(value) for value in rejected}
+        # Saved values are compared in the same form as the vocabulary's, so "Restaurant"
+        # or " restaurant " is left out when the wording was rejected for "restaurant".
+        allowed: dict[str, list[str]] = {}
+        for value in values:
+            value_form = comparison_form(value)
+            if value_form not in excluded_forms:
+                allowed.setdefault(value_form, []).append(value)
+        by_meaning: list[str] = []
+        if wording.vocabulary is not None and embedding is not None:
+            nearest_forms = await self._rank_by_meaning(
+                session, wording.vocabulary, wording.slot, embedding, list(allowed), limit
+            )
+            by_meaning = [value for value_form in nearest_forms for value in allowed[value_form]]
         by_spelling = sorted(
-            (value for value in values if value not in excluded),
+            (value for stored in allowed.values() for value in stored),
             key=lambda value: (-_spelling_similarity(form, value), value),
         )
         return _interleave(by_meaning, by_spelling, limit)
+
+    async def _rank_by_meaning(
+        self,
+        session: AsyncSession,
+        field: str,
+        slot: str,
+        embedding: tuple[float, ...],
+        among_forms: Sequence[str],
+        limit: int,
+    ) -> list[str]:
+        """Rank vocabulary values by meaning, or return none if the database fails it.
+
+        Ranking by meaning only adds options; ranking by spelling still offers
+        every allowed value. The query runs in a savepoint, so a failure leaves
+        the session usable for the rest of the search.
+        """
+        try:
+            async with session.begin_nested():
+                return await nearest_vocabulary_values(
+                    session, field, embedding, among=among_forms, limit=limit
+                )
+        except DBAPIError as error:
+            logger.warning(
+                "filter_normalization_ranking_failed",
+                extra={"slot": slot, "error": type(error.orig).__name__},
+            )
+            return []
 
     async def _decide(self, pending: _Pending) -> NormalizedWording:
         wording = pending.wording

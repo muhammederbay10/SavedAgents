@@ -43,24 +43,26 @@ from app.agent.saved_values import ValueScope
 from app.agent.search_conditions import (
     WIDENED_LEVELS,
     FilterContext,
+    FilterPredicates,
+    all_filters_hold,
+    area_predicates,
+    city_predicates,
     distance_from,
-    filter_condition,
+    filter_predicates,
     from_platform,
     fully_indexed,
-    in_any_city,
-    in_area,
     in_category,
     in_collection,
     keyword_query,
     keyword_rank,
     matches_keywords,
+    near_predicates,
     not_fully_indexed,
     of_type,
     owned_by,
     saved_after,
     tagged,
     vector_distance,
-    within,
 )
 from app.agent.search_query import (
     CATEGORY_SLOT,
@@ -205,25 +207,26 @@ class _Conditions:
     Attributes:
         scope: The user, collection, type, category, platform and date.
         tags: One condition per tag.
-        filters: One condition per type filter, by slot.
+        filters: Where each type filter holds, by slot. They must all hold on
+            the same linked entity.
         availability_slots: The slots of filters on streaming availability.
     """
 
     scope: tuple[ColumnElement[bool], ...]
     tags: dict[str, ColumnElement[bool]]
-    filters: dict[str, ColumnElement[bool]]
+    filters: dict[str, FilterPredicates]
     availability_slots: frozenset[str]
 
     def strict(self) -> list[ColumnElement[bool]]:
-        return [*self.scope, *self.tags.values(), *self.filters.values()]
+        return [*self.scope, *self.tags.values(), all_filters_hold(list(self.filters.values()))]
 
     def without_availability(self) -> list[ColumnElement[bool]]:
         kept = [
-            condition
-            for slot, condition in self.filters.items()
+            predicates
+            for slot, predicates in self.filters.items()
             if slot not in self.availability_slots
         ]
-        return [*self.scope, *self.tags.values(), *kept]
+        return [*self.scope, *self.tags.values(), all_filters_hold(kept)]
 
 
 class HybridRetriever:
@@ -380,8 +383,9 @@ class HybridRetriever:
         room = limit - len(run.hits)
         found = [hit.item_id for hit in run.hits]
         if room > 0:
-            loose = replace(ranking, required=None)
-            rows = await self._find(session, relaxed_conditions, loose, room, found)
+            # A keyword match that stands in for vector ranking (L1) is kept: relaxing
+            # filters must not turn a text search into "everything".
+            rows = await self._find(session, relaxed_conditions, ranking, room, found)
             run.hits.extend(_hit(row, FallbackLevel.RELAXED) for row in rows)
             found.extend(item_id for item_id, _ in rows)
         room = limit - len(run.hits)
@@ -408,10 +412,14 @@ class HybridRetriever:
         ]
         if country is None or not entity_types:
             return ()
-        if plan.uses_country:
-            items = conditions.without_availability()
-        else:
-            items = [SavedItem.id.in_([hit.item_id for hit in run.hits])]
+        returned = SavedItem.id.in_([hit.item_id for hit in run.hits])
+        # With a streaming filter, the titles it rejected for lack of a row count
+        # too, and so do the titles L2 returned after relaxing it.
+        items = (
+            [or_(and_(*conditions.without_availability()), returned)]
+            if plan.uses_country
+            else [returned]
+        )
         cutoff = self._now() - timedelta(days=self._settings.availability_max_age_days)
         rows = await session.execute(
             select(Entity.id, EntityAvailability.refreshed_at)
@@ -502,12 +510,12 @@ def _conditions(
         f"{TAG_SLOT_PREFIX}{index}": tagged(_value_of(f"{TAG_SLOT_PREFIX}{index}", normalized, tag))
         for index, tag in enumerate(plan.query.tags)
     }
-    filters: dict[str, ColumnElement[bool]] = {}
+    filters: dict[str, FilterPredicates] = {}
     availability: set[str] = set()
     for typed in plan.filters:
         slot = f"{FILTER_SLOT_PREFIX}{typed.search_filter.name}"
         value = _normalized_filter(typed, normalized).value
-        filters[slot] = filter_condition(typed.search_filter, value, context)
+        filters[slot] = filter_predicates(typed.search_filter, value, context)
         if typed.search_filter.source is FilterSource.COUNTRY_AVAILABILITY:
             availability.add(slot)
     return _Conditions(
@@ -554,20 +562,22 @@ async def _relaxed_conditions(
     """
     conditions = _scope_conditions(plan, normalized, indexed=True)
     relaxed = [f"{TAG_SLOT_PREFIX}{index}" for index in range(len(plan.query.tags))]
+    kept: list[FilterPredicates] = []
     for typed in plan.filters:
         slot = f"{FILTER_SLOT_PREFIX}{typed.search_filter.name}"
         value = _normalized_filter(typed, normalized).value
         if isinstance(value, Near):
-            conditions.append(within(value))
+            kept.append(near_predicates(value))
         elif typed.search_filter.kind is FilterKind.AREA:
             cities = await _cities_around(session, plan.query.user_id, str(value))
             if cities:
-                conditions.append(in_any_city(cities))
+                kept.append(city_predicates(cities))
                 relaxed.append(slot)
             else:
-                conditions.append(in_area(str(value)))
+                kept.append(area_predicates(str(value)))
         else:
             relaxed.append(slot)
+    conditions.append(all_filters_hold(kept))
     return conditions, tuple(relaxed)
 
 

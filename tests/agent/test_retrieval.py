@@ -15,12 +15,13 @@ from app.agent.fallback import FallbackLevel, FallbackReason
 from app.agent.filter_normalization import NormalizationMethod
 from app.agent.retrieval import AvailabilityGapReason, SearchResult
 from app.agent.search_query import CountryRequiredError, Near, SearchQuery
-from app.db.models import EntityAvailability
+from app.db.models import EntityAvailability, ItemEntity, ItemStatus, SavedItem
 from app.db.types import GeoPoint
 from app.models.errors import ModelUnavailableError
 from tests.agent.retrieval_support import (
     BEBEK,
     COFFEE_AXIS,
+    KOREAN_AXIS,
     NOW,
     STUDY_AXIS,
     MappedEmbedder,
@@ -30,6 +31,7 @@ from tests.agent.retrieval_support import (
     retrieval_settings,
     seed_saves,
 )
+from tests.db_factories import unit_vector
 
 # A point about 1 km from the seeded café in Bebek, and far from every other place.
 NEAR_BEBEK = GeoPoint(latitude=41.0700, longitude=29.0350)
@@ -504,3 +506,167 @@ async def test_collection_matches_in_any_case_and_near_ranks_nearest_first(
     result = await build_retriever().search(db_session, query)
 
     assert ids(result) == saves.ids("kronotrop", "kimchi")
+
+
+async def add_list_post(
+    session: AsyncSession, saves: Saves, name: str, entities: tuple[str, ...]
+) -> SavedItem:
+    """A post that lists several titles or places, each linked to the same item."""
+    item = SavedItem(
+        user_id=saves.user.id,
+        platform="instagram",
+        platform_post_id=f"synthetic-list-{name}",
+        type=saves.entities[entities[0]].type,
+        category="list",
+        status=ItemStatus.DONE,
+        saved_at=NOW,
+    )
+    session.add(item)
+    await session.flush()
+    session.add_all(
+        ItemEntity(saved_item_id=item.id, entity_id=saves.entities[entity].id, position=position)
+        for position, entity in enumerate(entities)
+    )
+    await session.flush()
+    return item
+
+
+async def test_two_titles_of_a_list_post_cannot_split_the_entity_filters(
+    db_session: AsyncSession, saves: Saves
+) -> None:
+    # Hereditary is horror but on U-NEXT in Japan; Inception is on Netflix in Japan but sci-fi.
+    split = await add_list_post(db_session, saves, "split", ("hereditary", "inception"))
+    query = SearchQuery(
+        user_id=saves.user.id,
+        country="JP",
+        type="movie",
+        filters={"genre": "horror", "streaming": "Netflix"},
+    )
+
+    result = await build_retriever().search(db_session, query)
+
+    assert result.level is FallbackLevel.NORMAL
+    assert split.id not in ids(result)
+    assert ids(result) == saves.ids("conjuring")
+
+
+async def test_one_title_of_a_list_post_meeting_every_entity_filter_finds_the_post(
+    db_session: AsyncSession, saves: Saves
+) -> None:
+    # The Conjuring is horror and on Netflix in Japan, and the user has not watched it.
+    joined = await add_list_post(db_session, saves, "joined", ("inception", "conjuring"))
+    query = SearchQuery(
+        user_id=saves.user.id,
+        country="JP",
+        type="movie",
+        filters={"genre": "horror", "streaming": "Netflix", "watched": False},
+    )
+    watched_and_horror = SearchQuery(
+        user_id=saves.user.id, type="movie", filters={"genre": "horror", "watched": True}
+    )
+    retriever = build_retriever()
+
+    result = await retriever.search(db_session, query)
+    none_watched = await retriever.search(db_session, watched_and_horror)
+
+    assert result.level is FallbackLevel.NORMAL
+    assert ids(result) == [joined.id, saves.items["conjuring"].id]
+    assert joined.id not in [hit.item_id for hit in none_watched.hits if hit.level == "L0"]
+
+
+async def test_l2_after_l1_keeps_matching_the_words_of_the_text(
+    db_session: AsyncSession, saves: Saves
+) -> None:
+    error = ModelUnavailableError("embed timed out", operation="embed", model="fake/embedding")
+    retriever = build_retriever(
+        embedder=MappedEmbedder(error=error), settings=retrieval_settings(search_min_results=3)
+    )
+
+    nothing = await retriever.search(
+        db_session, SearchQuery(user_id=saves.user.id, text="nonexistenttermxyz")
+    )
+    few = await retriever.search(db_session, SearchQuery(user_id=saves.user.id, text="integrals"))
+
+    assert nothing.hits == ()
+    assert nothing.level is FallbackLevel.RELAXED
+    assert ids(few) == saves.ids("integrals")
+    assert few.level is FallbackLevel.RELAXED
+
+
+@pytest.mark.parametrize("wording", ["eatery", "Eatery", "  EATERY  ", "eatery "])
+async def test_a_rejected_alias_is_never_offered_in_any_case_or_spacing(
+    db_session: AsyncSession, saves: Saves, wording: str
+) -> None:
+    db_session.add(
+        SavedItem(
+            user_id=saves.user.id,
+            platform="instagram",
+            platform_post_id="synthetic-capitalized-restaurant",
+            category="Restaurant",
+            status=ItemStatus.DONE,
+            embedding=unit_vector(KOREAN_AXIS),
+        )
+    )
+    await db_session.flush()
+    classifier = PickingClassifier(picks={("category", wording): "Restaurant"})
+    # The wording embeds next to "restaurant", so it would be the first option by meaning.
+    embedder = MappedEmbedder(axes={wording: KOREAN_AXIS})
+
+    result = await build_retriever(classifier=classifier, embedder=embedder).search(
+        db_session, SearchQuery(user_id=saves.user.id, category=wording)
+    )
+
+    assert {"Restaurant", "restaurant"}.isdisjoint(classifier.offered_values)
+    assert normalized_value(result, "category") == (wording, NormalizationMethod.UNCHANGED)
+    assert result.hits == ()
+
+
+async def test_a_failed_vocabulary_ranking_falls_back_to_spelling_and_keeps_the_session(
+    db_session: AsyncSession, saves: Saves, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A wording vector of the wrong size makes the database reject the ranking by meaning.
+    embedder = MappedEmbedder(dimension=3)
+    classifier = PickingClassifier(picks={("category", "restarant"): "restaurant"})
+    retriever = build_retriever(classifier=classifier, embedder=embedder)
+
+    with caplog.at_level(logging.WARNING, logger="app.agent.filter_normalization"):
+        result = await retriever.search(
+            db_session, SearchQuery(user_id=saves.user.id, category="restarant")
+        )
+    after = await retriever.search(
+        db_session, SearchQuery(user_id=saves.user.id, type="place", filters={"area": "Brooklyn"})
+    )
+
+    assert normalized_value(result, "category") == ("restaurant", NormalizationMethod.DECISION)
+    assert ids(result) == saves.ids("diner", "kimchi")
+    assert ids(after) == saves.ids("diner")
+    logged = [r for r in caplog.records if r.getMessage() == "filter_normalization_ranking_failed"]
+    assert len(logged) == 1
+    assert "restarant" not in str(logged[0].__dict__)
+
+
+async def test_availability_gaps_cover_titles_added_by_l2_in_the_asking_country_only(
+    db_session: AsyncSession, saves: Saves
+) -> None:
+    query = SearchQuery(
+        user_id=saves.user.id,
+        country="US",
+        type="movie",
+        filters={"genre": "horror", "streaming": "Netflix"},
+    )
+    settings = retrieval_settings(search_min_results=3)
+
+    result = await build_retriever(settings=settings).search(db_session, query)
+
+    assert ids(result) == saves.ids("hereditary", "conjuring", "inception")
+    assert [hit.level for hit in result.hits] == [
+        FallbackLevel.NORMAL,
+        FallbackLevel.RELAXED,
+        FallbackLevel.RELAXED,
+    ]
+    # Inception has a Japanese row with Netflix, which must not count for the US.
+    gaps = {(gap.entity_id, gap.country, gap.reason) for gap in result.availability_gaps}
+    assert gaps == {
+        (saves.entities["inception"].id, "US", AvailabilityGapReason.MISSING),
+        (saves.entities["conjuring"].id, "US", AvailabilityGapReason.STALE),
+    }

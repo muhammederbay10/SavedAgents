@@ -29,6 +29,7 @@ from sqlalchemy import (
     not_,
     or_,
     select,
+    true,
 )
 from sqlalchemy.dialects.postgresql import JSONPATH, TSQUERY
 
@@ -122,10 +123,29 @@ class FilterContext:
     country: str | None
 
 
-def filter_condition(
+@dataclass(frozen=True)
+class FilterPredicates:
+    """When one of a type's filters holds, on the item itself or on one linked entity.
+
+    A list post links several entities. Every filter of a search must hold on
+    the **same** entity, so two titles cannot each satisfy half of the filters.
+    A value stored on the item itself (`saved_item.fields`) holds for all of
+    its entities.
+
+    Attributes:
+        on_item: The filter holds by the item's own fields; `None` if it never can.
+        on_entity: The filter holds by one linked entity, written on `Entity`;
+            `None` if entities never decide it.
+    """
+
+    on_item: ColumnElement[bool] | None
+    on_entity: ColumnElement[bool] | None
+
+
+def filter_predicates(
     search_filter: SearchFilter, value: FilterValue, context: FilterContext
-) -> ColumnElement[bool]:
-    """Build the condition of one of a type's filters.
+) -> FilterPredicates:
+    """Build where one of a type's filters holds.
 
     Args:
         search_filter: The filter as the type declares it.
@@ -133,51 +153,87 @@ def filter_condition(
         context: The asking user and their country.
 
     Returns:
-        The condition on `saved_item`.
+        The filter's predicates on the item and on one linked entity.
     """
     if search_filter.source is FilterSource.COUNTRY_AVAILABILITY:
-        return _available_in_country(str(value), context.country)
+        return FilterPredicates(None, _available_in_country(str(value), context.country))
     if search_filter.source is FilterSource.USER_STATUS:
-        return _done_by_user(context.user_id) if value else not_(_done_by_user(context.user_id))
+        done = _done_by_user(context.user_id)
+        return FilterPredicates(None, done if value else not_(done))
     if isinstance(value, Near):
-        return within(value)
+        return near_predicates(value)
     if search_filter.kind is FilterKind.AREA:
-        return in_area(str(value))
+        return area_predicates(str(value))
     if search_filter.kind is FilterKind.TEXT:
-        return _mentions_text(search_filter.name, str(value))
-    return _has_value(search_filter.name, value)
+        return _text_predicates(search_filter.name, str(value))
+    return _value_predicates(search_filter.name, value)
 
 
-def in_area(area: str) -> ColumnElement[bool]:
-    """Keep the items with an entity whose address has the area at any level."""
-    return _has_entity(or_(*(level == area for level in ADDRESS_LEVELS)))
+def area_predicates(area: str) -> FilterPredicates:
+    """Hold for an entity whose address has the area at any level."""
+    return FilterPredicates(None, or_(*(level == area for level in ADDRESS_LEVELS)))
 
 
-def in_any_city(cities: Sequence[tuple[str | None, str]]) -> ColumnElement[bool]:
-    """Keep the items with an entity in one of the given cities.
+def city_predicates(cities: Sequence[tuple[str | None, str]]) -> FilterPredicates:
+    """Hold for an entity in one of the given cities.
 
     Args:
         cities: `(country, city)` pairs. The country keeps two cities with the
             same name in different countries apart.
 
     Returns:
-        The condition on `saved_item`.
+        The predicates; they never hold when `cities` is empty.
     """
     if not cities:
-        return false()
-    return _has_entity(
+        return FilterPredicates(None, false())
+    return FilterPredicates(
+        None,
         or_(
             *(
                 and_(Entity.city == city, Entity.country.is_not_distinct_from(country))
                 for country, city in cities
             )
-        )
+        ),
     )
 
 
-def within(near: Near) -> ColumnElement[bool]:
-    """Keep the items with an entity within a distance of a point."""
-    return _has_entity(func.ST_DWithin(Entity.location, _point(near), near.radius_m))
+def near_predicates(near: Near) -> FilterPredicates:
+    """Hold for an entity within a distance of a point."""
+    return FilterPredicates(None, func.ST_DWithin(Entity.location, _point(near), near.radius_m))
+
+
+def all_filters_hold(predicates: Sequence[FilterPredicates]) -> ColumnElement[bool]:
+    """Keep the items on which every filter holds, all on the same linked entity.
+
+    An item matches when its own fields satisfy every filter, or when one of
+    its entities satisfies every filter its fields do not.
+
+    Args:
+        predicates: One per filter of the search.
+
+    Returns:
+        The condition on `saved_item`.
+    """
+    if not predicates:
+        return true()
+    per_entity = and_(*(_on_item_or_entity(predicate) for predicate in predicates))
+    on_one_entity = (
+        select(ItemEntity.saved_item_id)
+        .join(Entity, Entity.id == ItemEntity.entity_id)
+        .where(ItemEntity.saved_item_id == SavedItem.id, per_entity)
+        .exists()
+    )
+    item_conditions = [predicate.on_item for predicate in predicates]
+    if any(condition is None for condition in item_conditions):
+        return on_one_entity
+    return or_(
+        and_(*(condition for condition in item_conditions if condition is not None)), on_one_entity
+    )
+
+
+def _on_item_or_entity(predicate: FilterPredicates) -> ColumnElement[bool]:
+    parts = [part for part in (predicate.on_item, predicate.on_entity) if part is not None]
+    return or_(*parts) if parts else false()
 
 
 def distance_from(near: Near) -> ColumnElement[float]:
@@ -225,46 +281,31 @@ def keyword_rank(query: ColumnElement[str]) -> ColumnElement[float]:
     return func.ts_rank(saved_item_search_vector(), query, type_=Float)
 
 
-def _has_entity(condition: ColumnElement[bool]) -> ColumnElement[bool]:
-    return (
-        select(ItemEntity.saved_item_id)
-        .join(Entity, Entity.id == ItemEntity.entity_id)
-        .where(ItemEntity.saved_item_id == SavedItem.id, condition)
-        .exists()
+def _value_predicates(key: str, value: FilterValue) -> FilterPredicates:
+    """The value under `key` in the item's fields or the entity's data, alone or in a list."""
+    return FilterPredicates(
+        or_(SavedItem.fields.contains({key: value}), SavedItem.fields.contains({key: [value]})),
+        or_(Entity.data.contains({key: value}), Entity.data.contains({key: [value]})),
     )
 
 
-def _has_value(key: str, value: FilterValue) -> ColumnElement[bool]:
-    """The value under `key` in the item's fields or an entity's data, alone or in a list."""
-    return or_(
-        SavedItem.fields.contains({key: value}),
-        SavedItem.fields.contains({key: [value]}),
-        _has_entity(or_(Entity.data.contains({key: value}), Entity.data.contains({key: [value]}))),
-    )
-
-
-def _mentions_text(key: str, value: str) -> ColumnElement[bool]:
+def _text_predicates(key: str, value: str) -> FilterPredicates:
     pattern = f"%{_escape_like(value)}%"
-    return or_(
+    return FilterPredicates(
         SavedItem.fields[key].astext.ilike(pattern, escape=_LIKE_ESCAPE),
-        _has_entity(Entity.data[key].astext.ilike(pattern, escape=_LIKE_ESCAPE)),
+        Entity.data[key].astext.ilike(pattern, escape=_LIKE_ESCAPE),
     )
 
 
 def _available_in_country(provider: str, country: str | None) -> ColumnElement[bool]:
+    """The entity is offered by the provider in the country; another country's row never counts."""
     path = cast(literal(_PROVIDER_NAME_PATH), JSONPATH)
     variables = func.jsonb_build_object("name", provider)
     return (
-        select(ItemEntity.saved_item_id)
-        .join(
-            EntityAvailability,
-            and_(
-                EntityAvailability.entity_id == ItemEntity.entity_id,
-                EntityAvailability.country == country,
-            ),
-        )
+        select(EntityAvailability.entity_id)
         .where(
-            ItemEntity.saved_item_id == SavedItem.id,
+            EntityAvailability.entity_id == Entity.id,
+            EntityAvailability.country == country,
             func.jsonb_path_exists(EntityAvailability.providers, path, variables),
         )
         .exists()
@@ -272,17 +313,14 @@ def _available_in_country(provider: str, country: str | None) -> ColumnElement[b
 
 
 def _done_by_user(user_id: uuid.UUID) -> ColumnElement[bool]:
+    """The user marked the entity as done (visited, watched, read)."""
     return (
-        select(ItemEntity.saved_item_id)
-        .join(
-            UserEntity,
-            and_(
-                UserEntity.entity_id == ItemEntity.entity_id,
-                UserEntity.user_id == user_id,
-                UserEntity.status == EntityStatus.DONE,
-            ),
+        select(UserEntity.entity_id)
+        .where(
+            UserEntity.entity_id == Entity.id,
+            UserEntity.user_id == user_id,
+            UserEntity.status == EntityStatus.DONE,
         )
-        .where(ItemEntity.saved_item_id == SavedItem.id)
         .exists()
     )
 
