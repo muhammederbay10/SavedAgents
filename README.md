@@ -200,12 +200,51 @@ All configuration comes from environment variables. Locally they live in `.env`,
 | `META_WEBHOOK_VERIFY_TOKEN` | API | The text Meta repeats in the verification handshake. You choose it and enter it in the Meta app. **Secret** |
 | `COLLECTION_HINT_WINDOW_SECONDS` | API | A text sent this many seconds or less after a share becomes that item's collection hint. A whole number above 0 |
 | `INGESTION_STATE_TTL_SECONDS` | API | How long ingestion keeps a user's job payloads, text receipts and recent shares in Redis. At least the hint window; 129600 (36 hours, Meta's documented retry period) in `.env.example` |
+| `INSTAGRAM_GRAPH_API_URL` | DM replies | Graph API base URL with its version, e.g. `https://graph.facebook.com/v27.0` (see [DM replies](#dm-replies)) |
+| `INSTAGRAM_ACCOUNT_ID` | DM replies | The bot's Instagram professional account id |
+| `INSTAGRAM_ACCESS_TOKEN` | DM replies | The bot's access token for the Send API. A secret |
+| `INSTAGRAM_REPLY_WINDOW_HOURS` | DM replies | How long after the user's last message the bot may reply: more than 0 and at most `24` (Instagram's limit) |
+| `SEND_API_TIMEOUT_SECONDS` | DM replies | Time limit of one Send API request |
+| `SEND_API_MAX_ATTEMPTS`, `SEND_API_RETRY_BASE_DELAY_SECONDS`, `SEND_API_RETRY_MAX_DELAY_SECONDS` | DM replies | Retries when Meta throttles a message or the connection never opens: total attempts, first wait, longest wait |
 | `TEST_DATABASE_ADMIN_URL` | Tests only | Postgres server for the database tests (see [Database tests](#database-tests)). Not read by the API |
 | `TEST_REDIS_URL` | Tests only | Redis server for the Redis tests (see [Redis tests](#redis-tests)). Not read by the API |
 | `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` | Docker Compose | Credentials and database name for the `db` container |
 | `API_PORT`, `POSTGRES_PORT`, `REDIS_PORT` | Docker Compose | Ports published on `127.0.0.1` |
 
-The API settings are defined in [`app/config.py`](app/config.py). None of them has a default, so the API refuses to start when one is missing or invalid. The error names the variable but never prints its value, because a URL can contain a password. The two secrets are also hidden when the settings are printed. Under Docker Compose, `DATABASE_URL` and `REDIS_URL` are built in `docker-compose.yml` from the `POSTGRES_*` values, so the two in `.env` are only used by `make run`.
+The API settings are defined in [`app/config.py`](app/config.py): `Settings` for the API and `MessengerSettings` for DM replies, which is only read when the bot sends a DM, so `/health` and the migrations don't need the token. None of them has a default, so the API refuses to start when one is missing or invalid. The error names the variable but never prints its value, because a URL can contain a password. The two secrets are also hidden when the settings are printed. Under Docker Compose, `DATABASE_URL` and `REDIS_URL` are built in `docker-compose.yml` from the `POSTGRES_*` values, so the two in `.env` are only used by `make run`.
+
+## DM replies
+
+[`app/agent/messenger.py`](app/agent/messenger.py) sends the bot's DMs through the Instagram Send API, and [`app/agent/reply_templates.py`](app/agent/reply_templates.py) holds the fixed wording (decision records [0004](docs/decisions/0004-reply-to-saved-reels.md) and [0011](docs/decisions/0011-dm-replies.md)). Nothing calls them yet: the indexing pipeline (SAV-14) and the response agent (SAV-17) will.
+
+```python
+import httpx
+
+from app.agent.messenger import InstagramMessenger
+from app.agent.reply_templates import ResultLine, reply_wording, result_reply
+from app.config import get_messenger_settings
+
+wording = reply_wording(user.language, localized=agent_wording)  # see "Languages" below
+async with httpx.AsyncClient() as http_client:
+    messenger = InstagramMessenger(http_client, get_messenger_settings())
+    line = ResultLine(position=1, total=3, name="Kronotrop", area="Beşiktaş", open_now=True)
+    result = await messenger.send(
+        recipient_id=account.platform_user_id,          # the user's IGSID
+        message=result_reply(line, item.source_message_id, wording),
+        last_user_message_at=chat_message.received_at,  # Meta's time of their last message
+    )
+```
+
+- **Replies to saved reels.** A message with `reply_to_message_id` is sent with `reply_to.mid`, so Instagram shows the saved reel above the line.
+- **24-hour window.** Before every request, retries included, the client checks the time since the user's last message. Past `INSTAGRAM_REPLY_WINDOW_HOURS` (at most 24; larger values are refused) it sends nothing more: `send` returns `OUTSIDE_REPLY_WINDOW` with the number of requests already made, and logs `dm_skipped_outside_reply_window`. Meta's own "outside the window" answer is reported the same way.
+- **Retries.** Only failures that show the message was not taken are retried, with exponential backoff up to `SEND_API_MAX_ATTEMPTS`: Meta's throttling errors and connections that never opened. A timeout after sending or any 5xx, 503 included, may have delivered the message, so it raises `MessengerDeliveryUnknownError` and is not repeated. This avoids repeating a message that may already have been delivered. Meta documents no guarantee about it, so a duplicate is still possible if Meta reports throttling for a message it did take. Every other failure raises a `MessengerError` subclass.
+- **Languages.** Every template takes a `ReplyWording`, the bot's own words in the user's language, from `reply_wording(language, localized=None)`:
+  - wording passed as `localized` is used as it is, for any language;
+  - otherwise the built-in English or Turkish wording, chosen by the primary subtag (`tr-TR` → Turkish);
+  - otherwise `ReplyWordingUnavailableError`. Nothing falls back to English silently.
+
+  For other languages the caller supplies the wording. SAV-17's response agent, which already writes replies in the user's language, owns producing it; `has_built_in_wording(language)` tells it when it must. Supplied wording is validated when it is built: every field non-empty, and exactly the placeholders listed on `ReplyWording`, as bare names such as `{item}`. A format spec (`{item:.0}`), a conversion (`{item!r}`), an index or an attribute is refused, so a caller's value is always shown whole. Names, open categories, option labels, count labels and other values are shown exactly as passed in.
+- **Logs** hold the kind of message, the attempt, the HTTP status and Meta's error code, never the recipient, a message id, the text or the token.
 
 ## Logging
 
@@ -419,6 +458,9 @@ app/
     erasure.py        # erases a user's Redis state and jobs for "delete my data"
   types/              # content-type registry: one module per built-in type
   models/             # model interfaces, OpenRouter clients, fakes (see "Models")
+  agent/
+    messenger.py      # Instagram Send API client: DMs, quick replies, replies to saved reels
+    reply_templates.py # fixed DM wording in the user's language
   db/
     models.py         # SQLAlchemy models
     session.py        # the API's engine and session factory
