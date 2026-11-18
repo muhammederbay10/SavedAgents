@@ -430,6 +430,7 @@ savedagent/
       deep_look.py          # parallel subagents + write-back
       fallback.py           # L1–L4 fallback ladder, time budget, logging
       messenger.py          # send DM replies, incl. replies that quote a saved reel (reply_to)
+      reply_templates.py    # fixed DM wording: confirmation, "which one?", progress, error, result line
     memory/
       session.py            # short-term: history + working set (Redis)
       longterm.py           # extract → gate → consolidate → retrieve
