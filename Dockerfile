@@ -4,14 +4,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
-WORKDIR /srv/savedagent
+WORKDIR /srv/savely
 
 COPY pyproject.toml README.md ./
 COPY app ./app
 RUN pip install .
 
-RUN useradd --system --no-create-home savedagent
-USER savedagent
+RUN useradd --system --no-create-home savely
+USER savely
 
 EXPOSE 8000
 

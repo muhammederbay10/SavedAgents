@@ -24,7 +24,7 @@ from sqlalchemy.pool import NullPool
 REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
 ALEMBIC_CONFIG_PATH = REPOSITORY_ROOT / "alembic.ini"
 ADMIN_URL_VARIABLE = "TEST_DATABASE_ADMIN_URL"
-TEST_DATABASE_NAME_PREFIX = "savedagent_test_"
+TEST_DATABASE_NAME_PREFIX = "savely_test_"
 # Small on purpose: test vectors stay readable, and it proves the size is not hard-coded.
 TEST_EMBEDDING_DIMENSION = 8
 ALEMBIC_TIMEOUT_SECONDS = 60.0

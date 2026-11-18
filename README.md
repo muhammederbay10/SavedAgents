@@ -1,6 +1,6 @@
-# SavedAgent
+# Savely
 
-SavedAgent indexes posts you save on Instagram (later TikTok, X and Facebook) and lets you search them by chat: places by district, movies by genre or streaming platform, study material by subject, and more.
+Savely indexes posts you save on Instagram (later TikTok, X and Facebook) and lets you search them by chat: places by district, movies by genre or streaming platform, study material by subject, and more.
 
 - Design: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 - Rules for contributors and agents: [`AGENTS.md`](AGENTS.md)
@@ -66,6 +66,15 @@ docker compose down --volumes      # stop everything and delete the local databa
 
 If a port is already in use, change `API_PORT`, `POSTGRES_PORT` or `REDIS_PORT` in `.env`.
 
+### Local data from before the rename
+
+The product was called SavedAgent until 18 November 2026. Local data from that time is development data only, and nothing migrates it:
+
+- `.env.example` now names the Postgres user and database `savely`. A `.env` copied earlier still says `savedagent` and keeps working with its existing database; the commands in this README then need its old user. If you switch `.env` to the new values, the existing database volume still has only the old user and database, so Postgres refuses the new ones.
+- Ingestion's Redis keys are now named `savely:ingestion:…`. Keys under the old `savedagent:ingestion:…` names are no longer read and expire after `INGESTION_STATE_TTL_SECONDS`.
+
+To start clean, delete both with `docker compose down --volumes` (this deletes all local database and Redis data), then run `make up` and `make migrate`.
+
 ### Run the API outside Docker
 
 For auto-reload while you edit code, run only the database and Redis in Docker and the API on your machine:
@@ -100,10 +109,10 @@ The tests for the schema and the migrations need a real Postgres with PostGIS an
 
 ```bash
 docker compose up --detach --wait db
-TEST_DATABASE_ADMIN_URL=postgresql+asyncpg://savedagent:change-me@localhost:5432/postgres make test
+TEST_DATABASE_ADMIN_URL=postgresql+asyncpg://savely:change-me@localhost:5432/postgres make test
 ```
 
-Each run creates its own databases named `savedagent_test_<random>` on that server and drops them at the end. It never reads or changes the `savedagent` database you develop against. The user in the URL must be allowed to create databases and extensions, which the Compose user is.
+Each run creates its own databases named `savely_test_<random>` on that server and drops them at the end. It never reads or changes the `savely` database you develop against. The user in the URL must be allowed to create databases and extensions, which the Compose user is.
 
 ### Redis tests
 

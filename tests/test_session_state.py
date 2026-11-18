@@ -33,7 +33,7 @@ def user_id() -> uuid.UUID:
 
 
 def shares_key(user_id: uuid.UUID) -> str:
-    return f"savedagent:ingestion:{user_id}:shares"
+    return f"savely:ingestion:{user_id}:shares"
 
 
 def photo_post(user_id: uuid.UUID, sent_at: datetime, signature: str) -> CaptureEvent:

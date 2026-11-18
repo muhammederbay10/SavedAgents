@@ -114,7 +114,7 @@ class Base(DeclarativeBase):
 
 
 class User(Base):
-    """A person who uses SavedAgent."""
+    """A person who uses Savely."""
 
     __tablename__ = "user"
 

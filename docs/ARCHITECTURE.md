@@ -1,6 +1,6 @@
 # Architecture: Saved-Posts Agent
 
-> Working name: **SavedAgent** (placeholder). You save a post (Instagram first, then TikTok, X, Facebook…). The system works out **what it is**: a restaurant, a movie, a study tip, a recipe, anything. Then you can ask things like *"what restaurants did I save in Beşiktaş?"*, *"horror movies from my Movies collection that are on Netflix"* or *"the spaced-repetition tips I saved for studying"*.
+> **Savely**: you save a post (Instagram first, then TikTok, X, Facebook…). The system works out **what it is**: a restaurant, a movie, a study tip, a recipe, anything. Then you can ask things like *"what restaurants did I save in Beşiktaş?"*, *"horror movies from my Movies collection that are on Netflix"* or *"the spaced-repetition tips I saved for studying"*.
 
 ## 1. Principles
 
@@ -140,7 +140,7 @@ Notes:
 - **Any language, anywhere.** Captions, speech and replies can be in any language, and places can be in any country. Nothing in the pipeline assumes a language, a city or a country (decision record 0005).
 
 ### 3.4 Content types, open categories and the vocabulary
-SavedAgent works for **anything a user saves**, so it never forces a post into a fixed list (decision record 0005).
+Savely works for **anything a user saves**, so it never forces a post into a fixed list (decision record 0005).
 
 **Every saved item gets an open `category` and tags**, written by the text model in plain words: "restaurant", "sci-fi movie", "car review", "skincare routine", "guitar lesson". They are searchable at once ("show my car videos"), and the confirmation DM says how the item was saved, so the user can correct it ("no, it's a travel video").
 
@@ -373,7 +373,7 @@ erDiagram
 ## 6. Repository layout
 
 ```
-savedagent/
+SavedAgents/
   app/
     main.py                 # FastAPI app
     config.py

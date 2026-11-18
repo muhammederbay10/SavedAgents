@@ -8,9 +8,9 @@ Rules for every AI agent (and human) working on this project. If anything here c
 People save posts on Instagram all the time: a restaurant to try, a movie to watch, a study tip, a recipe. Instagram lets you sort saves into collections (Food, Movies, Studying), but it doesn't let you search or filter inside them. You can't stand in Beşiktaş and ask "which restaurants did I save around here?", or ask "which of my saved horror movies are on Netflix?". The saves pile up and get forgotten, so saving loses its point.
 
 ### What we're building
-**SavedAgent** is a chat agent for the things you save.
+**Savely** is a chat agent for the things you save.
 1. You share a post or reel to our Instagram bot by DM, as easily as tapping Save.
-2. SavedAgent works out what the post is about (a place, a movie, a study tip, anything). It looks up the real thing behind it, such as the restaurant on Google Maps or the movie on TMDB, and indexes it once.
+2. Savely works out what the post is about (a place, a movie, a study tip, anything). It looks up the real thing behind it, such as the restaurant on Google Maps or the movie on TMDB, and indexes it once.
 3. Later you ask in plain language, in any language: "restaurants in Beşiktaş in my Food collection", "cafés in Brooklyn I saved", "horror movies on Netflix", "my car review videos". It answers from your own saves, with links.
 
 Instagram comes first. TikTok, X and Facebook follow through the same backend.
