@@ -1,0 +1,16 @@
+{
+  "text": "Welcome to Example Roasters.",
+  "task": "transcribe",
+  "language": "en",
+  "duration": 2.4,
+  "segments": [
+    {"id": 0, "start": 0.0, "end": 2.4, "text": "Welcome to Example Roasters."}
+  ],
+  "words": [
+    {"word": "Welcome", "start": 0.0, "end": 0.5},
+    {"word": "to", "start": 0.5, "end": 0.7},
+    {"word": "Example", "start": 0.7, "end": 1.4},
+    {"word": "Roasters.", "start": 1.4, "end": 2.4}
+  ],
+  "usage": {"seconds": 2.4, "cost": 0.0000667}
+}

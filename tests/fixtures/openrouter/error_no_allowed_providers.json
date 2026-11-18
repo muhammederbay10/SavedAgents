@@ -1,0 +1,21 @@
+{
+  "error": {
+    "code": 404,
+    "message": "No allowed providers are available for the selected model."
+  },
+  "openrouter_metadata": {
+    "requested": "deepseek/deepseek-v4.1-flash",
+    "strategy": "direct",
+    "attempt": 0,
+    "endpoints": {
+      "total": 1,
+      "available": [
+        {
+          "provider": "CoreWeave",
+          "model": "deepseek/deepseek-v4.1-flash",
+          "selected": false
+        }
+      ]
+    }
+  }
+}
