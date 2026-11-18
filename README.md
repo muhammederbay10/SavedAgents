@@ -132,7 +132,7 @@ What happens to a message ([`app/adapters/instagram.py`](app/adapters/instagram.
 | A reel shared by DM (`ig_reel`) | A saved item with the reel's id, public link and caption |
 | A post shared by DM or saved into the collection (`ig_post`, or the older `share`) | A saved item with the post's id (`ig_post` only) and caption. The signed image link is passed to the indexing job and not stored |
 | A reel saved into the collection (`unsupported_type`) | A saved item with only its message id. The signed video link is passed to the indexing job and not stored |
-| A text sent at most `COLLECTION_HINT_WINDOW_SECONDS` after the user's latest share (also a repeated share of a saved post) | Stored as that share's item's collection, e.g. "For my movies collection", if it has none yet. No chat job |
+| A text sent at most `COLLECTION_HINT_WINDOW_SECONDS` after the user's last share before it (also a repeated share of a saved post, and also when a later share arrived first) | Stored as that share's item's collection, e.g. "For my movies collection", if it has none yet. No chat job |
 | Any other text | A chat job for the response agent |
 | Anything else (read receipts, reactions, the bot's own messages, other attachments) | Ignored, and logged without its content |
 
@@ -141,7 +141,7 @@ What happens to a message ([`app/adapters/instagram.py`](app/adapters/instagram.
 - **One item per post and per message:** sharing the same post twice, or a webhook that Meta delivers twice, creates one saved item. Two reels saved into the collection have no post id, so they stay two items (decision record 0007).
 - **Jobs:** new items are queued as `index_saved_item` and texts as `answer_chat_message` on Redis, through `arq` ([`app/ingestion/jobs.py`](app/ingestion/jobs.py)). A job holds only ids; the caption, text and media link it works on are in a per-user payload hash ([`app/ingestion/session_state.py`](app/ingestion/session_state.py)). The workers that run them come with the indexing pipeline and the response agent. Until then the jobs wait in Redis and expire after a day, and the items stay `pending`.
 - **Routing is decided once:** each text's route is kept as a receipt by its message id before anything changes, so a repeated delivery is routed the same way, also when a delayed share arrived in between.
-- **Ingestion state:** payloads, text receipts and each user's latest share stay in Redis for `INGESTION_STATE_TTL_SECONDS`, and "delete my data" erases them.
+- **Ingestion state:** payloads, text receipts and each user's recent shares stay in Redis for `INGESTION_STATE_TTL_SECONDS`, and "delete my data" erases them.
 - **Errors:** if Postgres or Redis is down, the endpoint answers 500 and Meta delivers the webhook again. Handling a webhook twice is safe.
 
 ### Connect the Meta app
@@ -199,7 +199,7 @@ All configuration comes from environment variables. Locally they live in `.env`,
 | `META_APP_SECRET` | API | The Meta app's secret. Every webhook is signed with it. **Secret** |
 | `META_WEBHOOK_VERIFY_TOKEN` | API | The text Meta repeats in the verification handshake. You choose it and enter it in the Meta app. **Secret** |
 | `COLLECTION_HINT_WINDOW_SECONDS` | API | A text sent this many seconds or less after a share becomes that item's collection hint. A whole number above 0 |
-| `INGESTION_STATE_TTL_SECONDS` | API | How long ingestion keeps a user's job payloads, text receipts and latest share in Redis. At least the hint window; 129600 (36 hours, Meta's documented retry period) in `.env.example` |
+| `INGESTION_STATE_TTL_SECONDS` | API | How long ingestion keeps a user's job payloads, text receipts and recent shares in Redis. At least the hint window; 129600 (36 hours, Meta's documented retry period) in `.env.example` |
 | `TEST_DATABASE_ADMIN_URL` | Tests only | Postgres server for the database tests (see [Database tests](#database-tests)). Not read by the API |
 | `TEST_REDIS_URL` | Tests only | Redis server for the Redis tests (see [Redis tests](#redis-tests)). Not read by the API |
 | `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` | Docker Compose | Credentials and database name for the `db` container |
@@ -301,7 +301,7 @@ app/
     service.py        # stores captures, routes texts, queues jobs
     repository.py     # users on first contact, saved items, collection hints
     jobs.py           # job names and ids, the arq queue
-    session_state.py  # per-user state in Redis: payloads, text receipts, latest share
+    session_state.py  # per-user state in Redis: payloads, text receipts, recent shares
     erasure.py        # erases a user's Redis state and jobs for "delete my data"
   types/              # content-type registry: one module per built-in type
   db/

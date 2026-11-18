@@ -97,7 +97,7 @@ class CaptureEvent(BaseModel):
 - `POST /webhooks/instagram`: verify the `X-Hub-Signature-256` HMAC, check for duplicates by message id, map to a `CaptureEvent` or a chat message, **enqueue, and return 200 immediately**. Meta retries slow webhooks.
 - The first message from an account creates its `USER` and `PLATFORM_ACCOUNT`.
 - The webhook stores the `SAVED_ITEM` as `pending` and queues a job on Redis (`arq`): `index_saved_item` for a new item, `answer_chat_message` for a text. Jobs carry only ids; the caption, text or media link they work on is kept with the user's ingestion state in Redis, which "delete my data" erases. Each job has an id made from the item or the text's receipt, so a webhook that is delivered twice is queued once. If the database or the queue fails, the webhook is answered with an error and Meta delivers it again (decision record 0009).
-- Each text's route (collection hint or chat) is decided once and kept as a receipt by message id, so a repeated delivery is routed the same way. The hint goes to the user's latest share, including a repeated share of a post that is already saved.
+- Each text's route (collection hint or chat) is decided once and kept as a receipt by message id, so a repeated delivery is routed the same way. The hint goes to the user's last share sent before the text, including a repeated share of a post that is already saved, also when a later share was delivered first.
 - `POST /import`: batch endpoint for the browser extension and data-export uploads.
 - Upsert by `(user_id, platform, platform_post_id)`, so sharing the same post twice doesn't create a duplicate. An item without a post id (a reel saved into a collaborative collection) is stored once per `(user_id, source_message_id)`, so a webhook that Meta delivers twice doesn't create one either. Two saves of the same reel are two messages, and stay two items (decision record 0007).
 
@@ -388,7 +388,7 @@ savedagent/
       service.py            # stores captures, routes texts, queues jobs
       repository.py         # users on first contact, saved items, collection hints
       jobs.py               # job names and ids, the arq queue
-      session_state.py      # per-user state in Redis: payloads, text receipts, latest share
+      session_state.py      # per-user state in Redis: payloads, text receipts, recent shares
       erasure.py            # erases a user's Redis state and jobs for "delete my data"
     models/
       base.py               # Generator / Classifier / Transcriber / Embedder interfaces
