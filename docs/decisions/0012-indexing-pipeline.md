@@ -85,6 +85,8 @@ Muhammed decided these on SAV-14 on 2026-11-18.
 ## Consequences
 
 - **New settings** in `PipelineSettings` (`app/config.py`) and `.env.example`: the media folder, download and ffmpeg limits, the near-empty rule, the is-list threshold, extraction temperature and length, the vocabulary thresholds and the worker's concurrency, tries, retry delay and timeout.
+- **The image installs ffmpeg** (`apt-get install --no-install-recommends ffmpeg`), and makes `/srv/savely/media` writable by its non-root user. The API and the worker share the image.
+- **Compose has a `worker` service** running `python -m app.pipeline.worker`. It reads `.env` whole, because it needs nearly every setting (database, Redis, models, pipeline, Send API), and overrides the database and Redis URLs, the ffmpeg paths and the media folder (the `media_data` volume) for the Compose network. With the dummy `OPENROUTER_API_KEY` of `.env.example`, its model calls are refused and the items it picks up end as `failed`.
 - **New code:** `app/pipeline/` (steps, prompts, vocabulary, worker). `costs.py`, `media.py`, `open_values.py`, `payloads.py`, `renormalize.py`, `runs.py`, `storage.py`, `vocabulary.py`, `confirm.py` and `indexer.py` are new in the §6 layout next to the files it already lists.
 - **Not done here:** resolving entities and the "which one?" question (SAV-15); the import endpoint that queues many jobs (Phase 2); a hosted media store; wiring `LocalMediaStore` into a "delete my data" command next to ingestion's eraser, which no ticket has built yet.
 - **Evals:** there is no labelled set yet (`evals/labeled_saves.jsonl`, SAV-19/20). The prompts, the near-empty rule and the thresholds are first versions to score there.

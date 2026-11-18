@@ -136,7 +136,13 @@ Notes:
 - **One pass, many questions.** Each decision call sends the video once with all its questions. Google says it handles up to 1,000 questions per pass.
 - **List posts.** "5 movies to watch this weekend" or "3 cafés in Kadıköy" is one post with **several entities**. The extractor returns a list, and each entity is resolved and linked to the same saved item.
 - **The user's collection is a hint, not the type.** A "Food" collection can hold a restaurant and a recipe. The collection name is stored and used as a search filter and as a hint during classification, but the type is decided per post.
-- **Speech routing** (decision record 0008). A file with no audio track has no speech, and speech-to-text is skipped. A file with an audio track always goes to speech-to-text, even when the caption or the location tag already names the entity. If the final transcript is empty or nearly empty, the item has no speech; what counts as nearly empty is a documented pipeline setting. No model's "has speech" answer decides the route: in our tests, for videos with no audio track, the decision model gave speech probabilities of up to 0.86 and the video models claimed speech.
+- **Speech routing** (decision record 0008). A file with no audio track has no speech, and speech-to-text is skipped. A file with an audio track always goes to speech-to-text, even when the caption or the location tag already names the entity. If the final transcript is empty or nearly empty, the item has no speech. **Nearly empty** means fewer than `TRANSCRIPT_MIN_SPEECH_CHARACTERS` letters, digits and combining marks, in any script; spaces, punctuation and symbols such as ♪ don't count, and words aren't counted, because many languages don't separate them with spaces. **A provider error is not silence:** if no model produced a transcript, or the default model heard nothing and the fallback then failed, the step fails and the job runs again. No model's "has speech" answer decides the route, and the decision model isn't asked: in our tests, for videos with no audio track, the decision model gave speech probabilities of up to 0.86 and the video models claimed speech.
+- **Reels shared by DM are indexed from their caption only** (decision record 0012). Meta sends no video file for them (record 0002), and nothing is read from a post's page, so they get no speech-to-text and no escalation. Reels saved into a collaborative collection and `ig_post` images come with a file link and go through every step.
+- **Resumable steps.** One `arq` job per item runs the steps. Each step's result is written to `ENRICHMENT_RUN` when it finishes, so a job that runs again after a failure continues where it stopped. The last of `INDEXING_MAX_TRIES` runs marks the item `failed`.
+- **Stored media.** A video is kept as a 360p MP4 with its audio track and a still picture, an image as a smaller JPEG, in object storage (a local folder, `MEDIA_STORAGE_DIR`, in development), per user and item. "Delete my data" removes them.
+- **Prompts** live in `app/pipeline/prompts.py`, in one `PipelinePrompts` object with a version. The version is stored with each step's result, so an evaluation names the wording it scored. A wording change gets a new version and is scored on the eval set.
+- **The confirmation** is written in the user's language. Until it is known (or while that language has no wording), it is written in English.
+- **Cost and escalation** are logged per item: its type, whether it was escalated, and the charges of its model calls.
 - **Any language, anywhere.** Captions, speech and replies can be in any language, and places can be in any country. Nothing in the pipeline assumes a language, a city or a country (decision record 0005).
 
 ### 3.4 Content types, open categories and the vocabulary
@@ -168,7 +174,7 @@ Savely works for **anything a user saves**, so it never forces a post into a fix
    - **New:** a new canonical value is added.
 5. A candidate alias becomes **verified** when the decision model has matched it to the same value with high confidence (`VOCAB_ALIAS_MIN_PROBABILITY`) for at least `VOCAB_ALIAS_MIN_USERS` different users, or when we confirm it in eval review. Only verified aliases count for the exact hit in step 2.
 
-Values are stored in one canonical form (English, lower case) with aliases in any language, so a question in Turkish, Spanish or English finds the same items. Search filters offer the values that **exist in this user's saves**.
+Values are stored in one canonical form (English, lower case) with aliases in any language. The extraction prompt asks the text model for open values in English, lower case, so a new value is the item's own wording, trimmed, with runs of white space made one space, and lower-cased; there is no translation call. Aliases are stored and compared in the same form, so a question in Turkish, Spanish or English finds the same items. Search filters offer the values that **exist in this user's saves**.
 
 **Privacy gate: only generic words are shared.** The vocabulary has no link to any user and is used for everyone's normalization, so nothing personal may enter it, as a canonical value or as an alias:
 - Code checks first: text with an @handle, URL, email address or phone-like number, or longer than `VOCAB_MAX_VALUE_LENGTH`, is rejected.
@@ -345,11 +351,12 @@ erDiagram
 - **`ENTITY_AVAILABILITY`** holds TMDB watch providers for one movie or series in one country, primary key `(entity_id, country)`, with its own `refreshed_at`. Retrieval joins on the asking user's `country`. It holds no user data.
 - **`ITEM_ENTITY`** is many-to-many, because one list post can mention several entities.
 - **`USER_ENTITY.status`**: `want | done` (visited / watched / read), per user. Memory and ranking use it.
-- `SAVED_ITEM.fields` holds the extracted type fields (e.g. `{"subject": "maths", "topic": "integrals", "format": "tutorial"}`). `attributes` holds facts learned later by deep look.
+- `SAVED_ITEM.fields` holds the extracted type fields (e.g. `{"subject": "maths", "topic": "integrals", "format": "tutorial"}`). Open values inside nested objects, such as the cuisine of each place in a list post, are also listed once at the top under their vocabulary field (`"cuisine": ["korean barbecue", "specialty coffee"]`), where counting and filters find them. `attributes` holds facts learned later by deep look.
 - `SAVED_ITEM.status` goes `pending → enriching → needs_user → done | failed`.
 - `SAVED_ITEM.source_message_id` is the Instagram message id (`mid`) of the DM or collection save that brought the item in. Answers reply to it so the saved reel shows again (§3.5). It's empty for items from imports.
 - `SAVED_ITEM.category` is the open category the text model gives every item ("restaurant", "car review"), and `type` is the built-in type when one applies (empty otherwise). `subtype`, `tags` and open values inside `fields` use the vocabulary.
-- `SAVED_ITEM.raw_values` keeps the text model's own wording for each open value before normalization, and marks values the user set by hand. It lets us re-normalize the item if an alias is rejected, and holds wording that failed the privacy gate. It belongs to the item and is deleted with it.
+- `SAVED_ITEM.raw_values` keeps the text model's own wording for each open value before normalization, and marks values the user set by hand. It lets us re-normalize the item if an alias is rejected, and holds wording that failed the privacy gate. It is keyed by the value's path in the extraction: `{"entities.0.cuisine": {"field": "cuisine", "wording": "Kore mutfağı", "user_set": false}}`. It belongs to the item and is deleted with it.
+- **`ENRICHMENT_RUN`** has one row per step of an item (`fetch`, `classify`, `transcribe`, `extract`, `normalize`, `embed`, `confirm`), with `status` `done`, `failed` or `skipped`. A failed step keeps an `error` with no content in it. The normalize step's `output` records, per path, the vocabulary field, the outcome (`exact_value`, `exact_alias`, `matched`, `new`, `private` or `undecided`), the value and alias it went through, and the match probability.
 - **`VOCABULARY`** holds one canonical value per `field` (category, tag, cuisine, genre, subject, exam…) in English lower case, with an `embedding` for matching new wordings; `(field, value)` is unique. It's shared by all users, grows from real saves, and holds only wording that passed the privacy gate (§3.4).
 - **`VOCABULARY_ALIAS`** holds other wordings of a value, in any language, each with a `status`: `candidate` (one decision-model match), `verified` (confirmed, used for exact hits) or `rejected` (a wrong match, never used again). `probability` is the best match confidence seen, and `correction_count` counts user corrections against it. Which items matched through an alias is recorded in their `ENRICHMENT_RUN` normalize step, not here.
 - **"Delete my data"** removes the user's items with their `raw_values` and enrichment runs, and lowers each value's `item_count`. The vocabulary keeps only gated, generic wording with no link to any user. A value no item uses any more can be cleaned up.
@@ -365,7 +372,8 @@ erDiagram
 | Queue / workers | `arq` on Redis | Simple, async, retries built in. Redis also holds short-term memory |
 | DB | Postgres 16 + PostGIS + pgvector | One database for location queries, JSON filters and semantic search |
 | Models | All through OpenRouter: Gemini Decision 1 for decisions, MAI Transcribe 2 for speech (GPT Transcribe as fallback), DeepSeek V4.1 Flash for extraction + replies, Gemini 2.5 Flash for rare escalations, OpenAI `text-embedding-3-large` at 1024 dimensions | One provider and one key. See §3.9 and decision record 0008 |
-| Media | ffmpeg (downscale stored videos, thumbnails, audio extraction) | Standard tool |
+| Media | ffmpeg and ffprobe (audio-track check, downscaled copies, stills, audio extraction), run as programs | Standard tool |
+| Object storage | A local folder in development (`MEDIA_STORAGE_DIR`), behind a `MediaStore` interface | A hosted store comes with deployment |
 | Resolvers | Google Places API (New) · TMDB API · Open Library / Google Books | Best coverage in each area. TMDB includes streaming availability per country |
 | Hosting | Fly.io / Railway / Render to start | Public HTTPS URL for Meta's webhooks, and cheap |
 | Local dev | Docker Compose + ngrok/cloudflared tunnel | Meta needs a public HTTPS webhook URL |
@@ -415,14 +423,25 @@ Savely/
       tmdb.py
       open_library.py
     pipeline/
+      indexer.py            # runs the steps of one item, keeps each result, resumes after a failure
+      runs.py               # the item's row, status and steps in ENRICHMENT_RUN
+      payloads.py           # reads the capture event of a job from ingestion's Redis state
+      prompts.py            # every model prompt, in one versioned PipelinePrompts
       fetch.py              # download media before links expire
-      classify.py           # decision model on the video: type, tags, is-list
-      transcribe.py         # speech-to-text (when the file has an audio track)
+      media.py              # ffprobe and ffmpeg
+      storage.py            # MediaStore: object storage, a local folder in development
+      classify.py           # decision model on the video: type, is-list
+      transcribe.py         # speech-to-text (when the file has an audio track), near-empty rule
       extract.py            # text model with the type's schema; escalates to video model
+      open_values.py        # paths of open values; extraction → item columns
       normalize.py          # vocabulary: exact hit, privacy gate, match-or-new
+      vocabulary.py         # database work for the vocabulary and its counts
+      renormalize.py        # reject an alias and re-normalize only its items
       resolve.py            # type's resolver + decision-model candidate choice
       embed.py
-      worker.py             # parallel fan-out for bulk imports
+      confirm.py            # the save confirmation DM
+      costs.py              # charges of model calls, per step and item
+      worker.py             # the arq worker; parallel fan-out for bulk imports
     agent/
       agent.py              # response-agent loop
       tools.py              # search_items, near, deep_look, set_status…
@@ -448,10 +467,11 @@ Savely/
     fixtures/webhooks/      # real (anonymized) webhook payloads
     fixtures/openrouter/    # model responses written from the provider's documentation
     live/                   # opt-in smoke tests that call the real models
+    pipeline/               # the indexing pipeline on fake models
   docker/postgres/          # Postgres 16 image with PostGIS + pgvector
   docker-compose.yml
   alembic.ini               # Alembic configuration
-  Dockerfile                # API image
+  Dockerfile                # image of the API and the indexing worker (with ffmpeg)
   Makefile                  # fmt, lint, typecheck, test, up
   pyproject.toml
   docs/ARCHITECTURE.md

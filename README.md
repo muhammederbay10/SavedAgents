@@ -6,13 +6,14 @@ Savely indexes posts you save on Instagram (later TikTok, X and Facebook) and le
 - Rules for contributors and agents: [`AGENTS.md`](AGENTS.md)
 - Decision records: [`docs/decisions/`](docs/decisions/)
 
-This repository currently holds the project skeleton (a FastAPI app with a health endpoint, the database schema with its migrations, a local Docker stack and the development tooling), the content-type registry and the Instagram webhook, which stores what users share with the bot and queues the work that follows.
+This repository currently holds the project skeleton (a FastAPI app with a health endpoint, the database schema with its migrations, a local Docker stack and the development tooling), the content-type registry, the Instagram webhook, which stores what users share with the bot and queues the work that follows, and the indexing pipeline, which works out what each saved post is about.
 
 ## Requirements
 
 - Python 3.12
 - Docker with Compose v2 (`docker compose version`)
 - `make`
+- ffmpeg, which includes ffprobe, to run the indexing worker on your machine (`brew install ffmpeg` on a Mac). The Docker image installs its own.
 
 ## Setup
 
@@ -35,11 +36,12 @@ The values in `.env.example` work as they are for local development. To receive 
 make up
 ```
 
-This builds and starts three services and waits until all of them are healthy:
+This builds and starts four services and waits until all of them are running (and healthy, for the three that have a health check):
 
 | Service | What it is | Address on your machine |
 |---|---|---|
 | `api` | The FastAPI app | http://localhost:8000 |
+| `worker` | The indexing worker (see [Indexing pipeline](#indexing-pipeline)) | none |
 | `db` | Postgres 16 with PostGIS and pgvector | `localhost:5432` |
 | `redis` | Redis 7 | `localhost:6379` |
 
@@ -60,6 +62,7 @@ Useful commands:
 
 ```bash
 docker compose logs --follow api   # API logs, one JSON object per line
+docker compose logs --follow worker # indexing logs
 make down                          # stop everything, keep the database data
 docker compose down --volumes      # stop everything and delete the local database
 ```
@@ -102,6 +105,8 @@ make check
 | `make test` | `pytest` |
 
 Tests never call external services.
+
+Two tests run the real `ffmpeg` and `ffprobe` on a clip they generate. They are **skipped** when the programs are not installed, and pytest lists them with the reason. Every other pipeline test uses a stand-in for them.
 
 ### Database tests
 
@@ -148,7 +153,7 @@ What happens to a message ([`app/adapters/instagram.py`](app/adapters/instagram.
 - **First contact:** the first message from an Instagram account creates its `user` and `platform_account` rows.
 - **Message id:** every saved item keeps the id of the message it came in with (`source_message_id`), so answers can reply to it (decision record 0004).
 - **One item per post and per message:** sharing the same post twice, or a webhook that Meta delivers twice, creates one saved item. Two reels saved into the collection have no post id, so they stay two items (decision record 0007).
-- **Jobs:** new items are queued as `index_saved_item` and texts as `answer_chat_message` on Redis, through `arq` ([`app/ingestion/jobs.py`](app/ingestion/jobs.py)). A job holds only ids; the caption, text and media link it works on are in a per-user payload hash ([`app/ingestion/session_state.py`](app/ingestion/session_state.py)). The workers that run them come with the indexing pipeline and the response agent. Until then the jobs wait in Redis and expire after a day, and the items stay `pending`.
+- **Jobs:** new items are queued as `index_saved_item` and texts as `answer_chat_message` on Redis, through `arq` ([`app/ingestion/jobs.py`](app/ingestion/jobs.py)). A job holds only ids; the caption, text and media link it works on are in a per-user payload hash ([`app/ingestion/session_state.py`](app/ingestion/session_state.py)). The indexing worker runs `index_saved_item` (see [Indexing pipeline](#indexing-pipeline)). The chat worker comes with the response agent (SAV-17); until then chat jobs wait in Redis and expire after a day.
 - **Routing is decided once:** each text's route is kept as a receipt by its message id before anything changes, so a repeated delivery is routed the same way, also when a delayed share arrived in between.
 - **Ingestion state:** payloads, text receipts and each user's recent shares stay in Redis for `INGESTION_STATE_TTL_SECONDS`, and "delete my data" erases them.
 - **Errors:** if Postgres or Redis is down, the endpoint answers 500 and Meta delivers the webhook again. Handling a webhook twice is safe.
@@ -224,7 +229,7 @@ The API settings are defined in [`app/config.py`](app/config.py): `Settings` for
 
 ## DM replies
 
-[`app/agent/messenger.py`](app/agent/messenger.py) sends the bot's DMs through the Instagram Send API, and [`app/agent/reply_templates.py`](app/agent/reply_templates.py) holds the fixed wording (decision records [0004](docs/decisions/0004-reply-to-saved-reels.md) and [0011](docs/decisions/0011-dm-replies.md)). Nothing calls them yet: the indexing pipeline (SAV-14) and the response agent (SAV-17) will.
+[`app/agent/messenger.py`](app/agent/messenger.py) sends the bot's DMs through the Instagram Send API, and [`app/agent/reply_templates.py`](app/agent/reply_templates.py) holds the fixed wording (decision records [0004](docs/decisions/0004-reply-to-saved-reels.md) and [0011](docs/decisions/0011-dm-replies.md)). The indexing pipeline sends the save confirmation with them; the response agent (SAV-17) will send the rest.
 
 ```python
 import httpx
@@ -273,6 +278,51 @@ What the logging setup does for you:
 - `LOG_LEVEL` applies to every logger, including uvicorn's and other libraries'.
 - There is no access log. Uvicorn's access records hold the client's address and the full query string, so they are switched off. To see a request in the logs, log it from the application code, without personal data.
 - The API is started with `--ws none`. It has no WebSocket endpoints, and uvicorn would otherwise log the address and query string of every WebSocket handshake.
+
+## Indexing pipeline
+
+Every saved item is understood once, when it is saved (`docs/ARCHITECTURE.md` §3.3, decision record [0012](docs/decisions/0012-indexing-pipeline.md)). The webhook queues one `index_saved_item` job per item, and the worker runs these steps:
+
+1. **Fetch:** download the media from the link the platform sent and keep a 360p copy, a still picture, or a smaller image. A reel shared by DM comes without a file, so it is indexed from its caption only. Nothing is ever read from a post's page.
+2. **Classify:** one decision-model call on the media, the caption and the collection hint: the built-in type (or none of them), and whether the post lists several things.
+3. **Speech-to-text:** ffprobe decides. A file without an audio track has no speech. A file with one is always transcribed, by the default model and then the fallback. A final transcript with fewer than `TRANSCRIPT_MIN_SPEECH_CHARACTERS` letters and digits counts as no speech; letters of every script count, and so do digits and the marks that combine with letters, while spaces, punctuation and symbols such as ♪ don't. A model that fails is never taken as silence: the job runs again.
+4. **Extract:** the text model fills in the type's schema. When a type needs an entity and none was named, the escalation model watches the media.
+5. **Normalize:** open values (category, tags, cuisine, subject…) go through the shared vocabulary: exact hit, privacy gate, then match-or-new (§3.4).
+6. **Embed** the summary and transcript, mark the item `done`, and **confirm** by DM how it was saved, in the user's language, or in English while it isn't known.
+
+Each step's result is kept in `enrichment_run`, so a job that runs again continues where it stopped. The last of `INDEXING_MAX_TRIES` runs marks the item `failed`. Logs hold, for each item, its type, whether it was escalated, and the cost of its model calls.
+
+Run the worker on your machine (it reads `.env`, and needs ffmpeg, Postgres and Redis):
+
+```bash
+docker compose up --detach --wait db redis
+python -m app.pipeline.worker
+```
+
+Under Compose, the `worker` service runs the same command from the image, which includes ffmpeg. It reads `.env` whole, because it needs nearly every setting, and overrides the database and Redis URLs and the media folder for the Compose network. With the dummy `OPENROUTER_API_KEY` from `.env.example`, every model call is refused, and the items it picks up end as `failed`.
+
+**Media** is kept in `MEDIA_STORAGE_DIR` (`./media` on your machine, git-ignored; the `media_data` volume under Compose), in a folder per user and item. "Delete my data" removes the user's folder. A hosted object store comes with deployment.
+
+**Prompts** are in [`app/pipeline/prompts.py`](app/pipeline/prompts.py), in one `PipelinePrompts` object with a version. The version is stored with each step's result. Change the version with any change to the wording, and score the change on the eval set (AGENTS.md §4).
+
+The worker reads `Settings`, `ModelSettings`, `MessengerSettings` and `PipelineSettings` (all in [`app/config.py`](app/config.py)). The pipeline's own variables:
+
+| Variable | Meaning |
+|---|---|
+| `MEDIA_STORAGE_DIR` | The folder that stands in for object storage |
+| `MEDIA_DOWNLOAD_TIMEOUT_SECONDS`, `MEDIA_MAX_DOWNLOAD_BYTES` | Time limit and largest size of one download. Larger media is skipped and the item indexed from its text |
+| `MEDIA_STORED_HEIGHT_PIXELS` | Height of the stored copies (360). Smaller media keeps its size |
+| `FFMPEG_PATH`, `FFPROBE_PATH`, `MEDIA_TOOL_TIMEOUT_SECONDS` | The two programs, and the time limit of one run |
+| `TRANSCRIPT_MIN_SPEECH_CHARACTERS` | The near-empty rule above |
+| `CLASSIFY_IS_LIST_MIN_PROBABILITY` | A post counts as a list from this probability of yes |
+| `EXTRACTION_TEMPERATURE`, `EXTRACTION_MAX_OUTPUT_TOKENS` | Sampling and reply length of extraction and the escalation |
+| `VOCAB_PRIVACY_MIN_PROBABILITY` | Wording enters the shared vocabulary only with at least this probability of being generic |
+| `VOCAB_ALIAS_MIN_PROBABILITY`, `VOCAB_ALIAS_MIN_USERS` | A candidate alias is verified after matches this confident from this many different users |
+| `VOCAB_MAX_VALUE_LENGTH`, `VOCAB_PHONE_MIN_DIGITS` | Longer wording, or wording with a phone-like run of this many digits, never enters the vocabulary |
+| `VOCAB_MATCH_CANDIDATES` | How many nearby values the decision model chooses from |
+| `INDEXING_CONCURRENCY` | Jobs one worker runs at once; a bulk import fans out over every slot of every worker |
+| `INDEXING_MAX_TRIES`, `INDEXING_RETRY_DELAY_SECONDS` | Runs of one job, and the wait before the next run, multiplied by the run's number |
+| `INDEXING_JOB_TIMEOUT_SECONDS` | Time limit of one run. arq does not run a job again after a timeout, and its item stays `enriching` |
 
 ## Models
 
@@ -373,7 +423,7 @@ The model clients read these variables through `ModelSettings` in [`app/config.p
 | `EMBEDDING_MODEL`, `EMBEDDING_TIMEOUT_SECONDS` | Embedding model id (`openai/text-embedding-3-large`) and the time limit of one request. The vector size is `EMBEDDING_DIMENSION` |
 | `EMBEDDING_DIMENSION` | Shared with the database (see [Configuration](#configuration)): the vector size the embedding model is asked for, and the size every returned vector must have |
 
-The Compose `api` service does not receive these variables yet, because the API calls no model. The ticket that first calls a model from a container adds them to `docker-compose.yml`.
+The Compose `api` service does not receive these variables, because the API calls no model. The `worker` service reads them from `.env` (see [Indexing pipeline](#indexing-pipeline)).
 
 ### Live smoke tests
 
@@ -465,6 +515,7 @@ app/
     jobs.py           # job names and ids, the arq queue
     session_state.py  # per-user state in Redis: payloads, text receipts, recent shares
     erasure.py        # erases a user's Redis state and jobs for "delete my data"
+  pipeline/           # indexing: steps, prompts, vocabulary, the arq worker (see "Indexing pipeline")
   types/              # content-type registry: one module per built-in type
   models/             # model interfaces, OpenRouter clients, fakes (see "Models")
   agent/
@@ -480,8 +531,8 @@ alembic.ini           # Alembic configuration
 scripts/spikes/       # reproducible experiments behind decision records (see its README)
 tests/                # pytest suite
 docker/postgres/      # Postgres 16 image with PostGIS and pgvector
-docker-compose.yml    # local stack: db, redis, api
-Dockerfile            # API image
+docker-compose.yml    # local stack: db, redis, api, worker
+Dockerfile            # the image of the API and the worker
 Makefile              # install, fmt, lint, typecheck, test, check, run, migrate, up, down
 docs/
   ARCHITECTURE.md     # the design (source of truth)
