@@ -35,7 +35,14 @@ TEST_COLLECTION_HINT_WINDOW_SECONDS = 30
 TEST_INGESTION_STATE_TTL_SECONDS = 3600
 
 
-LOGGERS_CHANGED_BY_LOGGING_SETUP = ("", "uvicorn", "uvicorn.error", "uvicorn.access")
+LOGGERS_CHANGED_BY_LOGGING_SETUP = (
+    "",
+    "uvicorn",
+    "uvicorn.error",
+    "uvicorn.access",
+    "httpx",
+    "httpcore",
+)
 
 
 @pytest.fixture(autouse=True)

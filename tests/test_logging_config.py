@@ -2,6 +2,7 @@ import io
 import json
 import logging
 
+import httpx
 import uvicorn
 
 from app.logging_config import configure_logging
@@ -123,3 +124,17 @@ def test_configuring_twice_does_not_duplicate_log_lines() -> None:
     logging.getLogger("app.pipeline").info("once")
 
     assert len(read_log_lines(stream)) == 1
+
+
+async def test_http_request_lines_with_full_urls_are_not_written_below_warning() -> None:
+    stream = io.StringIO()
+    configure_logging("DEBUG", stream=stream)
+    signed_link = "https://cdn.example.test/video.mp4?signature=SYNTHETIC_SIGNATURE"
+    transport = httpx.MockTransport(lambda request: httpx.Response(200))
+
+    async with httpx.AsyncClient(transport=transport) as client:
+        await client.get(signed_link)
+    logging.getLogger("httpx").warning("kept")
+
+    assert "SYNTHETIC_SIGNATURE" not in stream.getvalue()
+    assert [entry["message"] for entry in read_log_lines(stream)] == ["kept"]
