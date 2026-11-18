@@ -192,6 +192,38 @@ def set_selected_field(field_name: str, value: object) -> Callable[[dict[str, An
     return change
 
 
+def attempt_record(provider: str, status: object, model: str = TEXT_MODEL) -> dict[str, object]:
+    return {"provider": provider, "model": model, "status": status}
+
+
+def set_attempt_number(value: object) -> Callable[[dict[str, Any]], None]:
+    def change(body: dict[str, Any]) -> None:
+        routing_metadata(body)["attempt"] = value
+
+    return change
+
+
+def fallback_reply(attempts: object | None) -> Callable[[dict[str, Any]], None]:
+    """The Reviewer's cases: a second attempt after a fallback, with the given history."""
+
+    def change(body: dict[str, Any]) -> None:
+        metadata = routing_metadata(body)
+        metadata.update(attempt=2, strategy="fallback")
+        if attempts is None:
+            del metadata["attempts"]
+        else:
+            metadata["attempts"] = attempts
+
+    return change
+
+
+def without(field_name: str) -> Callable[[dict[str, Any]], None]:
+    def change(body: dict[str, Any]) -> None:
+        del routing_metadata(body)[field_name]
+
+    return change
+
+
 @pytest.mark.parametrize(
     ("change", "problem"),
     [
@@ -218,21 +250,14 @@ def set_selected_field(field_name: str, value: object) -> Callable[[dict[str, An
             set_selected_field("model", "deepseek/deepseek-v4.1-flash-1017"),
             "another model",
         ),
-        (
-            lambda body: set_available(
-                body, [endpoint("CoreWeave", selected=True), endpoint("Baidu", selected=False)]
-            ),
-            "another provider",
-        ),
         (lambda body: set_attempts(body, "CoreWeave"), "malformed"),
         (lambda body: set_attempts(body, [{"model": TEXT_MODEL, "status": 200}]), "malformed"),
         (
-            lambda body: set_attempts(
-                body,
+            fallback_reply(
                 [
                     {"provider": "Novita", "model": TEXT_MODEL, "status": 503},
                     {"provider": "CoreWeave", "model": TEXT_MODEL, "status": 200},
-                ],
+                ]
             ),
             "another provider",
         ),
@@ -248,6 +273,100 @@ async def test_missing_malformed_ambiguous_or_contradictory_routing_evidence_fai
 
     with pytest.raises(ProviderPinViolationError, match=problem):
         await generator(transport).generate(QUESTION)
+
+
+@pytest.mark.parametrize(
+    ("change", "problem"),
+    [
+        (fallback_reply(None), "no complete attempt history"),
+        (fallback_reply([]), "no complete attempt history"),
+        (fallback_reply([attempt_record("CoreWeave", 200)]), "no complete attempt history"),
+        (without("attempt"), "attempt number"),
+        (set_attempt_number(0), "attempt number"),
+        (
+            lambda body: (set_attempt_number(0)(body), without("attempts")(body)),
+            "attempt number",
+        ),
+        (set_attempt_number(-1), "attempt number"),
+        (set_attempt_number(1.0), "attempt number"),
+        (set_attempt_number(1.5), "attempt number"),
+        (set_attempt_number(True), "attempt number"),
+        (set_attempt_number("1"), "attempt number"),
+        (set_attempt_number(None), "attempt number"),
+        (
+            lambda body: set_attempts(
+                body, [attempt_record("CoreWeave", 502), attempt_record("CoreWeave", 200)]
+            ),
+            "no complete attempt history",
+        ),
+        (
+            lambda body: (
+                set_attempt_number(2)(body),
+                set_attempts(
+                    body, [attempt_record("CoreWeave", 200), attempt_record("CoreWeave", 502)]
+                ),
+            ),
+            "last attempt did not succeed",
+        ),
+        (
+            lambda body: set_attempts(body, [attempt_record("CoreWeave", "200")]),
+            "malformed",
+        ),
+        (
+            lambda body: set_attempts(
+                body, [attempt_record("CoreWeave", 200, model="deepseek/deepseek-v4.1-flash-1017")]
+            ),
+            "another model",
+        ),
+    ],
+)
+async def test_unproven_attempt_history_fails_closed(
+    connect: Connect, change: Callable[[dict[str, Any]], None], problem: str
+) -> None:
+    body = load_fixture("chat_completion_schema.json")
+    change(body)
+    _, transport = connect([json_response(body)])
+
+    with pytest.raises(ProviderPinViolationError, match=problem):
+        await generator(transport).generate(QUESTION)
+
+
+async def test_repeated_attempt_on_the_pinned_provider_is_accepted(connect: Connect) -> None:
+    body = load_fixture("chat_completion_schema.json")
+    fallback_reply([attempt_record("CoreWeave", 502), attempt_record("CoreWeave", 200)])(body)
+    _, transport = connect([json_response(body)])
+
+    result = await generator(transport).generate(QUESTION)
+
+    assert result.provider == "CoreWeave"
+
+
+async def test_single_attempt_without_an_attempt_list_is_accepted(connect: Connect) -> None:
+    body = load_fixture("chat_completion_schema.json")
+    del routing_metadata(body)["attempts"]
+    _, transport = connect([json_response(body)])
+
+    result = await generator(transport).generate(QUESTION)
+
+    assert result.provider == "CoreWeave"
+
+
+async def test_other_provider_listed_only_as_an_unselected_candidate_is_accepted(
+    connect: Connect,
+) -> None:
+    body = load_fixture("chat_completion_schema.json")
+    metadata = routing_metadata(body)
+    metadata["endpoints"] = {
+        "total": 2,
+        "available": [endpoint("CoreWeave", selected=True), endpoint("Baidu", selected=False)],
+    }
+    assert metadata["attempt"] == 1
+    assert metadata["attempts"] == [attempt_record("CoreWeave", 200)]
+    _, transport = connect([json_response(body)])
+
+    result = await generator(transport).generate(QUESTION)
+
+    assert result.provider == "CoreWeave"
 
 
 async def test_top_level_provider_that_agrees_with_the_metadata_is_accepted(

@@ -8,13 +8,20 @@ A request that sends the header `X-OpenRouter-Metadata: enabled` gets an
       "endpoints": {"total": 1, "available": [
         {"provider": "CoreWeave", "model": "deepseek/deepseek-v4.1-flash", "selected": true}
       ]},
+      "attempt": 1,
       "attempts": [{"provider": "CoreWeave", "model": "...", "status": 200}]
     }
 
 `available` lists the endpoints the router considered, and the one marked
-`selected` served the request. `attempts` is present when the router tried more
-than one endpoint. Cache replays never carry the object. Other fields may be
-added at any time, so unknown fields are ignored.
+`selected` served the request. `attempt` is the 1-based number of the attempt
+that succeeded: above 1 means earlier attempts failed and the router fell back.
+`attempts` is the history of those attempts, one entry per upstream call, and
+the guide only promises it "when the router retried". Cache replays never carry
+the object. Other fields may be added at any time, so unknown fields are ignored.
+
+An endpoint that was only a candidate (`selected: false`) says nothing about
+where the request went. What it reached is the selected endpoint and the
+attempt history, so those are what the pin is checked against.
 
 `verify_pinned_route` checks a reply against a pin and fails closed: missing,
 malformed, ambiguous or contradictory evidence is a `RouteEvidenceError`, never
@@ -23,6 +30,7 @@ are not pinned and only report the provider for the record.
 """
 
 from dataclasses import dataclass
+from http import HTTPStatus
 
 from app.models.wire import JsonObject, list_or_none, object_or_none, string_or_none
 
@@ -30,6 +38,7 @@ ROUTING_METADATA_HEADER = "X-OpenRouter-Metadata"
 ROUTING_METADATA_ENABLED = "enabled"
 
 _METADATA_FIELD = "openrouter_metadata"
+_FIRST_ATTEMPT = 1
 
 
 class RouteEvidenceError(Exception):
@@ -60,6 +69,13 @@ class _Endpoint:
     selected: bool
 
 
+@dataclass(frozen=True)
+class _Attempt:
+    provider: str
+    model: str
+    status: int
+
+
 def verify_pinned_route(body: JsonObject, *, provider_name: str, model: str) -> str:
     """Check that the pinned provider, and only it, handled a reply.
 
@@ -68,10 +84,17 @@ def verify_pinned_route(body: JsonObject, *, provider_name: str, model: str) -> 
     - the reply carries routing metadata;
     - exactly one endpoint is selected, and it is the pinned provider serving
       the configured model;
-    - no endpoint the router considered, and no attempt it made, belongs to
-      another provider (the request allowed none, so any is a contradiction,
-      and an attempt elsewhere means the request was sent elsewhere);
+    - the attempt number is a JSON integer of 1 or more;
+    - every attempt in the history was made to the pinned provider and the
+      configured model. A failed attempt elsewhere still means the request
+      was sent elsewhere;
+    - after more than one attempt, the history is complete: one entry per
+      attempt, the last one successful. Without it the earlier attempts are
+      unidentified, so the routing is not proven;
     - a top-level `provider` field, if present, names the same provider.
+
+    Endpoints that were only candidates (`selected: false`) are not checked:
+    they were not called.
 
     Args:
         body: The chat completion response.
@@ -100,13 +123,7 @@ def verify_pinned_route(body: JsonObject, *, provider_name: str, model: str) -> 
         raise RouteEvidenceError("another provider served the reply", served_by.provider)
     if served_by.model != model:
         raise RouteEvidenceError("the selected endpoint serves another model", served_by.provider)
-    for other_provider in [endpoint.provider for endpoint in endpoints] + _attempt_providers(
-        metadata
-    ):
-        if not _same_provider(other_provider, provider_name):
-            raise RouteEvidenceError(
-                "the router considered or tried another provider", other_provider
-            )
+    _verify_attempt_history(metadata, provider_name=provider_name, model=model)
     top_level_provider = body.get("provider")
     if top_level_provider is not None and not (
         isinstance(top_level_provider, str) and _same_provider(top_level_provider, provider_name)
@@ -157,21 +174,55 @@ def _endpoint(raw_endpoint: object) -> _Endpoint:
     return _Endpoint(provider=provider, model=model, selected=selected)
 
 
-def _attempt_providers(metadata: JsonObject) -> list[str]:
+def _verify_attempt_history(metadata: JsonObject, *, provider_name: str, model: str) -> None:
+    attempt_number = _attempt_number(metadata)
+    attempts = _attempts(metadata)
+    for attempt in attempts:
+        if not _same_provider(attempt.provider, provider_name):
+            raise RouteEvidenceError("the router tried another provider", attempt.provider)
+        if attempt.model != model:
+            raise RouteEvidenceError("the router tried another model", attempt.provider)
+    if attempt_number == _FIRST_ATTEMPT and not attempts:
+        # One attempt, and it is the selected endpoint: nothing else was called.
+        return
+    if len(attempts) != attempt_number:
+        raise RouteEvidenceError(
+            "the routing metadata has no complete attempt history for its attempt number"
+        )
+    if attempts[-1].status != HTTPStatus.OK:
+        raise RouteEvidenceError("the last attempt did not succeed")
+
+
+def _attempt_number(metadata: JsonObject) -> int:
+    attempt_number = metadata.get("attempt")
+    # Only a JSON integer counts. 1.0, true or "1" is malformed, never converted.
+    if (
+        isinstance(attempt_number, bool)
+        or not isinstance(attempt_number, int)
+        or attempt_number < _FIRST_ATTEMPT
+    ):
+        raise RouteEvidenceError("the routing metadata has no valid attempt number")
+    return attempt_number
+
+
+def _attempts(metadata: JsonObject) -> list[_Attempt]:
     raw_attempts = metadata.get("attempts")
     if raw_attempts is None:
         return []
     attempts = list_or_none(raw_attempts)
     if attempts is None:
         raise RouteEvidenceError("the routing metadata's attempt list is malformed")
-    providers: list[str] = []
-    for raw_attempt in attempts:
-        attempt = object_or_none(raw_attempt)
-        provider = string_or_none(attempt.get("provider")) if attempt is not None else None
-        if provider is None:
-            raise RouteEvidenceError("an attempt in the routing metadata is malformed")
-        providers.append(provider)
-    return providers
+    return [_attempt(raw_attempt) for raw_attempt in attempts]
+
+
+def _attempt(raw_attempt: object) -> _Attempt:
+    entry = object_or_none(raw_attempt)
+    provider = string_or_none(entry.get("provider")) if entry is not None else None
+    model = string_or_none(entry.get("model")) if entry is not None else None
+    status = entry.get("status") if entry is not None else None
+    if provider is None or model is None or isinstance(status, bool) or not isinstance(status, int):
+        raise RouteEvidenceError("an attempt in the routing metadata is malformed")
+    return _Attempt(provider=provider, model=model, status=status)
 
 
 def _same_provider(reported: str, pinned: str) -> bool:

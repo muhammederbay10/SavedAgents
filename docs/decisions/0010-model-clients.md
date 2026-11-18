@@ -73,8 +73,11 @@ OpenRouter's own US routing (`us.openrouter.ai`) is not an option: this model is
 - **In the response.** Every request sends `X-OpenRouter-Metadata: enabled`, so the reply carries `openrouter_metadata` (OpenRouter's "Router metadata" guide, read 18 Nov 2026). `app/models/routing.py` accepts the reply only if all of these hold, and otherwise discards it with `ProviderPinViolationError`:
   - the metadata is there and well formed;
   - exactly one endpoint in `endpoints.available` has `selected: true` (a JSON boolean), and it names `TEXT_MODEL_PROVIDER_NAME` (any letter case) and exactly `TEXT_MODEL`;
-  - no endpoint the router considered, and no entry in `attempts`, names another provider. The request allowed none, so one is a contradiction, and a failed attempt elsewhere still means the request was sent elsewhere;
+  - `attempt`, the number of the attempt that succeeded, is a JSON integer of 1 or more;
+  - every entry in `attempts` is the pinned provider and exactly `TEXT_MODEL`. A failed attempt elsewhere still means the request was sent elsewhere;
+  - after more than one attempt, `attempts` is complete: one entry per attempt, the last with status 200. If it is missing, empty or shorter, the earlier attempts are unidentified and the reply is refused. With a single attempt the list may be missing (OpenRouter only promises it when the router retried), because the selected endpoint is then the only one called;
   - a top-level `provider` field, if a response has one, names the same provider.
+- **Candidates are not calls.** `endpoints.available` lists what the router considered. Another provider listed there with `selected: false` was not sent the request, so it does not fail the reply; the selected endpoint and the attempt history decide.
 - **Only documented fields count as proof.** OpenRouter's chat completion reference does not promise a top-level `provider` field, so it is never accepted as evidence. It can only make a reply fail, when it contradicts the metadata.
 - **Cache replays are refused.** OpenRouter strips the metadata from them ("Cache hits never include `openrouter_metadata`"), so there is no proof of who served the original. They fail with the same error.
 - `DeepSeekGenerator` cannot be built without a pin.
@@ -105,6 +108,8 @@ Embeddings are matched to their texts by `index`, and only a JSON integer from 0
 - **The standard library's `urllib` in threads.** No dependency at all, but blocking calls in a thread pool under an async pipeline, with timeouts and connection reuse written by hand.
 - **Trusting the top-level `provider` field.** The first version of this change did. OpenRouter does not document it on chat completions, so the Reviewer asked for the documented routing metadata instead.
 - **Accepting the pinned provider when it is merely among the candidates.** Proves nothing about who served the reply; only the `selected` endpoint does.
+- **Refusing any other provider among the candidates.** The first fix round did. The Reviewer showed it refuses replies that were routed only to the pinned provider, because an unselected candidate was never called.
+- **Trusting the selected endpoint alone after a fallback.** With `attempt` above 1 and no complete history, an earlier attempt could have gone anywhere, so the reply is refused instead.
 - **Trusting the request alone for the pin.** Rejected: a routing change or a misread option on OpenRouter's side would then send user data elsewhere without anyone noticing.
 - **Deriving the provider's name from its slug.** `google-vertex` answers as "Google" and `mancer` as "Mancer 2", so the name is its own setting.
 - **Failing when the default model hears nothing and the fallback fails.** Rejected for music-only reels, see above.
