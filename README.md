@@ -17,8 +17,8 @@ This repository currently holds the project skeleton (a FastAPI app with a healt
 ## Setup
 
 ```bash
-git clone https://github.com/muhammederbay10/SavedAgents.git
-cd SavedAgents
+git clone https://github.com/muhammederbay10/Savely.git
+cd Savely
 
 cp .env.example .env            # local configuration, git-ignored
 
