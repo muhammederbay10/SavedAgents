@@ -214,6 +214,8 @@ flowchart TD
 - **Structured filters** for hard facts: collection, type or open category, tags, and the type's filters (an area at any level, genre, streaming platform, subject…), plus distance (`ST_DWithin`) for places. Exact, fast and free. Filter values are normalized against what exists in the user's own saves, never against a fixed list.
 - **Vector search** for fuzzy requests: "cozy date-night place", "that mind-bending sci-fi movie", "the video explaining recursion simply". These match the embeddings of what was said and summarized in each post.
 - The two are combined: filter first, then rank by similarity. Long-term memories also affect ranking (§3.7).
+- **Filter normalization** (decision record 0014) maps each value the user wrote to one in **their own** saves: their collections, categories, tags, the type's field values, the areas of their places, and the streaming providers of their titles **in their country**. An exact hit (one of their values, or a canonical value or verified alias of the vocabulary, compared trimmed and lower-cased) needs no model call. Otherwise their values are ranked by meaning (vocabulary embeddings) and spelling, values the wording was rejected as an alias of are left out, and Gemini Decision 1 picks one or "none of these" above `FILTER_NORMALIZATION_MIN_PROBABILITY`. With no match the wording is kept and L2 relaxes the filter. Normalization never reads another user's items and never writes to the vocabulary.
+- **Where a filter reads its values** is declared by the content type (`FilterSource`): the key named after the filter in `saved_item.fields` and in linked `entity.data` (an area: the entity's address levels; near: its location), `entity_availability` joined on `(entity_id, asking user's country)` for streaming, or the asking user's `user_entity.status` for watched. The country is an explicit argument of the search; without it a streaming filter is refused, so the agent asks once. A missing or stale (`AVAILABILITY_MAX_AGE_DAYS`) row for that country is returned as an availability gap for the resolver to fetch; another country's row never stands in for it.
 
 **Tools available to the response agent:**
 
@@ -247,8 +249,10 @@ Normal search should answer almost everything. The fallback covers two different
 | **L3 Decision scan over text** | Still nothing, or the database is unreachable | **Gemini Decision 1 does the search temporarily:** it checks each item's stored text against the question ("is this a horror movie?") in batched, parallel calls | Cents, a few seconds |
 | **L4 Decision scan over video** (last resort) | Items with no usable text (indexing failed) | Gemini Decision 1 on the stored videos themselves, **capped** (e.g. the 50 most recent), in parallel | Most expensive, ~5–10 s |
 
+Phase 1 builds L0–L2 (`app/agent/retrieval.py`, decision record 0014). L1 is chosen when the query text can't be embedded or the vector query fails. L2 runs when L0 or L1 found fewer than `SEARCH_MIN_RESULTS` items: a district or neighbourhood is widened to its city, tags and the type's other filters are dropped (collection, type, category, platform, date and a "near" point stay), and items that aren't fully indexed are matched by any word of the query in their caption. The result names the filters it relaxed, so the reply can say so.
+
 Rules:
-- **Time budget:** about 10 s in total. Answer with what we have, and tell the user when results may be incomplete ("Search is in backup mode right now, so this list may be missing some items").
+- **Time budget:** about 10 s in total (`SEARCH_TIME_BUDGET_SECONDS`). Answer with what we have, and tell the user when results may be incomplete ("Search is in backup mode right now, so this list may be missing some items").
 - **Self-healing:** anything found at L2–L4 is queued for re-indexing, so the next search finds it at L0.
 - **Works without the database:** a per-user snapshot (JSON of each item's id, text fields and entity info) is kept in object storage and updated on every change. L3 can use it even if Postgres is down.
 - **Don't let it hide bugs:** every fallback is logged with its level and reason, and we get an alert if L1+ happens often.
@@ -447,9 +451,14 @@ Savely/
     agent/
       agent.py              # response-agent loop
       tools.py              # search_items, near, deep_look, set_status…
-      retrieval.py          # hybrid SQL + vector search
+      retrieval.py          # hybrid SQL + vector search, fallback ladder, time budget
+      search_query.py       # the search's arguments, checked against the content types
+      search_conditions.py  # SQL/PostGIS/pgvector conditions and rankings
+      saved_values.py       # the values in one user's saves, and vocabulary lookups
+      filter_normalization.py  # filter values → the user's own values (decision model)
+      prompts.py            # versioned wording for the decision model
       deep_look.py          # parallel subagents + write-back
-      fallback.py           # L1–L4 fallback ladder, time budget, logging
+      fallback.py           # L1–L4 fallback levels, reasons, logging
       messenger.py          # send DM replies, incl. replies that quote a saved reel (reply_to)
       reply_templates.py    # fixed DM wording: confirmation, "which one?", progress, error, result line
     memory/
