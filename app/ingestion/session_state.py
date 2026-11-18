@@ -1,22 +1,23 @@
 """What ingestion keeps in Redis about a user's recent messages.
 
-Three hashes per user, named `savedagent:ingestion:<user id>:<name>`, hold
+Three keys per user, named `savedagent:ingestion:<user id>:<name>`, hold
 everything ingestion writes to Redis about a user, so "delete my data" can
 erase it by deleting three keys:
 
-| Name | Field | Value, as JSON |
+| Name | Type | Entries |
 |---|---|---|
-| `payloads` | `capture:<saved item id>` | The `CaptureEvent` an indexing job works on |
-| | `chat:<receipt id>` | The `ChatMessage` a chat job answers |
-| `receipts` | `<platform>:<message id>` | How a text was routed (`TextReceipt`) |
-| `latest_shares` | `<platform>` | The user's latest share (`LatestShare`) |
+| `payloads` | hash | `capture:<saved item id>`: the `CaptureEvent` an indexing job works on |
+| | | `chat:<receipt id>`: the `ChatMessage` a chat job answers |
+| `receipts` | hash | `<platform>:<message id>`: how a text was routed (`TextReceipt`) |
+| `shares` | sorted set | the user's recent shares (`RecordedShare`), scored by send time |
 
 The jobs on the queue carry only ids. A worker reads the payload from here, and
 finds nothing once the user is deleted.
 
 Every write sets the key to expire after the configured lifetime. It must be
 longer than the time Meta keeps delivering a failed webhook again, so that a
-late delivery still finds its receipt.
+late delivery still finds its receipt and the shares sent before it. Shares
+sent more than one lifetime before the newest recorded share are dropped.
 
 Callers hold the user's row lock (`app.ingestion.repository.lock_user`) while
 they read and write a user's keys. That makes each read-then-write safe and
@@ -37,7 +38,8 @@ from app.adapters.base import CaptureEvent, ChatMessage
 _KEY_PREFIX = "savedagent:ingestion"
 _PAYLOADS = "payloads"
 _RECEIPTS = "receipts"
-_LATEST_SHARES = "latest_shares"
+_SHARES = "shares"
+_MILLISECONDS_PER_SECOND = 1000
 _CAPTURE_PAYLOAD_PREFIX = "capture"
 _CHAT_PAYLOAD_PREFIX = "chat"
 
@@ -67,25 +69,27 @@ class TextReceipt(BaseModel):
     chat_queued: bool
 
 
-class LatestShare(BaseModel):
-    """The latest share from a user: when it was sent, and the item it is stored as.
+class RecordedShare(BaseModel):
+    """One share from a user: where and when it was sent, and the item it is stored as.
 
     A share of a post that is already saved points to the existing item, with
     the time of the new share.
 
     Attributes:
+        platform: The platform the share was sent on.
         saved_item_id: The item the share is stored as.
         sent_at: When the user sent the share.
     """
 
     model_config = ConfigDict(frozen=True)
 
+    platform: str
     saved_item_id: uuid.UUID
     sent_at: datetime
 
 
 class RedisIngestionState:
-    """Ingestion's per-user state in Redis: payloads, text receipts and latest shares."""
+    """Ingestion's per-user state in Redis: payloads, text receipts and recent shares."""
 
     def __init__(self, redis: Redis, lifetime: timedelta) -> None:
         """Create the state store.
@@ -100,10 +104,11 @@ class RedisIngestionState:
     async def save_capture_payload(
         self, user_id: uuid.UUID, saved_item_id: uuid.UUID, event: CaptureEvent
     ) -> None:
-        """Keep the capture event an indexing job works on.
+        """Keep the capture event an indexing job works on, unless a newer one is kept.
 
-        A later share of the same item replaces it, so the job gets the newest
-        media link.
+        A share of the same item that was sent later replaces it, so the job
+        gets the freshest media link. A share sent earlier, such as an old
+        message delivered again or late, leaves the newer one in place.
 
         Args:
             user_id: The user who shared the post.
@@ -114,6 +119,12 @@ class RedisIngestionState:
             redis.exceptions.RedisError: If Redis cannot be reached.
         """
         field = capture_payload_field(saved_item_id)
+        kept = await self._hget(_key(user_id, _PAYLOADS), field)
+        if (
+            kept is not None
+            and CaptureEvent.model_validate_json(kept).received_at > event.received_at
+        ):
+            return
         await self._write(user_id, _PAYLOADS, field, event.model_dump_json())
 
     async def save_chat_payload(
@@ -135,9 +146,11 @@ class RedisIngestionState:
     async def record_share(
         self, user_id: uuid.UUID, platform: str, saved_item_id: uuid.UUID, sent_at: datetime
     ) -> None:
-        """Remember a share as the user's latest, unless a later one is already known.
+        """Remember a share, so a text sent after it can find it.
 
-        Webhooks can arrive out of order, so the times decide, not the order of arrival.
+        Webhooks can arrive out of order, so shares are kept by the time they
+        were sent, not by the order they arrived in. Shares sent more than one
+        lifetime before this one are dropped.
 
         Args:
             user_id: The user who shared the post.
@@ -148,27 +161,41 @@ class RedisIngestionState:
         Raises:
             redis.exceptions.RedisError: If Redis cannot be reached.
         """
-        known = await self.latest_share(user_id, platform)
-        if known is not None and known.sent_at > sent_at:
-            return
-        share = LatestShare(saved_item_id=saved_item_id, sent_at=sent_at)
-        await self._write(user_id, _LATEST_SHARES, platform, share.model_dump_json())
+        share = RecordedShare(platform=platform, saved_item_id=saved_item_id, sent_at=sent_at)
+        key = _key(user_id, _SHARES)
+        score = _milliseconds(sent_at)
+        oldest_kept = score - _milliseconds_of(self._lifetime)
+        async with self._redis.pipeline(transaction=True) as pipeline:
+            pipeline.zadd(key, {share.model_dump_json(): score})
+            pipeline.zremrangebyscore(key, "-inf", f"({oldest_kept}")
+            pipeline.expire(key, self._lifetime)
+            await pipeline.execute()
 
-    async def latest_share(self, user_id: uuid.UUID, platform: str) -> LatestShare | None:
-        """Return the user's latest share on a platform, if one is known.
+    async def latest_share_between(
+        self, user_id: uuid.UUID, platform: str, earliest: datetime, latest: datetime
+    ) -> RecordedShare | None:
+        """Return the user's last share on a platform that was sent within a time span.
 
         Args:
             user_id: The user.
             platform: The platform.
+            earliest: The earliest send time to consider, included.
+            latest: The latest send time to consider, included.
 
         Returns:
-            The latest share, or `None`.
+            The share sent last in the span, or `None` if there is none.
 
         Raises:
             redis.exceptions.RedisError: If Redis cannot be reached.
         """
-        value = await self._hget(_key(user_id, _LATEST_SHARES), platform)
-        return None if value is None else LatestShare.model_validate_json(value)
+        members = await cast(
+            Awaitable[list[bytes]],
+            self._redis.zrevrangebyscore(
+                _key(user_id, _SHARES), _milliseconds(latest), _milliseconds(earliest)
+            ),
+        )
+        shares = (RecordedShare.model_validate_json(member) for member in members)
+        return next((share for share in shares if share.platform == platform), None)
 
     async def text_receipt(
         self, user_id: uuid.UUID, platform: str, message_id: str
@@ -250,7 +277,7 @@ class RedisIngestionState:
             await pipeline.execute()
 
 
-_ALL_KEY_NAMES = (_PAYLOADS, _RECEIPTS, _LATEST_SHARES)
+_ALL_KEY_NAMES = (_PAYLOADS, _RECEIPTS, _SHARES)
 
 
 def payloads_key(user_id: uuid.UUID) -> str:
@@ -295,3 +322,11 @@ def _key(user_id: uuid.UUID, name: str) -> str:
 
 def _receipt_field(platform: str, message_id: str) -> str:
     return f"{platform}:{message_id}"
+
+
+def _milliseconds(moment: datetime) -> int:
+    return round(moment.timestamp() * _MILLISECONDS_PER_SECOND)
+
+
+def _milliseconds_of(duration: timedelta) -> int:
+    return round(duration.total_seconds() * _MILLISECONDS_PER_SECOND)

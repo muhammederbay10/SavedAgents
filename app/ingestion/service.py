@@ -109,12 +109,12 @@ class IngestionService:
             return await find_or_create_user(session, platform, platform_user_id)
 
     async def ingest_capture(self, event: CaptureEvent) -> IngestionOutcome:
-        """Store a capture as a saved item, remember it as the latest share and queue its indexing.
+        """Store a capture as a saved item, record the share and queue the item's indexing.
 
         A post or a message that is already stored creates no second item, but
-        still counts as the user's latest share, so a hint after it labels that
-        item. Its indexing is queued again only while the item is still pending,
-        which covers a first delivery that stored the item but failed to queue it.
+        is still recorded as a share, so a hint after it labels that item. Its
+        indexing is queued again only while the item is still pending, which
+        covers a first delivery that stored the item but failed to queue it.
 
         Args:
             event: The capture event.
@@ -203,11 +203,14 @@ class IngestionService:
     async def _item_awaiting_hint(
         self, session: AsyncSession, message: ChatMessage
     ) -> uuid.UUID | None:
-        share = await self._state.latest_share(message.user_id, message.platform)
+        # The last share sent before the text, even if later shares arrived first.
+        share = await self._state.latest_share_between(
+            message.user_id,
+            message.platform,
+            earliest=message.received_at - self._collection_hint_window,
+            latest=message.received_at,
+        )
         if share is None:
-            return None
-        earliest_share = message.received_at - self._collection_hint_window
-        if not earliest_share <= share.sent_at <= message.received_at:
             return None
         if not await is_unlabelled_item(session, message.user_id, share.saved_item_id):
             return None

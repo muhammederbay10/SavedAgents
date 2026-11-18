@@ -252,3 +252,25 @@ async def test_question_long_after_a_share_is_not_taken_as_its_collection_hint(
     (item,) = await saved_items(session_factory)
     assert item.collection is None
     assert len(job_queue.named(ANSWER_CHAT_MESSAGE_JOB)) == 1
+
+
+async def test_hint_delivered_after_a_later_share_still_labels_the_reel_sent_before_it(
+    webhooks: AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    job_queue: RecordingJobQueue,
+) -> None:
+    hint_event = fixture_json(HINT_AFTER_REEL)["entry"][0]["messaging"][0]
+    later_share = fixture_json(REEL_SHARE)
+    later_event = later_share["entry"][0]["messaging"][0]
+    later_event["message"]["mid"] = OTHER_MESSAGE_ID
+    later_event["timestamp"] = hint_event["timestamp"] + 10_000
+
+    await deliver(webhooks, fixture_body(REEL_BEFORE_HINT))
+    await deliver(webhooks, body_of(later_share))
+    await deliver(webhooks, fixture_body(HINT_AFTER_REEL))
+
+    hinted_reel, later_reel = await saved_items(session_factory)
+    assert hinted_reel.source_message_id == fixture_message(REEL_BEFORE_HINT)["mid"]
+    assert hinted_reel.collection == "For my movies collection"
+    assert later_reel.collection is None
+    assert job_queue.named(ANSWER_CHAT_MESSAGE_JOB) == []

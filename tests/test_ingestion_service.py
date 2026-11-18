@@ -757,7 +757,147 @@ async def test_message_of_a_user_deleted_meanwhile_is_refused_and_leaves_nothing
         else:
             await ingestion.ingest_chat_message(text_message(user_id))
 
-    assert await ingestion_state.latest_share(user_id, INSTAGRAM) is None
+    assert (
+        await ingestion_state.latest_share_between(user_id, INSTAGRAM, SHARED_AT, SHARED_AT) is None
+    )
     assert await ingestion_state.text_receipt(user_id, INSTAGRAM, HINT_MESSAGE_ID) is None
     assert job_queue.jobs == []
     assert await count(session_factory, SavedItem) == 0
+
+
+# --- Regressions from the second review (fix round 2) ---------------------------
+
+FRESH_SIGNED_IMAGE_URL = (
+    "https://lookaside.fbsbx.com/ig_messaging_cdn/"
+    "?asset_id=18000000000000301&signature=FAKE_SIGNATURE_301"
+)
+OLD_SIGNED_IMAGE_URL = (
+    "https://lookaside.fbsbx.com/ig_messaging_cdn/"
+    "?asset_id=18000000000000301&signature=FAKE_SIGNATURE_300"
+)
+
+
+def photo_post_share(user_id: uuid.UUID, message_id: str, **overrides: object) -> CaptureEvent:
+    """A photo post shared by DM: a post id and a signed image link, but no public link."""
+    values: dict[str, object] = {
+        "media_type": "post",
+        "post_url": None,
+        "media_url": OLD_SIGNED_IMAGE_URL,
+        "source_message_id": message_id,
+    }
+    return reel_share(user_id, **{**values, **overrides})
+
+
+async def test_delayed_hint_labels_the_share_sent_before_it_not_a_later_one(
+    ingestion: IngestionService,
+    session_factory: async_sessionmaker[AsyncSession],
+    job_queue: RecordingJobQueue,
+    user_id: uuid.UUID,
+) -> None:
+    # Sent: A at 0 s, the hint at 10 s, B at 20 s. Delivered: A, B, then the hint.
+    await ingestion.ingest_capture(
+        reel_share(user_id, platform_post_id=POST_A, source_message_id=SHARE_A_MESSAGE_ID)
+    )
+    await ingestion.ingest_capture(
+        reel_share(
+            user_id,
+            platform_post_id=POST_B,
+            source_message_id=SHARE_B_MESSAGE_ID,
+            received_at=SHARED_AT + timedelta(seconds=20),
+        )
+    )
+    hint = text_message(user_id, message_id=LATE_HINT_MESSAGE_ID, sent_after=timedelta(seconds=10))
+
+    outcome = await ingestion.ingest_chat_message(hint)
+    replay = await ingestion.ingest_chat_message(hint)
+
+    post_a = await item_with_post_id(session_factory, POST_A)
+    post_b = await item_with_post_id(session_factory, POST_B)
+    assert (outcome, replay) == (IngestionOutcome.COLLECTION_HINT, IngestionOutcome.COLLECTION_HINT)
+    assert post_a.collection == HINT
+    assert post_b.collection is None
+    assert job_queue.named(ANSWER_CHAT_MESSAGE_JOB) == []
+
+
+async def test_delayed_hint_whose_earlier_share_is_labelled_stays_chat_and_skips_older_shares(
+    ingestion: IngestionService,
+    session_factory: async_sessionmaker[AsyncSession],
+    user_id: uuid.UUID,
+) -> None:
+    # One item per hint: an earlier share in the window doesn't take over.
+    await ingestion.ingest_capture(
+        reel_share(user_id, platform_post_id=POST_A, source_message_id=SHARE_A_MESSAGE_ID)
+    )
+    await ingestion.ingest_capture(
+        reel_share(
+            user_id,
+            platform_post_id=POST_B,
+            source_message_id=SHARE_B_MESSAGE_ID,
+            received_at=SHARED_AT + timedelta(seconds=5),
+        )
+    )
+    await ingestion.ingest_chat_message(
+        text_message(user_id, message_id=HINT_MESSAGE_ID, sent_after=timedelta(seconds=8))
+    )
+
+    outcome = await ingestion.ingest_chat_message(
+        text_message(
+            user_id,
+            text=QUESTION,
+            message_id=LATE_HINT_MESSAGE_ID,
+            sent_after=timedelta(seconds=9),
+        )
+    )
+
+    assert outcome is IngestionOutcome.CHAT_QUEUED
+    assert (await item_with_post_id(session_factory, POST_A)).collection is None
+    assert (await item_with_post_id(session_factory, POST_B)).collection == HINT
+
+
+async def test_replayed_old_share_keeps_the_fresh_media_link_of_a_later_share(
+    ingestion: IngestionService,
+    session_factory: async_sessionmaker[AsyncSession],
+    ingestion_redis: ArqRedis,
+    user_id: uuid.UUID,
+) -> None:
+    old_share = photo_post_share(user_id, MESSAGE_ID)
+    fresh_share = photo_post_share(
+        user_id,
+        OTHER_MESSAGE_ID,
+        media_url=FRESH_SIGNED_IMAGE_URL,
+        received_at=SHARED_AT + timedelta(minutes=5),
+    )
+
+    await ingestion.ingest_capture(old_share)
+    await ingestion.ingest_capture(fresh_share)
+    await ingestion.ingest_capture(old_share)
+
+    item = await only_saved_item(session_factory)
+    payload = await capture_payload(ingestion_redis, user_id, item.id)
+    assert payload["media_url"] == FRESH_SIGNED_IMAGE_URL
+    assert item.source_message_id == MESSAGE_ID
+    assert item.saved_at == SHARED_AT
+
+
+async def test_delayed_old_share_keeps_the_fresh_media_link_delivered_before_it(
+    ingestion: IngestionService,
+    session_factory: async_sessionmaker[AsyncSession],
+    ingestion_redis: ArqRedis,
+    user_id: uuid.UUID,
+) -> None:
+    fresh_share = photo_post_share(
+        user_id,
+        OTHER_MESSAGE_ID,
+        media_url=FRESH_SIGNED_IMAGE_URL,
+        received_at=SHARED_AT + timedelta(minutes=5),
+    )
+    delayed_old_share = photo_post_share(user_id, MESSAGE_ID)
+
+    await ingestion.ingest_capture(fresh_share)
+    outcome = await ingestion.ingest_capture(delayed_old_share)
+
+    item = await only_saved_item(session_factory)
+    payload = await capture_payload(ingestion_redis, user_id, item.id)
+    assert outcome is IngestionOutcome.ITEM_ALREADY_SAVED
+    assert payload["media_url"] == FRESH_SIGNED_IMAGE_URL
+    assert item.source_message_id == OTHER_MESSAGE_ID

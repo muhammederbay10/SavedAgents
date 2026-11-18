@@ -44,7 +44,7 @@ class Settings(BaseSettings):
             same user still counts as that item's collection hint
             (`COLLECTION_HINT_WINDOW_SECONDS`).
         ingestion_state_ttl_seconds: How long ingestion keeps a user's job
-            payloads, text receipts and latest share in Redis after its last
+            payloads, text receipts and recent shares in Redis after its last
             write (`INGESTION_STATE_TTL_SECONDS`). It must cover the time Meta
             keeps delivering a failed webhook again, so a late delivery is
             still recognized, and it must be at least the hint window.
