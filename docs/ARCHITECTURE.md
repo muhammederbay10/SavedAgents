@@ -398,6 +398,7 @@ savedagent/
       decision.py           # Gemini Decision 1 client
       transcriber.py        # speech-to-text: default model + fallback
       chat_completions.py   # Generator over chat completions, with the provider pin
+      routing.py            # which provider served a reply, from OpenRouter's routing metadata
       deepseek.py           # text model: extraction + response agent, pinned to one provider
       multimodal.py         # video model for escalations
       embeddings.py

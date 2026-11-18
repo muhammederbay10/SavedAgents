@@ -14,7 +14,7 @@ and messages, and a provider's own error text can quote its input back.
     ├── ModelResponseError             an answer arrived but was unusable
     │   ├── SchemaOutputError          the reply was not the JSON that was asked for
     │   ├── EmbeddingDimensionError    a vector had the wrong size
-    │   └── ProviderPinViolationError  another provider than the pinned one answered
+    │   └── ProviderPinViolationError  no proof that the pinned provider alone answered
     └── TranscriptionFailedError       no transcription model produced a transcript
 """
 
@@ -139,18 +139,26 @@ class EmbeddingDimensionError(ModelResponseError):
 
 
 class ProviderPinViolationError(ModelResponseError):
-    """A provider other than the pinned one served the call.
+    """The response does not prove that the pinned provider, and only it, served the call.
 
-    The reply is discarded: it must not be used, because the request left the
-    approved host.
+    The reply is discarded: it must not be used, because the request may have
+    left the approved host, or there is no evidence that it did not.
 
     Attributes:
         expected_provider: The provider name the pin expects.
-        actual_provider: The provider the response names; `None` if it names none.
+        actual_provider: The other provider the evidence names; `None` if it
+            names none.
+        problem: What is wrong with the evidence.
     """
 
     def __init__(
-        self, *, operation: str, model: str, expected_provider: str, actual_provider: str | None
+        self,
+        *,
+        operation: str,
+        model: str,
+        expected_provider: str,
+        actual_provider: str | None,
+        problem: str,
     ) -> None:
         """Create the error.
 
@@ -158,17 +166,19 @@ class ProviderPinViolationError(ModelResponseError):
             operation: The interface method that failed.
             model: The configured id of the model that was called.
             expected_provider: The provider name the pin expects.
-            actual_provider: The provider the response names, if any.
+            actual_provider: The other provider the evidence names, if any.
+            problem: What is wrong with the evidence, without response content.
         """
-        served_by = f"'{actual_provider}'" if actual_provider is not None else "an unnamed provider"
+        named = f" ('{actual_provider}')" if actual_provider is not None else ""
         super().__init__(
-            f"{operation} with {model} was served by {served_by}, "
-            f"but the model is pinned to '{expected_provider}'",
+            f"{operation} with {model} is not proven to be served by the pinned provider "
+            f"'{expected_provider}': {problem}{named}",
             operation=operation,
             model=model,
         )
         self.expected_provider = expected_provider
         self.actual_provider = actual_provider
+        self.problem = problem
 
 
 class TranscriptionFailedError(ModelError):

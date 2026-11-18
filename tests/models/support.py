@@ -33,6 +33,7 @@ class RecordedRequest:
 
     url: str
     authorization: str | None
+    routing_metadata_header: str | None
     timeout_seconds: float | None
     body: dict[str, Any]
 
@@ -49,6 +50,7 @@ class FakeOpenRouter:
             RecordedRequest(
                 url=str(request.url),
                 authorization=request.headers.get("Authorization"),
+                routing_metadata_header=request.headers.get("X-OpenRouter-Metadata"),
                 timeout_seconds=request.extensions["timeout"].get("read"),
                 body=json.loads(request.content),
             )

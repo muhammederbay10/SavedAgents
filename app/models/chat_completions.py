@@ -13,9 +13,19 @@ both speak this contract (OpenRouter docs, 17 Nov 2026):
   slug in `only` and `order` with `allow_fallbacks: false`, so OpenRouter may
   use that one endpoint and nothing else.
 
+Every request also sends `X-OpenRouter-Metadata: enabled`, so the response
+carries `openrouter_metadata`: which endpoints the router considered, which one
+it selected, and which it tried (`app.models.routing`).
+
 A pin is enforced twice. The request forbids every other provider, and the
-response's `provider` field is checked against the expected name. A reply from
-anyone else is discarded with `ProviderPinViolationError`.
+reply's routing metadata must prove that the pinned provider, and only it,
+handled the call. A reply without that proof is discarded with
+`ProviderPinViolationError`. The top-level `provider` field is not part of
+OpenRouter's documented chat completion response, so it is never accepted as
+proof; it only counts against a reply that it contradicts.
+
+A reply whose message is missing or has the wrong shape raises
+`ModelResponseError`. It is never turned into an empty success.
 """
 
 import json
@@ -40,6 +50,13 @@ from app.models.errors import (
     SchemaOutputError,
 )
 from app.models.openrouter import ModelCall, OpenRouterTransport
+from app.models.routing import (
+    ROUTING_METADATA_ENABLED,
+    ROUTING_METADATA_HEADER,
+    RouteEvidenceError,
+    selected_provider,
+    verify_pinned_route,
+)
 from app.models.wire import (
     JsonObject,
     cost_usd,
@@ -51,6 +68,7 @@ from app.models.wire import (
 
 _OPERATION = "generate"
 _ERROR_FINISH_REASON = "error"
+_FUNCTION_TOOL_TYPE = "function"
 
 # OpenRouter answers one of these when no endpoint satisfies the `provider`
 # object. Its docs name both: 404 where they describe `only`, 503 in the error table.
@@ -94,7 +112,11 @@ class ChatCompletionsGenerator(Generator):
         """
         self._transport = transport
         self._call = ModelCall(
-            operation=_OPERATION, model=model, url=url, timeout_seconds=timeout_seconds
+            operation=_OPERATION,
+            model=model,
+            url=url,
+            timeout_seconds=timeout_seconds,
+            headers={ROUTING_METADATA_HEADER: ROUTING_METADATA_ENABLED},
         )
         self._provider_pin = provider_pin
 
@@ -110,24 +132,26 @@ class ChatCompletionsGenerator(Generator):
         Raises:
             ProviderRouteUnavailableError: The model is pinned and its provider
                 cannot serve the call.
-            ProviderPinViolationError: The model is pinned and another provider
-                answered.
+            ProviderPinViolationError: The model is pinned and the reply does
+                not prove that the pinned provider alone served it.
             SchemaOutputError: A schema was requested and the reply is not a
                 JSON object.
+            ModelResponseError: The reply's message is missing or malformed.
             ModelError: The call failed in another way.
         """
         body = await self._post(self._payload(request))
-        provider = string_or_none(body.get("provider"))
-        self._check_pin(provider)
+        provider = self._serving_provider(body)
         choice = self._first_choice(body)
-        message = object_or_none(choice.get("message")) or {}
-        text = string_or_none(message.get("content")) or ""
+        message = object_or_none(choice.get("message"))
+        if message is None:
+            raise self._response_error("the reply has no message object")
         tool_calls = self._tool_calls(message)
+        text = self._text(message, has_tool_calls=bool(tool_calls))
         return GenerationResult(
             text=text,
             structured=self._structured(request, text, tool_calls),
             tool_calls=tool_calls,
-            finish_reason=string_or_none(choice.get("finish_reason")) or "",
+            finish_reason=self._finish_reason(choice),
             model=string_or_none(body.get("model")) or self._call.model,
             provider=provider,
             cost_usd=cost_usd(body),
@@ -186,17 +210,20 @@ class ChatCompletionsGenerator(Generator):
                 status=error.status,
             ) from error
 
-    def _check_pin(self, provider: str | None) -> None:
+    def _serving_provider(self, body: JsonObject) -> str | None:
         pin = self._provider_pin
         if pin is None:
-            return
-        if provider is None or provider.casefold() != pin.name.casefold():
+            return selected_provider(body)
+        try:
+            return verify_pinned_route(body, provider_name=pin.name, model=self._call.model)
+        except RouteEvidenceError as error:
             raise ProviderPinViolationError(
                 operation=_OPERATION,
                 model=self._call.model,
                 expected_provider=pin.name,
-                actual_provider=provider,
-            )
+                actual_provider=error.actual_provider,
+                problem=error.problem,
+            ) from error
 
     def _first_choice(self, body: JsonObject) -> JsonObject:
         choices = list_or_none(body.get("choices")) or []
@@ -207,9 +234,24 @@ class ChatCompletionsGenerator(Generator):
             raise self._response_error("the provider reported an error in the reply")
         return choice
 
+    def _text(self, message: JsonObject, *, has_tool_calls: bool) -> str:
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        # Null content is valid only next to tool calls: the model called a tool
+        # and wrote nothing. Without tool calls the reply would say nothing at all.
+        if content is None and has_tool_calls:
+            return ""
+        raise self._response_error("the reply's message has no text and no tool calls")
+
     def _tool_calls(self, message: JsonObject) -> tuple[ToolCall, ...]:
-        raw_calls = list_or_none(message.get("tool_calls")) or []
-        return tuple(self._tool_call(raw_call) for raw_call in raw_calls)
+        raw_calls = message.get("tool_calls")
+        if raw_calls is None:
+            return ()
+        calls = list_or_none(raw_calls)
+        if calls is None:
+            raise self._response_error("the reply's tool calls are not a list")
+        return tuple(self._tool_call(raw_call) for raw_call in calls)
 
     def _tool_call(self, raw_call: object) -> ToolCall:
         call = object_or_none(raw_call) or {}
@@ -219,7 +261,17 @@ class ChatCompletionsGenerator(Generator):
         arguments = _tool_arguments(string_or_none(function.get("arguments")))
         if call_id is None or name is None or arguments is None:
             raise self._response_error("a tool call is missing its id, name or JSON arguments")
+        if call.get("type", _FUNCTION_TOOL_TYPE) != _FUNCTION_TOOL_TYPE:
+            raise self._response_error("a tool call is not a function call")
         return ToolCall(id=call_id, name=name, arguments=arguments)
+
+    def _finish_reason(self, choice: JsonObject) -> str:
+        finish_reason = choice.get("finish_reason")
+        if finish_reason is None:
+            return ""
+        if not isinstance(finish_reason, str):
+            raise self._response_error("the reply's finish reason is not text")
+        return finish_reason
 
     def _structured(
         self, request: GenerationRequest, text: str, tool_calls: tuple[ToolCall, ...]

@@ -12,8 +12,8 @@ import asyncio
 import logging
 import re
 import time
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass, field
 from http import HTTPStatus
 
 import httpx
@@ -89,12 +89,15 @@ class ModelCall:
         model: The configured id of the model.
         url: The full URL of the endpoint.
         timeout_seconds: How long one attempt may take.
+        headers: Extra request headers for this call, such as the opt-in to
+            routing metadata.
     """
 
     operation: str
     model: str
     url: str
     timeout_seconds: float
+    headers: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -198,7 +201,7 @@ class OpenRouterTransport:
     async def _attempt(self, call: ModelCall, payload: JsonObject) -> JsonObject | _Failure:
         try:
             response = await self._http_client.post(
-                call.url, json=payload, timeout=call.timeout_seconds
+                call.url, json=payload, headers=dict(call.headers), timeout=call.timeout_seconds
             )
         except httpx.TransportError as error:
             return _Failure(status=None, cause=type(error).__name__)

@@ -393,8 +393,9 @@ class GenerationResult:
         finish_reason: Why the model stopped: `stop`, `tool_calls`, `length`
             or `content_filter`.
         model: The model that answered, as the provider reports it.
-        provider: The upstream provider that served the call; `None` if not
-            reported.
+        provider: The upstream provider that served the call, as OpenRouter's
+            routing metadata names it; `None` if the metadata does not name
+            exactly one. For a pinned model it is always the verified provider.
         cost_usd: What the provider charged for the call; `None` if not reported.
     """
 

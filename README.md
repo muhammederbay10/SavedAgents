@@ -275,7 +275,7 @@ async with open_http_client(settings) as http_client:
 | `ModelRequestError` | The request was rejected. Subclasses: `ModelAuthenticationError` (key refused), `ModelCreditsError` (out of credits) |
 | `ModelRateLimitError`, `ModelUnavailableError` | Still rate-limited, or timeouts and server errors, after the last attempt |
 | `ProviderRouteUnavailableError` | The pinned provider cannot serve the call, and no other provider is allowed |
-| `ProviderPinViolationError` | Another provider than the pinned one answered. The reply is discarded |
+| `ProviderPinViolationError` | The reply does not prove that the pinned provider, and only it, served it. The reply is discarded |
 | `ModelResponseError` | The answer was unusable. Subclasses: `SchemaOutputError`, `EmbeddingDimensionError` |
 | `TranscriptionFailedError` | Both speech-to-text models failed |
 
@@ -287,11 +287,12 @@ DeepSeek's own API is hosted in China, and OpenRouter by default sends a model t
 
 ```bash
 TEXT_MODEL_PROVIDER=coreweave/fp8     # the endpoint's OpenRouter slug
-TEXT_MODEL_PROVIDER_NAME=CoreWeave    # the name OpenRouter reports for it in a response
+TEXT_MODEL_PROVIDER_NAME=CoreWeave    # the name OpenRouter reports for it in routing metadata
 ```
 
 - **Every request allows only that endpoint:** `provider: {"only": [slug], "order": [slug], "allow_fallbacks": false}`.
-- **Every reply is checked:** if OpenRouter's `provider` field is missing or names anyone else, the reply is discarded with `ProviderPinViolationError`.
+- **Every reply must prove where it was served.** Each request sends `X-OpenRouter-Metadata: enabled`, and OpenRouter then adds `openrouter_metadata` to the reply. The reply is used only if exactly one endpoint is `selected`, it is the pinned provider with the configured model, and no other provider was considered or tried. Anything else (no metadata, malformed or ambiguous metadata, another provider, a top-level `provider` field that disagrees) discards the reply with `ProviderPinViolationError`.
+- **Cache replays are refused.** OpenRouter strips the metadata from them, so they can't be proven. Keep response caching off for the text model.
 - **No route means an error, never another host.** If the endpoint cannot serve a call (OpenRouter answers 404 or 503; a 503 is retried first), `generate` raises `ProviderRouteUnavailableError`.
 
 **Why CoreWeave** (evidence read on 17 Nov 2026; the full comparison is in [record 0010](docs/decisions/0010-model-clients.md#the-provider-that-serves-deepseek)):
@@ -316,7 +317,7 @@ The model clients read these variables through `ModelSettings` in [`app/config.p
 | `DECISION_MODEL`, `DECISION_TIMEOUT_SECONDS` | Decision model id (`google/gemini-decision-1`) and the time limit of one request |
 | `TEXT_MODEL`, `TEXT_TIMEOUT_SECONDS` | Text model id (`deepseek/deepseek-v4.1-flash`) and the time limit of one request |
 | `TEXT_MODEL_PROVIDER` | The one provider endpoint that may serve the text model, as an OpenRouter slug (`coreweave/fp8`). Must be hosted outside China. See [The DeepSeek provider pin](#the-deepseek-provider-pin) |
-| `TEXT_MODEL_PROVIDER_NAME` | The name OpenRouter reports for that provider in a response (`CoreWeave`). A reply that names another provider is discarded |
+| `TEXT_MODEL_PROVIDER_NAME` | The name OpenRouter reports for that provider in a reply's routing metadata (`CoreWeave`). A reply not proven to come from it is discarded |
 | `ESCALATION_MODEL`, `ESCALATION_TIMEOUT_SECONDS` | Video model id (`google/gemini-2.5-flash`) and the time limit of one request |
 | `TRANSCRIPTION_MODEL`, `TRANSCRIPTION_RESPONSE_FORMAT` | Default speech-to-text model (`microsoft/mai-transcribe-2`) and its response format: `verbose_json` (with language and timestamps) or `json` |
 | `TRANSCRIPTION_FALLBACK_MODEL`, `TRANSCRIPTION_FALLBACK_RESPONSE_FORMAT` | The model asked when the default fails or returns no words (`openai/gpt-transcribe`, which only accepts `json`) |
@@ -337,7 +338,7 @@ set -a; source .env; set +a
 LIVE_MODEL_TESTS=1 pytest -m live
 ```
 
-The text-model test also checks that the reply came from the pinned provider. Sending a video to the escalation model is not covered: the test sends text only.
+The text-model test also checks, from the reply's routing metadata, that the pinned provider served it. Sending a video to the escalation model is not covered: the test sends text only.
 
 ## Content types
 

@@ -1,3 +1,7 @@
+from collections.abc import Callable
+from typing import Any
+
+import httpx
 import pytest
 
 from app.models.base import (
@@ -86,10 +90,56 @@ async def test_every_request_allows_only_the_pinned_provider_and_no_fallback(
     assert server.requests[0].body["provider"] == PINNED_ROUTING
 
 
-@pytest.mark.parametrize("served_by", ["DeepSeek", "Alibaba", "coreweave/fp8-typo", ""])
-async def test_reply_from_another_provider_is_discarded(connect: Connect, served_by: str) -> None:
+def routing_metadata(body: dict[str, Any]) -> dict[str, Any]:
+    metadata: dict[str, Any] = body["openrouter_metadata"]
+    return metadata
+
+
+def selected_endpoint(body: dict[str, Any]) -> dict[str, Any]:
+    endpoint: dict[str, Any] = routing_metadata(body)["endpoints"]["available"][0]
+    return endpoint
+
+
+def endpoint(provider: str, *, selected: bool, model: str = TEXT_MODEL) -> dict[str, object]:
+    return {"provider": provider, "model": model, "selected": selected}
+
+
+async def test_every_pinned_request_opts_in_to_routing_metadata(connect: Connect) -> None:
+    server, transport = connect([fixture_response("chat_completion_schema.json")])
+
+    await generator(transport).generate(QUESTION)
+
+    assert server.only_request.routing_metadata_header == "enabled"
+
+
+async def test_reply_whose_selected_endpoint_is_the_pinned_provider_is_accepted(
+    connect: Connect,
+) -> None:
     body = load_fixture("chat_completion_schema.json")
-    body["provider"] = served_by
+    assert "provider" not in body
+    _, transport = connect([json_response(body)])
+
+    result = await generator(transport).generate(QUESTION)
+
+    assert result.provider == "CoreWeave"
+
+
+async def test_selected_provider_is_compared_without_regard_to_case(connect: Connect) -> None:
+    body = load_fixture("chat_completion_schema.json")
+    selected_endpoint(body)["provider"] = "coreweave"
+    _, transport = connect([json_response(body)])
+
+    result = await generator(transport).generate(QUESTION)
+
+    assert result.provider == "coreweave"
+
+
+@pytest.mark.parametrize("served_by", ["DeepSeek", "Alibaba", "coreweave/fp8", ""])
+async def test_reply_selected_from_another_provider_is_discarded(
+    connect: Connect, served_by: str
+) -> None:
+    body = load_fixture("chat_completion_schema.json")
+    selected_endpoint(body)["provider"] = served_by
     _, transport = connect([json_response(body)])
 
     with pytest.raises(ProviderPinViolationError) as raised:
@@ -99,25 +149,129 @@ async def test_reply_from_another_provider_is_discarded(connect: Connect, served
     assert raised.value.actual_provider == served_by
 
 
-async def test_reply_that_names_no_provider_is_discarded(connect: Connect) -> None:
-    body = load_fixture("chat_completion_schema.json")
-    del body["provider"]
-    _, transport = connect([json_response(body)])
+async def test_cache_replay_without_routing_metadata_is_discarded(connect: Connect) -> None:
+    _, transport = connect([fixture_response("chat_completion_cache_replay.json")])
 
-    with pytest.raises(ProviderPinViolationError, match="an unnamed provider") as raised:
+    with pytest.raises(ProviderPinViolationError, match="no routing metadata") as raised:
         await generator(transport).generate(QUESTION)
 
     assert raised.value.actual_provider is None
 
 
-async def test_provider_name_is_compared_without_regard_to_case(connect: Connect) -> None:
+async def test_reply_that_went_through_another_provider_first_is_discarded(
+    connect: Connect,
+) -> None:
+    _, transport = connect([fixture_response("chat_completion_after_fallback.json")])
+
+    with pytest.raises(ProviderPinViolationError, match="another provider") as raised:
+        await generator(transport).generate(QUESTION)
+
+    assert raised.value.actual_provider == "DeepInfra"
+
+
+def set_metadata(body: dict[str, Any], value: object) -> None:
+    body["openrouter_metadata"] = value
+
+
+def set_endpoints(body: dict[str, Any], value: object) -> None:
+    routing_metadata(body)["endpoints"] = value
+
+
+def set_available(body: dict[str, Any], value: object) -> None:
+    routing_metadata(body)["endpoints"]["available"] = value
+
+
+def set_attempts(body: dict[str, Any], value: object) -> None:
+    routing_metadata(body)["attempts"] = value
+
+
+def set_selected_field(field_name: str, value: object) -> Callable[[dict[str, Any]], None]:
+    def change(body: dict[str, Any]) -> None:
+        selected_endpoint(body)[field_name] = value
+
+    return change
+
+
+@pytest.mark.parametrize(
+    ("change", "problem"),
+    [
+        (lambda body: set_metadata(body, "CoreWeave"), "no routing metadata"),
+        (lambda body: set_metadata(body, None), "no routing metadata"),
+        (lambda body: set_endpoints(body, None), "malformed"),
+        (lambda body: set_available(body, "CoreWeave"), "malformed"),
+        (lambda body: set_available(body, ["CoreWeave"]), "malformed"),
+        (lambda body: set_available(body, []), "no selected endpoint"),
+        (
+            lambda body: set_available(body, [endpoint("CoreWeave", selected=False)]),
+            "no selected endpoint",
+        ),
+        (set_selected_field("selected", "true"), "malformed"),
+        (set_selected_field("provider", None), "malformed"),
+        (set_selected_field("model", None), "malformed"),
+        (
+            lambda body: set_available(
+                body, [endpoint("CoreWeave", selected=True), endpoint("CoreWeave", selected=True)]
+            ),
+            "more than one selected endpoint",
+        ),
+        (
+            set_selected_field("model", "deepseek/deepseek-v4.1-flash-1017"),
+            "another model",
+        ),
+        (
+            lambda body: set_available(
+                body, [endpoint("CoreWeave", selected=True), endpoint("Baidu", selected=False)]
+            ),
+            "another provider",
+        ),
+        (lambda body: set_attempts(body, "CoreWeave"), "malformed"),
+        (lambda body: set_attempts(body, [{"model": TEXT_MODEL, "status": 200}]), "malformed"),
+        (
+            lambda body: set_attempts(
+                body,
+                [
+                    {"provider": "Novita", "model": TEXT_MODEL, "status": 503},
+                    {"provider": "CoreWeave", "model": TEXT_MODEL, "status": 200},
+                ],
+            ),
+            "another provider",
+        ),
+        (lambda body: body.update(provider="DeepSeek"), "contradicts"),
+    ],
+)
+async def test_missing_malformed_ambiguous_or_contradictory_routing_evidence_fails_closed(
+    connect: Connect, change: Callable[[dict[str, Any]], None], problem: str
+) -> None:
     body = load_fixture("chat_completion_schema.json")
-    body["provider"] = "coreweave"
+    change(body)
+    _, transport = connect([json_response(body)])
+
+    with pytest.raises(ProviderPinViolationError, match=problem):
+        await generator(transport).generate(QUESTION)
+
+
+async def test_top_level_provider_that_agrees_with_the_metadata_is_accepted(
+    connect: Connect,
+) -> None:
+    body = load_fixture("chat_completion_schema.json")
+    body["provider"] = "CoreWeave"
     _, transport = connect([json_response(body)])
 
     result = await generator(transport).generate(QUESTION)
 
-    assert result.provider == "coreweave"
+    assert result.provider == "CoreWeave"
+
+
+async def test_no_allowed_provider_answer_with_its_metadata_is_a_route_error(
+    connect: Connect,
+) -> None:
+    no_route = fixture_response("error_no_allowed_providers.json")
+    _, transport = connect([httpx.Response(404, json=no_route.json())])
+
+    with pytest.raises(ProviderRouteUnavailableError) as raised:
+        await generator(transport).generate(QUESTION)
+
+    assert raised.value.status == 404
 
 
 async def test_no_route_through_the_pinned_provider_is_a_clear_error_at_once(
@@ -354,3 +508,88 @@ async def test_reply_without_a_usable_choice_raises_response_error(
 
     with pytest.raises(ModelResponseError):
         await generator(transport).generate(QUESTION)
+
+
+@pytest.mark.parametrize(
+    "choice",
+    [
+        {"index": 0, "finish_reason": "stop"},
+        {"index": 0, "finish_reason": "stop", "message": None},
+        {"index": 0, "finish_reason": "stop", "message": "Three places match."},
+        {"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": 123}},
+        {"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": ["a"]}},
+        {"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": None}},
+        {"index": 0, "finish_reason": "stop", "message": {"role": "assistant"}},
+        {
+            "index": 0,
+            "finish_reason": "tool_calls",
+            "message": {"role": "assistant", "content": None, "tool_calls": "search_items"},
+        },
+        {
+            "index": 0,
+            "finish_reason": "tool_calls",
+            "message": {"role": "assistant", "content": None, "tool_calls": []},
+        },
+        {"index": 0, "finish_reason": 7, "message": {"role": "assistant", "content": "ok"}},
+    ],
+)
+async def test_malformed_message_raises_response_error_instead_of_an_empty_success(
+    connect: Connect, choice: dict[str, object]
+) -> None:
+    body = load_fixture("chat_completion_schema.json")
+    # The routing evidence is valid, so only the message's shape can be at fault.
+    body["provider"] = "CoreWeave"
+    body["choices"] = [choice]
+    _, transport = connect([json_response(body)])
+
+    with pytest.raises(ModelResponseError) as raised:
+        await generator(transport).generate(QUESTION)
+
+    assert type(raised.value) is ModelResponseError
+
+
+async def test_tool_call_of_another_type_raises_response_error(connect: Connect) -> None:
+    body = load_fixture("chat_completion_tool_calls.json")
+    body["provider"] = "CoreWeave"
+    body["choices"][0]["message"]["tool_calls"][0]["type"] = "code_interpreter"
+    _, transport = connect([json_response(body)])
+    request = GenerationRequest(messages=QUESTION.messages, tools=[SEARCH_TOOL])
+
+    with pytest.raises(ModelResponseError) as raised:
+        await generator(transport).generate(request)
+
+    assert type(raised.value) is ModelResponseError
+
+
+async def test_tool_only_reply_with_null_content_is_valid(connect: Connect) -> None:
+    body = load_fixture("chat_completion_tool_calls.json")
+    assert body["choices"][0]["message"]["content"] is None
+    _, transport = connect([json_response(body)])
+    request = GenerationRequest(messages=QUESTION.messages, tools=[SEARCH_TOOL])
+
+    result = await generator(transport).generate(request)
+
+    assert result.text == ""
+    assert [call.name for call in result.tool_calls] == ["search_items"]
+
+
+async def test_empty_text_reply_is_a_valid_shape(connect: Connect) -> None:
+    body = load_fixture("chat_completion_schema.json")
+    body["choices"][0]["message"]["content"] = ""
+    _, transport = connect([json_response(body)])
+
+    result = await generator(transport).generate(QUESTION)
+
+    assert result.text == ""
+    assert result.tool_calls == ()
+
+
+async def test_text_reply_with_an_empty_tool_call_list_is_valid(connect: Connect) -> None:
+    body = load_fixture("chat_completion_schema.json")
+    body["choices"][0]["message"].update(content="Three places match.", tool_calls=[])
+    _, transport = connect([json_response(body)])
+
+    result = await generator(transport).generate(QUESTION)
+
+    assert result.text == "Three places match."
+    assert result.tool_calls == ()

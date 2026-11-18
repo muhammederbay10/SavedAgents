@@ -1,8 +1,8 @@
 # 0010: Model clients, and the provider that serves DeepSeek
 
-- Status: proposed. Three points need Muhammed's answer before the pull request: see [Needs the owner's decision](#needs-the-owners-decision). The model choices themselves were approved in SAV-7 (decision record 0008, which arrives with SAV-7's pull request).
+- Status: proposed. Three points need Muhammed's answer before the pull request: see [Needs the owner's decision](#needs-the-owners-decision). The model choices themselves were approved in SAV-7 (decision record 0008).
 - Date: 2026-11-17
-- Ticket: SAV-10 (0008 is SAV-7's record on the model choices, and 0009 is SAV-11's on webhook ingestion; both arrive with their own pull requests)
+- Ticket: SAV-10 (0008 is SAV-7's record on the model choices; 0009 is SAV-11's on webhook ingestion, which arrives with its own pull request)
 
 ## Context
 
@@ -70,25 +70,41 @@ OpenRouter's own US routing (`us.openrouter.ai`) is not an option: this model is
 **How the pin is enforced, twice:**
 
 - **In the request.** Every text-model request carries `provider: {"only": [slug], "order": [slug], "allow_fallbacks": false}`. OpenRouter may use that one endpoint and nothing else.
-- **In the response.** OpenRouter names the provider that answered in the response's `provider` field. If it is missing or is not `TEXT_MODEL_PROVIDER_NAME`, the reply is discarded with `ProviderPinViolationError`.
+- **In the response.** Every request sends `X-OpenRouter-Metadata: enabled`, so the reply carries `openrouter_metadata` (OpenRouter's "Router metadata" guide, read 18 Nov 2026). `app/models/routing.py` accepts the reply only if all of these hold, and otherwise discards it with `ProviderPinViolationError`:
+  - the metadata is there and well formed;
+  - exactly one endpoint in `endpoints.available` has `selected: true` (a JSON boolean), and it names `TEXT_MODEL_PROVIDER_NAME` (any letter case) and exactly `TEXT_MODEL`;
+  - no endpoint the router considered, and no entry in `attempts`, names another provider. The request allowed none, so one is a contradiction, and a failed attempt elsewhere still means the request was sent elsewhere;
+  - a top-level `provider` field, if a response has one, names the same provider.
+- **Only documented fields count as proof.** OpenRouter's chat completion reference does not promise a top-level `provider` field, so it is never accepted as evidence. It can only make a reply fail, when it contradicts the metadata.
+- **Cache replays are refused.** OpenRouter strips the metadata from them ("Cache hits never include `openrouter_metadata`"), so there is no proof of who served the original. They fail with the same error.
 - `DeepSeekGenerator` cannot be built without a pin.
 
 **When no route is available.** If the pinned endpoint cannot serve a call, OpenRouter answers 404 or 503 (its docs name both). A 503 is retried like any outage. After that `generate` raises `ProviderRouteUnavailableError`, which names the provider and says that no fallback is allowed. The request is never sent anywhere else.
 
+**The escalation model** sends the same header but is not pinned. Its result reports the selected provider when the metadata names exactly one, and `None` otherwise; nothing is refused for that.
+
+### Replies with the wrong shape
+
+A chat completion whose choice has no `message` object, whose `content` is neither text nor null, whose `tool_calls` is not a list, or whose tool call is not a function call raises `ModelResponseError`. Null `content` is valid only next to at least one tool call: that is a tool-only reply. An empty string is valid text. A reply is never turned into an empty success.
+
+Embeddings are matched to their texts by `index`, and only a JSON integer from 0 to the number of texts minus one counts. `1.9`, `1.0`, `true`, `"1"` and `-1` are refused, never rounded or converted, and a repeated index is refused.
+
 ### Test fixtures
 
-`tests/fixtures/openrouter/` holds responses **written by hand** from OpenRouter's public documentation of 17 Nov 2026, with invented content. They are not recordings: SAV-7 kept none. The first approved live smoke run should be used to check them.
+`tests/fixtures/openrouter/` holds responses **written by hand** from OpenRouter's public documentation of 17 and 18 Nov 2026, with invented content. They are not recordings: SAV-7 kept none. The router-metadata guide's own examples are Responses API replies; the fixtures put the same object next to `choices`, as the guide says it is placed. The first approved live smoke run should be used to check them.
 
 ## Needs the owner's decision
 
 1. **`httpx` becomes a runtime dependency.** It was already in the project, but only as a development tool (for tests). The clients need an async HTTP client when the app runs, so `pyproject.toml` now lists it under `dependencies`. No new package is installed. AGENTS.md §1 asks for approval of a new dependency; this is the request. To undo it: move the line back and replace the transport in `app/models/openrouter.py`.
 2. **The provider.** Is `coreweave/fp8` on the evidence above acceptable, or should the pin be `fireworks/us` (a stated US-only route, about 3.5 times the input price)? Changing it is two lines in `.env`.
-3. **A live smoke run** of `tests/live/` (six calls, a fraction of a cent) to confirm the pin, the `provider` field and the hand-written fixtures.
+3. **A live smoke run** of `tests/live/` (six calls, a fraction of a cent) to confirm the pin, the routing metadata on a real chat completion and the hand-written fixtures.
 
 ## Alternatives considered
 
-- **The `openai` SDK pointed at OpenRouter.** A new dependency that still would not cover the decisions endpoint, and whose typed responses hide the `provider` field the pin check needs.
+- **The `openai` SDK pointed at OpenRouter.** A new dependency that still would not cover the decisions endpoint, and whose typed responses drop the `openrouter_metadata` object the pin check needs.
 - **The standard library's `urllib` in threads.** No dependency at all, but blocking calls in a thread pool under an async pipeline, with timeouts and connection reuse written by hand.
+- **Trusting the top-level `provider` field.** The first version of this change did. OpenRouter does not document it on chat completions, so the Reviewer asked for the documented routing metadata instead.
+- **Accepting the pinned provider when it is merely among the candidates.** Proves nothing about who served the reply; only the `selected` endpoint does.
 - **Trusting the request alone for the pin.** Rejected: a routing change or a misread option on OpenRouter's side would then send user data elsewhere without anyone noticing.
 - **Deriving the provider's name from its slug.** `google-vertex` answers as "Google" and `mancer` as "Mancer 2", so the name is its own setting.
 - **Failing when the default model hears nothing and the fallback fails.** Rejected for music-only reels, see above.
@@ -101,11 +117,12 @@ OpenRouter's own US routing (`us.openrouter.ai`) is not an option: this model is
 - **SAV-17 (response agent)** uses `text_generator` with tools. A reply's `tool_calls` carry parsed arguments; tool results go back as `tool` messages.
 - **The Compose `api` service does not receive the model variables yet,** because the API calls no model. The ticket that starts a worker or wires a model into the API adds them to `docker-compose.yml`.
 - **Changing the pinned provider** means changing both `TEXT_MODEL_PROVIDER` and `TEXT_MODEL_PROVIDER_NAME`, and recording the new provider's serving-region evidence here. Where a provider serves from can change; re-check it when the pin or the model changes.
-- **`docs/ARCHITECTURE.md` §3.9** still says the provider "is verified with the model clients (SAV-10)" on SAV-7's branch. That sentence can point here once both are merged.
+- **Response caching** on OpenRouter would make every cached text reply fail, because a replay carries no routing metadata. Leave it off for the text model.
+- **`docs/ARCHITECTURE.md` §3.9** says the provider "is verified with the model clients (SAV-10)". This record is that verification so far; the live run is still missing.
 
 ## Still open
 
-1. **Nothing here has run against the real API.** The contracts come from OpenRouter's documentation and SAV-7's reports. In particular, the docs show the `provider` field on decisions responses and streaming chunks, but not on a plain chat completion; if it is absent there, every text call fails with `ProviderPinViolationError` instead of going through unchecked.
+1. **Nothing here has run against the real API.** The contracts come from OpenRouter's documentation and SAV-7's reports. In particular, the router-metadata guide shows its examples on the Responses API, and gives `provider` values as display names ("OpenAI") without listing CoreWeave's. If a real chat completion places or names things differently, every text call fails with `ProviderPinViolationError` instead of going through unchecked; the live smoke run shows which.
 2. **Video input** is sent as a base64 data URL in a `video_url` part. OpenRouter documents that form for the Responses API and says Gemini on Vertex needs base64; SAV-7 sent MP4 files successfully, but its request shape was not kept.
 3. **No retry jitter.** Parallel workers that hit a rate limit together wait the same time. Add it if SAV-14's bulk imports show bursts.
 4. **An account-wide allowed-provider list** on OpenRouter would be a third guard for the pin. It is an account setting, so it is Muhammed's to set.

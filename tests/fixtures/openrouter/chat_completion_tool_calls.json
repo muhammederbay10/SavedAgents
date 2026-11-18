@@ -1,6 +1,5 @@
 {
   "id": "gen-synthetic-0003",
-  "provider": "CoreWeave",
   "model": "deepseek/deepseek-v4.1-flash",
   "object": "chat.completion",
   "created": 1794000001,
@@ -25,5 +24,35 @@
       }
     }
   ],
-  "usage": {"prompt_tokens": 420, "completion_tokens": 31, "total_tokens": 451, "cost": 0.0000748}
+  "usage": {
+    "prompt_tokens": 420,
+    "completion_tokens": 31,
+    "total_tokens": 451,
+    "cost": 7.48e-05
+  },
+  "openrouter_metadata": {
+    "requested": "deepseek/deepseek-v4.1-flash",
+    "strategy": "direct",
+    "region": "iad",
+    "summary": "available=1, selected=CoreWeave",
+    "attempt": 1,
+    "is_byok": false,
+    "endpoints": {
+      "total": 1,
+      "available": [
+        {
+          "provider": "CoreWeave",
+          "model": "deepseek/deepseek-v4.1-flash",
+          "selected": true
+        }
+      ]
+    },
+    "attempts": [
+      {
+        "provider": "CoreWeave",
+        "model": "deepseek/deepseek-v4.1-flash",
+        "status": 200
+      }
+    ]
+  }
 }

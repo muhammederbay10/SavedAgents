@@ -70,9 +70,7 @@ async def test_text_generator_is_pinned_to_the_configured_provider(
 async def test_escalation_generator_uses_its_own_model_and_timeout_without_a_pin(
     clients: ModelClients, server: FakeOpenRouter
 ) -> None:
-    reply = load_fixture("chat_completion_schema.json")
-    reply["provider"] = "Google"
-    server.script(json_response(reply))
+    server.script(json_response(load_fixture("chat_completion_schema.json")))
 
     await clients.escalation_generator.generate(QUESTION)
 

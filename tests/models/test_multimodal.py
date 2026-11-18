@@ -21,8 +21,14 @@ def generator(transport: OpenRouterTransport) -> MultimodalGenerator:
 
 def reply_from(provider: str) -> dict[str, object]:
     body = load_fixture("chat_completion_schema.json")
-    body["provider"] = provider
     body["model"] = ESCALATION_MODEL
+    body["openrouter_metadata"]["requested"] = ESCALATION_MODEL
+    body["openrouter_metadata"]["endpoints"]["available"] = [
+        {"provider": provider, "model": ESCALATION_MODEL, "selected": True}
+    ]
+    body["openrouter_metadata"]["attempts"] = [
+        {"provider": provider, "model": ESCALATION_MODEL, "status": 200}
+    ]
     return body
 
 
@@ -68,3 +74,19 @@ async def test_escalation_model_is_not_pinned_and_accepts_any_provider(connect: 
     assert server.only_request.body["provider"] == {"require_parameters": True}
     assert result.provider == "Google AI Studio"
     assert result.structured == {"category": "cafe", "entities": [{"name": "Example Roasters"}]}
+
+
+async def test_escalation_reply_without_routing_metadata_is_accepted_with_no_provider(
+    connect: Connect,
+) -> None:
+    body = reply_from("Google")
+    del body["openrouter_metadata"]
+    server, transport = connect([json_response(body)])
+
+    result = await generator(transport).generate(
+        GenerationRequest(messages=[Message(role="user", content="a question")])
+    )
+
+    assert server.only_request.routing_metadata_header == "enabled"
+    assert result.provider is None
+    assert result.text
