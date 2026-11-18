@@ -21,6 +21,7 @@ from app.pipeline.fetch import MediaFetcher
 from app.pipeline.indexer import ItemIndexer, PipelineSteps
 from app.pipeline.normalize import Normalizer, VocabularyRules
 from app.pipeline.storage import LocalMediaStore
+from app.pipeline.sweeper import Requeuer, StuckItemSweeper, SweepReport
 from app.pipeline.transcribe import SpeechToText
 from app.types.registry import CONTENT_TYPES
 from tests.database import TEST_EMBEDDING_DIMENSION
@@ -35,6 +36,9 @@ from tests.pipeline.support import (
 SENDER_ID = "1000000000000141"
 RUN_DEADLINE_SECONDS = 30.0
 FAILURE_RECORDING_SECONDS = 10.0
+MAX_TRIES = 3
+STALE_AFTER_SECONDS = 300.0
+SWEEP_BATCH_SIZE = 10
 RULES = VocabularyRules(
     privacy_min_probability=0.9,
     alias_min_probability=0.9,
@@ -45,14 +49,11 @@ RULES = VocabularyRules(
 )
 
 
-class RecordingFinalization:
-    """Records the status jobs a last try asks for, instead of queuing them."""
+class IdleSweeper:
+    """A sweeper for test workers that must not sweep: it finds nothing."""
 
-    def __init__(self) -> None:
-        self.scheduled: list[tuple[uuid.UUID, uuid.UUID]] = []
-
-    async def schedule(self, user_id: uuid.UUID, saved_item_id: uuid.UUID) -> None:
-        self.scheduled.append((user_id, saved_item_id))
+    async def sweep(self) -> SweepReport:
+        return SweepReport()
 
 
 class MemoryPayloads:
@@ -84,7 +85,6 @@ class Pipeline:
     )
     messenger: RecordingMessenger = field(default_factory=RecordingMessenger)
     payloads: MemoryPayloads = field(default_factory=MemoryPayloads)
-    finalization: RecordingFinalization = field(default_factory=RecordingFinalization)
 
     def script(
         self,
@@ -113,7 +113,7 @@ class Pipeline:
         payloads: object | None = None,
         run_deadline_seconds: float = RUN_DEADLINE_SECONDS,
         failure_recording_seconds: float = FAILURE_RECORDING_SECONDS,
-        finalization: object | None = None,
+        max_tries: int = MAX_TRIES,
     ) -> ItemIndexer:
         """Build the indexer; tests may swap in failing sessions or payloads."""
         store = self.store
@@ -158,7 +158,26 @@ class Pipeline:
             alias_min_probability=RULES.alias_min_probability,
             run_deadline_seconds=run_deadline_seconds,
             failure_recording_seconds=failure_recording_seconds,
-            finalization=finalization or self.finalization,  # type: ignore[arg-type]
+            max_tries=max_tries,
+        )
+
+    def sweeper(
+        self,
+        job_queue: Requeuer,
+        *,
+        stale_after_seconds: float = STALE_AFTER_SECONDS,
+        max_tries: int = MAX_TRIES,
+        batch_size: int = SWEEP_BATCH_SIZE,
+        sessions: object | None = None,
+    ) -> StuckItemSweeper:
+        """Build the stuck-item sweeper on the same database and payloads."""
+        return StuckItemSweeper(
+            sessions=sessions or self.sessions,  # type: ignore[arg-type]
+            payloads=self.payloads,
+            job_queue=job_queue,
+            stale_after_seconds=stale_after_seconds,
+            max_tries=max_tries,
+            batch_size=batch_size,
         )
 
 

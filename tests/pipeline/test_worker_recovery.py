@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 from arq.connections import ArqRedis
 from arq.jobs import Job, JobStatus
+from arq.worker import JobExecutionFailed
 from redis.exceptions import ConnectionError as RedisConnectionError
 from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
@@ -34,7 +35,7 @@ from app.ingestion.jobs import (
 from app.models.errors import ModelUnavailableError
 from app.pipeline.indexer import ItemIndexer
 from app.pipeline.worker import WorkerResources, build_worker
-from tests.pipeline.harness import MemoryPayloads, Pipeline, add_item, add_user, load
+from tests.pipeline.harness import IdleSweeper, MemoryPayloads, Pipeline, add_item, add_user, load
 from tests.pipeline.support import (
     capture_event,
     open_extraction,
@@ -78,12 +79,13 @@ async def no_close() -> None:
     return None
 
 
-def startup_with(
-    indexer: ItemIndexer, max_tries: int
-) -> Callable[[dict[str, Any]], Awaitable[None]]:
+def startup_with(indexer: ItemIndexer) -> Callable[[dict[str, Any]], Awaitable[None]]:
     async def startup(ctx: dict[str, Any]) -> None:
         ctx["indexing_resources"] = WorkerResources(
-            indexer=indexer, max_tries=max_tries, retry_delay_seconds=0.01, close=no_close
+            indexer=indexer,
+            sweeper=IdleSweeper(),  # type: ignore[arg-type]
+            retry_delay_seconds=0.01,
+            close=no_close,
         )
 
     return startup
@@ -107,7 +109,7 @@ async def run_worker(
     worker = build_worker(
         settings,
         worker_settings,
-        on_startup=startup_with(indexer, max_tries),
+        on_startup=startup_with(indexer),
         redis_pool=redis,
         burst=True,
     )
@@ -273,7 +275,7 @@ async def test_a_database_failure_at_start_is_retried_and_keeps_finished_steps(
     await run_worker(
         settings,
         ingestion_redis,
-        pipeline.indexer(sessions=sessions, payloads=payloads),
+        pipeline.indexer(sessions=sessions, payloads=payloads, max_tries=4),
         max_tries=4,
     )
 
@@ -286,7 +288,7 @@ async def test_a_database_failure_at_start_is_retried_and_keeps_finished_steps(
     assert len(pipeline.primary_stt.calls) == 1
 
 
-async def test_a_start_failure_on_the_last_try_marks_the_item_failed(
+async def test_a_start_that_keeps_failing_leaves_the_item_unfinished_for_the_sweeper(
     pipeline: Pipeline, settings: Settings, ingestion_redis: ArqRedis, job_queue: ArqJobQueue
 ) -> None:
     user_id = await add_user(pipeline.sessions)
@@ -302,8 +304,13 @@ async def test_a_start_failure_on_the_last_try_marks_the_item_failed(
         settings, ingestion_redis, pipeline.indexer(payloads=BrokenPayloads()), max_tries=2
     )
 
-    assert await result_of(ingestion_redis, item_id) == "failed"
-    assert (await load(pipeline.sessions, item_id)).status == ItemStatus.FAILED
+    # arq gave up on the job; no run started, so no try was spent. The item is
+    # still unfinished in Postgres, where the stuck-item sweeper finds it.
+    with pytest.raises(JobExecutionFailed, match="retries exceeded"):
+        await result_of(ingestion_redis, item_id)
+    item = await load(pipeline.sessions, item_id)
+    assert item.status in {ItemStatus.PENDING, ItemStatus.ENRICHING}
+    assert item.indexing_attempts == 0
 
 
 # --- Blocker 3: the deadline is handled inside the job ---------------------------
@@ -352,7 +359,7 @@ async def test_a_run_past_its_deadline_on_the_last_try_marks_the_item_failed(
     await run_worker(
         settings,
         ingestion_redis,
-        pipeline.indexer(run_deadline_seconds=DEADLINE_SECONDS),
+        pipeline.indexer(run_deadline_seconds=DEADLINE_SECONDS, max_tries=2),
         max_tries=2,
         run_deadline_seconds=DEADLINE_SECONDS,
         job_timeout_seconds=JOB_TIMEOUT_SECONDS,

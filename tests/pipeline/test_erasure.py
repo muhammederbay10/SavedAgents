@@ -24,7 +24,7 @@ async def test_deleting_a_user_removes_their_media_step_outputs_and_counts(
     )
     leaving, staying = await add_user(session_factory), await add_user(session_factory)
     item_id = await add_item(session_factory, pipeline, capture_event(leaving))
-    await pipeline.indexer().index(leaving, item_id, last_try=False)
+    await pipeline.indexer().index(leaving, item_id)
     other_media = await pipeline.store.put(staying, item_id, "video.mp4", b"other user's video")
     assert (tmp_path / "media" / str(leaving)).exists()
 

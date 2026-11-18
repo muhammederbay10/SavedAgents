@@ -12,18 +12,23 @@ more slots. The providers' rate limits set the real ceiling.
 
 **Retries.** A step that fails in a way that may pass later raises
 `RetryLaterError`; the job is tried again after a growing wait, up to
-`INDEXING_MAX_TRIES` runs. The last run marks the item `failed`, and first
-queues `finalize_saved_item`, an ids-only job that writes that status again
-until it is saved, so a database that is locked or down at that moment can't
-leave the item unfinished. Each run continues after the steps that already
-finished (`app.pipeline.indexer`).
-Reading the payload and the item at the start is retried the same way.
+`INDEXING_MAX_TRIES` runs of the item in all, counted in Postgres
+(`saved_item.indexing_attempts`) across requeues. The last run marks the item
+`failed` as well as it can within its recording deadline. Each run continues
+after the steps that already finished (`app.pipeline.indexer`). Reading the
+payload and the item at the start is retried the same way.
+
+**The stuck-item sweeper.** An arq cron in this worker runs
+`app.pipeline.sweeper` every `INDEXING_SWEEP_INTERVAL_SECONDS`. It repairs, from
+Postgres, any unfinished item that no job has worked on for
+`INDEXING_STALE_AFTER_SECONDS`: it queues it again, or marks it `failed`.
 
 **One budget per run.** `INDEXING_RUN_DEADLINE_SECONDS` starts before the
 payload is read and covers the start and every step; a run that passes it
 stops itself, records where it was, and is tried again. Recording a failure
-then has `INDEXING_FAILURE_RECORDING_SECONDS`. arq's own limit,
-`INDEXING_JOB_TIMEOUT_SECONDS`, is longer than both together and only a
+then has `INDEXING_FAILURE_RECORDING_SECONDS`, and `INDEXING_CLEANUP_RESERVE_SECONDS`
+is kept free for stopping a media tool and rolling back. arq's own limit,
+`INDEXING_JOB_TIMEOUT_SECONDS`, is longer than the three together and only a
 backstop.
 
 The job's arguments are ids, and its result is the outcome's name, so neither
@@ -41,12 +46,14 @@ from typing import Any, Final
 import httpx
 from arq import Retry
 from arq.connections import ArqRedis, RedisSettings
+from arq.cron import cron
 from arq.typing import StartupShutdown
 from arq.worker import Worker, func
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.agent.messenger import InstagramMessenger
 from app.config import (
+    SECONDS_PER_MINUTE,
     PipelineSettings,
     Settings,
     get_messenger_settings,
@@ -55,14 +62,7 @@ from app.config import (
     get_settings,
 )
 from app.db.session import create_engine, create_session_factory
-from app.ingestion.jobs import (
-    FINALIZE_SAVED_ITEM_JOB,
-    INDEX_SAVED_ITEM_JOB,
-    INDEXING_QUEUE,
-    ArqJobQueue,
-    JobQueue,
-    finalize_job_id,
-)
+from app.ingestion.jobs import INDEX_SAVED_ITEM_JOB, INDEXING_QUEUE, ArqJobQueue
 from app.logging_config import configure_logging
 from app.models.factory import build_model_clients, open_http_client
 from app.pipeline.classify import PostClassifier
@@ -70,17 +70,13 @@ from app.pipeline.confirm import SaveConfirmer
 from app.pipeline.embed import ItemEmbedder
 from app.pipeline.extract import Extractor
 from app.pipeline.fetch import MediaFetcher
-from app.pipeline.indexer import (
-    FinalizationScheduler,
-    ItemIndexer,
-    PipelineSteps,
-    RetryLaterError,
-)
+from app.pipeline.indexer import ItemIndexer, PipelineSteps, RetryLaterError
 from app.pipeline.media import FfmpegMediaTools
 from app.pipeline.normalize import Normalizer, VocabularyRules
 from app.pipeline.payloads import CapturePayloads
 from app.pipeline.prompts import PIPELINE_PROMPTS
 from app.pipeline.storage import LocalMediaStore
+from app.pipeline.sweeper import StuckItemSweeper
 from app.pipeline.transcribe import SpeechToText
 from app.types.registry import CONTENT_TYPES
 
@@ -90,6 +86,7 @@ _RESOURCES: Final = "indexing_resources"
 _JOB_TRY: Final = "job_try"
 # arq's context key for its own Redis client, which also holds ingestion's state.
 _REDIS: Final = "redis"
+SWEEP_STUCK_ITEMS_JOB: Final = "sweep_stuck_items"
 
 # arq hands every job a context dictionary of its own making; its values are
 # of any type, so it cannot be typed more narrowly.
@@ -102,85 +99,44 @@ class WorkerResources:
 
     Attributes:
         indexer: Indexes one item.
-        max_tries: `INDEXING_MAX_TRIES`.
+        sweeper: Repairs stuck items.
         retry_delay_seconds: `INDEXING_RETRY_DELAY_SECONDS`.
         close: Closes the HTTP clients and the database engine.
     """
 
     indexer: ItemIndexer
-    max_tries: int
+    sweeper: StuckItemSweeper
     retry_delay_seconds: float
     close: Callable[[], Awaitable[None]]
 
 
-# The status job runs until the status is saved or the item is gone; arq needs a
-# number, so this one is never reached in practice.
-_UNTIL_SAVED: Final = 2**31 - 1
-
-
-class ArqFinalizationScheduler(FinalizationScheduler):
-    """Queues the ids-only job that saves an item's `failed` status, on the indexing queue.
-
-    The job lives in Redis, so it outlives the job that queued it and the
-    worker that ran it. "Delete my data" removes it with the user's other jobs.
-    """
-
-    def __init__(self, job_queue: JobQueue, *, defer_seconds: float) -> None:
-        """Create the scheduler.
-
-        Args:
-            job_queue: The queue to put the job on.
-            defer_seconds: How long the job waits before its first run.
-        """
-        self._job_queue = job_queue
-        self._defer_seconds = defer_seconds
-
-    async def schedule(self, user_id: uuid.UUID, saved_item_id: uuid.UUID) -> None:
-        """Queue the status job, unless one is already queued for the item.
-
-        Args:
-            user_id: The item's owner.
-            saved_item_id: The item.
-
-        Raises:
-            redis.exceptions.RedisError: If Redis cannot be reached.
-        """
-        await self._job_queue.enqueue(
-            FINALIZE_SAVED_ITEM_JOB,
-            finalize_job_id(saved_item_id),
-            {"user_id": str(user_id), "saved_item_id": str(saved_item_id)},
-            defer_seconds=self._defer_seconds,
-        )
-
-
-async def finalize_saved_item(ctx: JobContext, *, user_id: str, saved_item_id: str) -> str:
-    """Save the `failed` status a last indexing try could not save; ids only.
-
-    It runs again, after `INDEXING_RETRY_DELAY_SECONDS` times its try number
-    (capped at `INDEXING_MAX_TRIES` times), until the status is saved, is
-    already final, or the item or its user is gone.
+async def sweep_stuck_items(ctx: JobContext) -> dict[str, int]:
+    """Requeue or fail the items no job is working on any more; the sweeper's cron job.
 
     Args:
         ctx: arq's job context.
-        user_id: The item's owner, as text.
-        saved_item_id: The item, as text.
 
     Returns:
-        The outcome's name, e.g. `finalized`.
-
-    Raises:
-        arq.Retry: If the status could not be written yet.
+        How many items were requeued, failed or skipped; counts only.
     """
     resources: WorkerResources = ctx[_RESOURCES]
-    job_try: int = ctx[_JOB_TRY]
-    try:
-        outcome = await resources.indexer.finalize_failed(
-            uuid.UUID(user_id), uuid.UUID(saved_item_id)
-        )
-    except RetryLaterError as error:
-        delay = resources.retry_delay_seconds * min(job_try, resources.max_tries)
-        raise Retry(defer=delay) from error
-    return outcome.value
+    report = await resources.sweeper.sweep()
+    return report.as_log()
+
+
+def sweep_schedule(interval_seconds: int) -> tuple[set[int] | None, set[int]]:
+    """Turn the sweep interval into the minutes and seconds an arq cron runs at.
+
+    Args:
+        interval_seconds: `INDEXING_SWEEP_INTERVAL_SECONDS`; the settings check
+            that it divides a minute, or is whole minutes that divide an hour.
+
+    Returns:
+        The minutes (`None` for every minute) and the seconds to run at.
+    """
+    if interval_seconds < SECONDS_PER_MINUTE:
+        return None, set(range(0, SECONDS_PER_MINUTE, interval_seconds))
+    return set(range(0, SECONDS_PER_MINUTE, interval_seconds // SECONDS_PER_MINUTE)), {0}
 
 
 async def index_saved_item(ctx: JobContext, *, user_id: str, saved_item_id: str) -> str:
@@ -195,17 +151,13 @@ async def index_saved_item(ctx: JobContext, *, user_id: str, saved_item_id: str)
         The outcome's name, e.g. `indexed`.
 
     Raises:
-        arq.Retry: If a step failed in a way that may pass later, and this was
-            not the last try.
+        arq.Retry: If a step failed in a way that may pass later, and the item
+            has tries left.
     """
     resources: WorkerResources = ctx[_RESOURCES]
     job_try: int = ctx[_JOB_TRY]
     try:
-        outcome = await resources.indexer.index(
-            uuid.UUID(user_id),
-            uuid.UUID(saved_item_id),
-            last_try=job_try >= resources.max_tries,
-        )
+        outcome = await resources.indexer.index(uuid.UUID(user_id), uuid.UUID(saved_item_id))
     except RetryLaterError as error:
         raise Retry(defer=resources.retry_delay_seconds * job_try) from error
     return outcome.value
@@ -294,12 +246,16 @@ async def start_worker(ctx: JobContext) -> None:
             alias_min_probability=rules.alias_min_probability,
             run_deadline_seconds=pipeline_settings.indexing_run_deadline_seconds,
             failure_recording_seconds=pipeline_settings.indexing_failure_recording_seconds,
-            finalization=ArqFinalizationScheduler(
-                ArqJobQueue(ctx[_REDIS]),
-                defer_seconds=pipeline_settings.indexing_retry_delay_seconds,
-            ),
+            max_tries=pipeline_settings.indexing_max_tries,
         ),
-        max_tries=pipeline_settings.indexing_max_tries,
+        sweeper=StuckItemSweeper(
+            sessions=sessions,
+            payloads=CapturePayloads(ctx[_REDIS]),
+            job_queue=ArqJobQueue(ctx[_REDIS]),
+            stale_after_seconds=pipeline_settings.indexing_stale_after_seconds,
+            max_tries=pipeline_settings.indexing_max_tries,
+            batch_size=pipeline_settings.indexing_sweep_batch_size,
+        ),
         retry_delay_seconds=pipeline_settings.indexing_retry_delay_seconds,
         close=partial(_close, engine, (model_http, media_http, messenger_http)),
     )
@@ -331,7 +287,8 @@ def build_worker(
 ) -> Worker:
     """Create the arq worker for indexing jobs.
 
-    It reads only `INDEXING_QUEUE`, so it never takes a chat job.
+    It reads only `INDEXING_QUEUE`, so it never takes a chat job, and runs
+    the stuck-item sweeper every `INDEXING_SWEEP_INTERVAL_SECONDS`.
 
     Args:
         settings: The app's settings, for the Redis URL.
@@ -343,6 +300,7 @@ def build_worker(
     Returns:
         The worker. `run()` starts it.
     """
+    minutes, seconds = sweep_schedule(pipeline_settings.indexing_sweep_interval_seconds)
     return Worker(
         functions=[
             func(
@@ -350,13 +308,15 @@ def build_worker(
                 name=INDEX_SAVED_ITEM_JOB,
                 max_tries=pipeline_settings.indexing_max_tries,
             ),
-            # No result is kept, so a later failure of the same item can queue it again.
-            func(
-                finalize_saved_item,
-                name=FINALIZE_SAVED_ITEM_JOB,
-                max_tries=_UNTIL_SAVED,
-                keep_result=0,
-            ),
+        ],
+        cron_jobs=[
+            cron(
+                sweep_stuck_items,
+                name=SWEEP_STUCK_ITEMS_JOB,
+                minute=minutes,
+                second=seconds,
+                run_at_startup=True,
+            )
         ],
         queue_name=INDEXING_QUEUE,
         redis_settings=RedisSettings.from_dsn(str(settings.redis_url)),
@@ -366,8 +326,8 @@ def build_worker(
         on_shutdown=stop_worker,
         max_jobs=pipeline_settings.indexing_concurrency,
         # The run stops itself at INDEXING_RUN_DEADLINE_SECONDS and records where
-        # within INDEXING_FAILURE_RECORDING_SECONDS; this outer limit, longer than
-        # both, is only a backstop.
+        # within INDEXING_FAILURE_RECORDING_SECONDS, with INDEXING_CLEANUP_RESERVE_SECONDS
+        # to spare; this outer limit, longer than all three, is only a backstop.
         job_timeout=pipeline_settings.indexing_job_timeout_seconds,
         max_tries=pipeline_settings.indexing_max_tries,
     )

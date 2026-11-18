@@ -285,16 +285,38 @@ class FfmpegMediaTools(MediaTools):
         try:
             output, _ = await asyncio.wait_for(process.communicate(), self._timeout_seconds)
         except TimeoutError as error:
-            await self._stop(process, name)
+            await self._stop_even_if_cancelled(process, name)
             raise MediaToolError(f"{name} took longer than {self._timeout_seconds} s") from error
         except asyncio.CancelledError:
             # The run's deadline, or the worker shutting down. The program must
             # not keep running next to the next try, so it is stopped first.
-            await self._stop(process, name)
+            await self._stop_even_if_cancelled(process, name)
             raise
         if process.returncode != 0:
             raise MediaToolError(f"{name} failed with exit code {process.returncode}")
         return output
+
+    async def _stop_even_if_cancelled(self, process: asyncio.subprocess.Process, name: str) -> None:
+        """Stop and reap the child, finishing even if a cancellation arrives meanwhile.
+
+        Stopping is bounded (`_stop`), so it is shielded and waited for to the
+        end, also when the run's deadline cancels this task during it, for
+        example while a timed-out tool is still being stopped. A cancellation
+        that arrived is raised again once the child is reaped.
+
+        Raises:
+            asyncio.CancelledError: If the task was cancelled while stopping.
+        """
+        stopping = asyncio.ensure_future(self._stop(process, name))
+        cancelled = False
+        while not stopping.done():
+            try:
+                await asyncio.shield(stopping)
+            except asyncio.CancelledError:
+                cancelled = True
+        stopping.result()
+        if cancelled:
+            raise asyncio.CancelledError
 
     async def _stop(self, process: asyncio.subprocess.Process, name: str) -> None:
         """Stop this exact child and reap it, within a bounded time.

@@ -34,7 +34,7 @@ async def index_place(pipeline: Pipeline, user_id: uuid.UUID, cuisine: str) -> u
         extractions=[structured_reply(place_extraction(("Synthetic Place", cuisine)))],
     )
     item_id = await add_item(pipeline.sessions, pipeline, capture_event(user_id))
-    await pipeline.indexer().index(user_id, item_id, last_try=False)
+    await pipeline.indexer().index(user_id, item_id)
     return item_id
 
 

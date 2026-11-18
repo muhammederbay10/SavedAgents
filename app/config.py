@@ -24,6 +24,9 @@ LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 # pgvector cannot build an HNSW index on a `vector` column with more dimensions.
 MAX_EMBEDDING_DIMENSION = 2000
 
+SECONDS_PER_MINUTE = 60
+SECONDS_PER_HOUR = 3600
+
 # Instagram accepts a reply only this long after the user's last message
 # (Instagram "Messaging API" page). A setting can shorten the window, never widen it.
 MAX_INSTAGRAM_REPLY_WINDOW_HOURS = 24.0
@@ -367,10 +370,23 @@ class PipelineSettings(BaseSettings):
             take after the run stopped (`INDEXING_FAILURE_RECORDING_SECONDS`).
             If the database doesn't answer in time, the failure is logged and
             not recorded, and the job still ends itself.
+        indexing_cleanup_reserve_seconds: Time kept free inside arq's limit for
+            clean-up after a run is stopped (`INDEXING_CLEANUP_RESERVE_SECONDS`):
+            stopping and reaping a media tool, rolling back a transaction. It
+            must cover a media tool's stop (twice `MEDIA_TOOL_STOP_TIMEOUT_SECONDS`).
         indexing_job_timeout_seconds: arq's own limit on one run of one job
             (`INDEXING_JOB_TIMEOUT_SECONDS`), a backstop that cancels the job
-            without a retry. It must be longer than the run deadline plus the
-            recording allowance.
+            without a retry. It must be longer than the run deadline, the
+            recording allowance and the clean-up reserve together.
+        indexing_sweep_interval_seconds: How often the stuck-item sweeper runs
+            (`INDEXING_SWEEP_INTERVAL_SECONDS`). It runs as an arq cron, so the
+            interval must divide a minute, or be whole minutes that divide an hour.
+        indexing_stale_after_seconds: An unfinished item counts as stuck when
+            no job or sweep has worked on it for this long
+            (`INDEXING_STALE_AFTER_SECONDS`). It must be longer than the longest
+            a live job can stay silent: a whole run plus every retry wait.
+        indexing_sweep_batch_size: The most stuck items one sweep handles
+            (`INDEXING_SWEEP_BATCH_SIZE`); the next sweep takes the rest.
     """
 
     model_config = SettingsConfigDict(
@@ -407,15 +423,53 @@ class PipelineSettings(BaseSettings):
     indexing_retry_delay_seconds: float = Field(gt=0, allow_inf_nan=False)
     indexing_run_deadline_seconds: float = Field(gt=0, allow_inf_nan=False)
     indexing_failure_recording_seconds: float = Field(gt=0, allow_inf_nan=False)
+    indexing_cleanup_reserve_seconds: float = Field(gt=0, allow_inf_nan=False)
     indexing_job_timeout_seconds: float = Field(gt=0, allow_inf_nan=False)
+    indexing_sweep_interval_seconds: int = Field(gt=0)
+    indexing_stale_after_seconds: float = Field(gt=0, allow_inf_nan=False)
+    indexing_sweep_batch_size: int = Field(gt=0)
 
     @model_validator(mode="after")
     def _the_run_ends_itself_before_arq_does(self) -> Self:
-        own_budget = self.indexing_run_deadline_seconds + self.indexing_failure_recording_seconds
+        own_budget = (
+            self.indexing_run_deadline_seconds
+            + self.indexing_failure_recording_seconds
+            + self.indexing_cleanup_reserve_seconds
+        )
         if self.indexing_job_timeout_seconds <= own_budget:
             raise ValueError(
-                "indexing_job_timeout_seconds must be longer than "
-                "indexing_run_deadline_seconds plus indexing_failure_recording_seconds"
+                "indexing_job_timeout_seconds must be longer than indexing_run_deadline_seconds "
+                "plus indexing_failure_recording_seconds plus indexing_cleanup_reserve_seconds"
+            )
+        if self.indexing_cleanup_reserve_seconds < 2 * self.media_tool_stop_timeout_seconds:
+            raise ValueError(
+                "indexing_cleanup_reserve_seconds must be at least twice "
+                "media_tool_stop_timeout_seconds"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _the_sweeper_never_touches_a_live_job(self) -> Self:
+        longest_silence = (
+            self.indexing_job_timeout_seconds
+            + self.indexing_retry_delay_seconds * self.indexing_max_tries
+        )
+        if self.indexing_stale_after_seconds <= longest_silence:
+            raise ValueError(
+                "indexing_stale_after_seconds must be longer than indexing_job_timeout_seconds "
+                "plus indexing_retry_delay_seconds times indexing_max_tries"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _the_sweep_interval_fits_a_cron(self) -> Self:
+        interval = self.indexing_sweep_interval_seconds
+        fits_a_minute = interval < SECONDS_PER_MINUTE and SECONDS_PER_MINUTE % interval == 0
+        fits_an_hour = interval % SECONDS_PER_MINUTE == 0 and SECONDS_PER_HOUR % interval == 0
+        if not (fits_a_minute or fits_an_hour):
+            raise ValueError(
+                "indexing_sweep_interval_seconds must divide a minute, "
+                "or be whole minutes that divide an hour"
             )
         return self
 

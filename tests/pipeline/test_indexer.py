@@ -5,11 +5,11 @@ Every caption, transcript and name is synthetic.
 """
 
 import logging
-import uuid
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.db.models import EnrichmentRun, ItemStatus, SavedItem, Vocabulary
@@ -17,7 +17,7 @@ from app.logging_config import configure_logging
 from app.models.base import TranscriptionAttempt, YesNoAnswer
 from app.models.errors import ModelUnavailableError
 from app.pipeline.classify import NONE_OF_THESE
-from app.pipeline.indexer import FinalizeOutcome, IndexOutcome, RetryLaterError
+from app.pipeline.indexer import IndexOutcome, RetryLaterError
 from app.pipeline.media import MediaProbe
 from app.pipeline.runs import Step
 from app.types.registry import UnknownContentTypeError
@@ -81,7 +81,7 @@ async def test_a_place_reel_is_fetched_transcribed_extracted_and_normalized(
         collection="Food",
     )
 
-    outcome = await pipeline.indexer().index(user_id, item_id, last_try=False)
+    outcome = await pipeline.indexer().index(user_id, item_id)
 
     assert outcome is IndexOutcome.INDEXED
     item = await load(pipeline.sessions, item_id)
@@ -118,7 +118,7 @@ async def test_a_movie_list_post_keeps_every_movie_and_skips_speech_to_text(
         pipeline.sessions, pipeline, capture_event(user_id, caption="3 films", media_type="post")
     )
 
-    await pipeline.indexer().index(user_id, item_id, last_try=False)
+    await pipeline.indexer().index(user_id, item_id)
 
     item = await load(pipeline.sessions, item_id)
     assert [entity["title"] for entity in item.fields["entities"]] == [
@@ -155,7 +155,7 @@ async def test_a_silent_reel_skips_speech_to_text_and_escalates_to_the_video_mod
     item_id = await add_item(pipeline.sessions, pipeline, capture_event(user_id))
     caplog.set_level(logging.INFO, logger="app.pipeline")
 
-    await pipeline.indexer().index(user_id, item_id, last_try=False)
+    await pipeline.indexer().index(user_id, item_id)
 
     item = await load(pipeline.sessions, item_id)
     assert item.transcript is None
@@ -191,7 +191,7 @@ async def test_every_audio_track_is_transcribed_even_if_the_caption_names_the_pl
         pipeline.sessions, pipeline, capture_event(user_id, caption="Kronotrop Bebek ☕️")
     )
 
-    await pipeline.indexer().index(user_id, item_id, last_try=False)
+    await pipeline.indexer().index(user_id, item_id)
 
     assert len(pipeline.primary_stt.calls) == 1
     assert len(pipeline.fallback_stt.calls) == 1
@@ -211,7 +211,7 @@ async def test_a_study_video_keeps_its_open_subject_and_is_not_escalated(
     user_id = await add_user(pipeline.sessions)
     item_id = await add_item(pipeline.sessions, pipeline, capture_event(user_id))
 
-    await pipeline.indexer().index(user_id, item_id, last_try=False)
+    await pipeline.indexer().index(user_id, item_id)
 
     item = await load(pipeline.sessions, item_id)
     assert item.type == "study"
@@ -232,7 +232,7 @@ async def test_a_post_with_no_built_in_type_keeps_its_open_category_and_is_confi
     user_id = await add_user(pipeline.sessions)
     item_id = await add_item(pipeline.sessions, pipeline, capture_event(user_id))
 
-    await pipeline.indexer().index(user_id, item_id, last_try=False)
+    await pipeline.indexer().index(user_id, item_id)
 
     item = await load(pipeline.sessions, item_id)
     assert item.type is None
@@ -257,7 +257,7 @@ async def test_a_failed_step_is_tried_again_without_repeating_the_finished_steps
     indexer = pipeline.indexer()
 
     with pytest.raises(RetryLaterError) as raised:
-        await indexer.index(user_id, item_id, last_try=False)
+        await indexer.index(user_id, item_id)
 
     assert raised.value.step is Step.EXTRACT
     first_try = await runs_of(pipeline, item_id)
@@ -265,7 +265,7 @@ async def test_a_failed_step_is_tried_again_without_repeating_the_finished_steps
     assert "ModelUnavailableError" in str(first_try["extract"].error)
     assert (await load(pipeline.sessions, item_id)).status == ItemStatus.ENRICHING
 
-    assert await indexer.index(user_id, item_id, last_try=True) is IndexOutcome.INDEXED
+    assert await indexer.index(user_id, item_id) is IndexOutcome.INDEXED
 
     assert pipeline.media_server.requests == 1
     assert pipeline.classifier.asked_keys().count("content_type") == 1
@@ -280,7 +280,7 @@ async def test_a_failure_on_the_last_try_marks_the_item_failed(pipeline: Pipelin
     user_id = await add_user(pipeline.sessions)
     item_id = await add_item(pipeline.sessions, pipeline, capture_event(user_id))
 
-    outcome = await pipeline.indexer().index(user_id, item_id, last_try=True)
+    outcome = await pipeline.indexer(max_tries=1).index(user_id, item_id)
 
     assert outcome is IndexOutcome.FAILED
     assert (await load(pipeline.sessions, item_id)).status == ItemStatus.FAILED
@@ -299,7 +299,7 @@ async def test_no_words_then_a_fallback_error_is_tried_again_not_saved_as_silenc
     item_id = await add_item(pipeline.sessions, pipeline, capture_event(user_id))
 
     with pytest.raises(RetryLaterError):
-        await pipeline.indexer().index(user_id, item_id, last_try=False)
+        await pipeline.indexer().index(user_id, item_id)
 
     runs = await runs_of(pipeline, item_id)
     assert runs["transcribe"].status == "failed"
@@ -313,7 +313,7 @@ async def test_a_dm_reel_without_a_video_is_indexed_from_its_caption(pipeline: P
     event = capture_event(user_id, media_url=None, caption="Bu filmi izleyin")
     item_id = await add_item(pipeline.sessions, pipeline, event)
 
-    await pipeline.indexer().index(user_id, item_id, last_try=False)
+    await pipeline.indexer().index(user_id, item_id)
 
     assert pipeline.media_server.requests == 0
     assert pipeline.escalation_model.requests == []
@@ -327,7 +327,7 @@ async def test_an_item_with_no_media_and_no_caption_fails(pipeline: Pipeline) ->
     user_id = await add_user(pipeline.sessions)
     item_id = await add_item(pipeline.sessions, pipeline, capture_event(user_id, media_url=None))
 
-    outcome = await pipeline.indexer().index(user_id, item_id, last_try=False)
+    outcome = await pipeline.indexer().index(user_id, item_id)
 
     assert outcome is IndexOutcome.FAILED
     assert pipeline.classifier.calls == []
@@ -344,7 +344,7 @@ async def test_a_user_without_a_known_language_is_confirmed_in_english(
     user_id = await add_user(pipeline.sessions, language=None)
     item_id = await add_item(pipeline.sessions, pipeline, capture_event(user_id))
 
-    await pipeline.indexer().index(user_id, item_id, last_try=False)
+    await pipeline.indexer().index(user_id, item_id)
 
     assert [text for _, text in pipeline.messenger.sent] == ["Saved as car review"]
     runs = await runs_of(pipeline, item_id)
@@ -364,7 +364,7 @@ async def test_a_job_without_a_payload_stops_because_the_user_was_deleted(
     item_id = await add_item(pipeline.sessions, pipeline, capture_event(user_id))
     del pipeline.payloads.events[item_id]
 
-    assert await pipeline.indexer().index(user_id, item_id, last_try=False) is IndexOutcome.GONE
+    assert await pipeline.indexer().index(user_id, item_id) is IndexOutcome.GONE
     assert pipeline.media_server.requests == 0
 
 
@@ -376,7 +376,7 @@ async def test_an_item_that_is_already_done_is_not_indexed_again(pipeline: Pipel
         assert item is not None
         item.status = ItemStatus.DONE
 
-    outcome = await pipeline.indexer().index(user_id, item_id, last_try=False)
+    outcome = await pipeline.indexer().index(user_id, item_id)
 
     assert outcome is IndexOutcome.NOT_PENDING
     assert pipeline.media_server.requests == 0
@@ -395,7 +395,7 @@ async def test_logs_and_step_outputs_never_hold_the_media_link(
     configure_logging("DEBUG")
     caplog.set_level(logging.DEBUG)
 
-    await pipeline.indexer().index(user_id, item_id, last_try=False)
+    await pipeline.indexer().index(user_id, item_id)
 
     logged = " ".join(f"{record.getMessage()} {record.__dict__}" for record in caplog.records)
     assert "synthetic private" not in logged
@@ -415,65 +415,49 @@ async def test_an_unexpected_error_marks_the_item_failed_and_is_raised(pipeline:
     item_id = await add_item(pipeline.sessions, pipeline, capture_event(user_id, caption="x"))
 
     with pytest.raises(UnknownContentTypeError):
-        await pipeline.indexer().index(user_id, item_id, last_try=False)
+        await pipeline.indexer().index(user_id, item_id)
 
     assert (await load(pipeline.sessions, item_id)).status == ItemStatus.FAILED
 
 
-async def test_a_last_try_failure_queues_the_durable_status_job(pipeline: Pipeline) -> None:
-    failure = ModelUnavailableError("synthetic outage", operation="transcribe", model="fake/mai")
-    pipeline.script(transcripts=[failure], fallback_transcripts=[failure])
-    user_id = await add_user(pipeline.sessions)
-    item_id = await add_item(pipeline.sessions, pipeline, capture_event(user_id))
-
-    await pipeline.indexer().index(user_id, item_id, last_try=True)
-
-    assert pipeline.finalization.scheduled == [(user_id, item_id)]
-
-
-async def test_a_retry_that_is_not_the_last_queues_no_status_job(pipeline: Pipeline) -> None:
-    failure = ModelUnavailableError("synthetic outage", operation="transcribe", model="fake/mai")
-    pipeline.script(transcripts=[failure], fallback_transcripts=[failure])
-    user_id = await add_user(pipeline.sessions)
-    item_id = await add_item(pipeline.sessions, pipeline, capture_event(user_id))
-
-    with pytest.raises(RetryLaterError):
-        await pipeline.indexer().index(user_id, item_id, last_try=False)
-
-    assert pipeline.finalization.scheduled == []
-
-
-@pytest.mark.parametrize(
-    ("status", "outcome", "final_status"),
-    [
-        (ItemStatus.PENDING, FinalizeOutcome.FINALIZED, ItemStatus.FAILED),
-        (ItemStatus.ENRICHING, FinalizeOutcome.FINALIZED, ItemStatus.FAILED),
-        (ItemStatus.DONE, FinalizeOutcome.ALREADY_FINAL, ItemStatus.DONE),
-        (ItemStatus.FAILED, FinalizeOutcome.ALREADY_FINAL, ItemStatus.FAILED),
-    ],
-)
-async def test_the_status_job_writes_failed_only_over_an_unfinished_status(
-    pipeline: Pipeline, status: ItemStatus, outcome: FinalizeOutcome, final_status: ItemStatus
+async def test_every_run_counts_against_the_items_tries_and_the_last_marks_it_failed(
+    pipeline: Pipeline,
 ) -> None:
+    failure = ModelUnavailableError("synthetic outage", operation="transcribe", model="fake/mai")
+    pipeline.script(transcripts=[failure] * 3, fallback_transcripts=[failure] * 3)
+    user_id = await add_user(pipeline.sessions)
+    item_id = await add_item(pipeline.sessions, pipeline, capture_event(user_id))
+
+    # A new indexer each run, as after a requeue: the count lives on the item.
+    for _ in range(2):
+        with pytest.raises(RetryLaterError):
+            await pipeline.indexer(max_tries=3).index(user_id, item_id)
+    outcome = await pipeline.indexer(max_tries=3).index(user_id, item_id)
+
+    item = await load(pipeline.sessions, item_id)
+    assert outcome is IndexOutcome.FAILED
+    assert item.indexing_attempts == 3
+    assert item.status == ItemStatus.FAILED
+
+
+async def test_a_run_marks_the_item_as_worked_on(pipeline: Pipeline) -> None:
     user_id = await add_user(pipeline.sessions)
     item_id = await add_item(pipeline.sessions, pipeline, capture_event(user_id))
     async with pipeline.sessions() as session, session.begin():
-        item = await session.get(SavedItem, item_id)
-        assert item is not None
-        item.status = status
-
-    assert await pipeline.indexer().finalize_failed(user_id, item_id) is outcome
-
-    assert (await load(pipeline.sessions, item_id)).status == final_status
-    assert pipeline.classifier.calls == [] and pipeline.text_model.requests == []
-
-
-async def test_the_status_job_ends_when_the_item_is_gone(pipeline: Pipeline) -> None:
-    user_id = await add_user(pipeline.sessions)
-
-    outcome = await pipeline.indexer().finalize_failed(user_id, uuid.uuid4())
-
-    assert outcome is FinalizeOutcome.GONE
-    assert await pipeline.indexer().finalize_failed(uuid.uuid4(), uuid.uuid4()) is (
-        FinalizeOutcome.GONE
+        await session.execute(
+            update(SavedItem)
+            .where(SavedItem.id == item_id)
+            .values(indexing_updated_at=func.now() - timedelta(days=2))
+        )
+    pipeline.script(
+        transcripts=[transcript("synthetic speech")],
+        extractions=[structured_reply(open_extraction())],
     )
+
+    await pipeline.indexer().index(user_id, item_id)
+
+    async with pipeline.sessions() as session:
+        age = await session.scalar(
+            select(func.now() - SavedItem.indexing_updated_at).where(SavedItem.id == item_id)
+        )
+    assert age is not None and age < timedelta(minutes=1)

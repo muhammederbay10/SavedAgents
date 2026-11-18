@@ -28,7 +28,11 @@ REQUIRED_VARIABLES = {
     "INDEXING_MAX_TRIES": "5",
     "INDEXING_RETRY_DELAY_SECONDS": "30",
     "INDEXING_RUN_DEADLINE_SECONDS": "540",
-    "INDEXING_FAILURE_RECORDING_SECONDS": "30",
+    "INDEXING_FAILURE_RECORDING_SECONDS": "20",
+    "INDEXING_CLEANUP_RESERVE_SECONDS": "30",
+    "INDEXING_SWEEP_INTERVAL_SECONDS": "300",
+    "INDEXING_STALE_AFTER_SECONDS": "1800",
+    "INDEXING_SWEEP_BATCH_SIZE": "100",
     "INDEXING_JOB_TIMEOUT_SECONDS": "600",
 }
 
@@ -91,15 +95,52 @@ def test_an_example_file_lists_every_pipeline_setting() -> None:
 
 
 @pytest.mark.parametrize(
-    ("deadline", "recording"),
-    [("600", "1"), ("540", "60"), ("580", "30")],
-    ids=["deadline-alone-fills-it", "both-fill-it", "both-overrun-it"],
+    ("deadline", "recording", "reserve"),
+    [("560", "20", "30"), ("540", "40", "30"), ("540", "20", "40"), ("600", "1", "10")],
+    ids=["deadline", "recording", "reserve", "deadline-alone"],
 )
-def test_the_job_timeout_must_leave_time_for_the_run_and_recording_its_failure(
-    environment: pytest.MonkeyPatch, deadline: str, recording: str
+def test_the_job_timeout_must_cover_the_run_recording_and_clean_up(
+    environment: pytest.MonkeyPatch, deadline: str, recording: str, reserve: str
 ) -> None:
     environment.setenv("INDEXING_RUN_DEADLINE_SECONDS", deadline)
     environment.setenv("INDEXING_FAILURE_RECORDING_SECONDS", recording)
+    environment.setenv("INDEXING_CLEANUP_RESERVE_SECONDS", reserve)
 
-    with pytest.raises(ValidationError, match="plus indexing_failure_recording_seconds"):
+    with pytest.raises(ValidationError, match="plus indexing_cleanup_reserve_seconds"):
         load()
+
+
+def test_the_clean_up_reserve_must_cover_stopping_a_media_tool(
+    environment: pytest.MonkeyPatch,
+) -> None:
+    environment.setenv("MEDIA_TOOL_STOP_TIMEOUT_SECONDS", "16")
+
+    with pytest.raises(ValidationError, match="twice media_tool_stop_timeout_seconds"):
+        load()
+
+
+@pytest.mark.parametrize("stale_after", ["750", "600"])
+def test_stuck_items_are_only_older_than_the_longest_silence_of_a_live_job(
+    environment: pytest.MonkeyPatch, stale_after: str
+) -> None:
+    environment.setenv("INDEXING_STALE_AFTER_SECONDS", stale_after)
+
+    with pytest.raises(ValidationError, match="indexing_stale_after_seconds must be longer"):
+        load()
+
+
+@pytest.mark.parametrize("interval", ["7", "45", "90", "420"])
+def test_the_sweep_interval_must_fit_a_cron(environment: pytest.MonkeyPatch, interval: str) -> None:
+    environment.setenv("INDEXING_SWEEP_INTERVAL_SECONDS", interval)
+
+    with pytest.raises(ValidationError, match="divide a minute"):
+        load()
+
+
+@pytest.mark.parametrize("interval", ["1", "15", "30", "60", "300", "900", "3600"])
+def test_sweep_intervals_that_fit_a_cron_are_accepted(
+    environment: pytest.MonkeyPatch, interval: str
+) -> None:
+    environment.setenv("INDEXING_SWEEP_INTERVAL_SECONDS", interval)
+
+    assert load().indexing_sweep_interval_seconds == int(interval)

@@ -9,10 +9,8 @@ and keyword arguments:
 | `index_saved_item` | `user_id`, `saved_item_id` | `capture:<saved_item_id>` |
 | `answer_chat_message` | `user_id`, `message_receipt_id` | `chat:<message_receipt_id>` |
 
-The indexing worker also queues one job of its own on the indexing queue:
-`finalize_saved_item` (`user_id`, `saved_item_id`; job id `finalize:<item>`),
-which saves the `failed` status a last indexing try could not save. It has no
-payload, and "delete my data" removes it with the user's other jobs.
+The indexing worker's stuck-item sweeper queues `index_saved_item` again, with
+the same job id, for an item no job is working on any more (record 0012).
 
 The arguments are ids only, as text. Captions, texts and media links stay in
 the payloads hash (`app/ingestion/session_state.py`), which "delete my data"
@@ -35,6 +33,7 @@ from uuid import UUID
 
 from arq.connections import ArqRedis
 from arq.constants import default_queue_name, job_key_prefix, result_key_prefix, retry_key_prefix
+from arq.jobs import Job, JobStatus
 from redis.asyncio import ConnectionPool
 
 # A job's keyword arguments are JSON-compatible values of any shape. arq takes
@@ -43,18 +42,11 @@ JobArguments = Mapping[str, Any]
 
 INDEX_SAVED_ITEM_JOB = "index_saved_item"
 ANSWER_CHAT_MESSAGE_JOB = "answer_chat_message"
-# Queued by the indexing worker itself when an item's last try could not save its
-# `failed` status; it retries the status write alone (record 0012).
-FINALIZE_SAVED_ITEM_JOB = "finalize_saved_item"
 
 # arq's queues are sorted sets named like its own default queue (`arq:queue`).
 INDEXING_QUEUE = f"{default_queue_name}:indexing"
 CHAT_QUEUE = f"{default_queue_name}:chat"
-_QUEUE_OF_JOB = {
-    INDEX_SAVED_ITEM_JOB: INDEXING_QUEUE,
-    FINALIZE_SAVED_ITEM_JOB: INDEXING_QUEUE,
-    ANSWER_CHAT_MESSAGE_JOB: CHAT_QUEUE,
-}
+_QUEUE_OF_JOB = {INDEX_SAVED_ITEM_JOB: INDEXING_QUEUE, ANSWER_CHAT_MESSAGE_JOB: CHAT_QUEUE}
 # Every queue a job of ours can be in. arq's default queue is included because
 # jobs queued before the queues were split are still there, and "delete my data"
 # must remove them too.
@@ -65,8 +57,7 @@ def queue_of(job_name: str) -> str:
     """Return the queue that jobs of one name go to.
 
     Args:
-        job_name: `INDEX_SAVED_ITEM_JOB`, `FINALIZE_SAVED_ITEM_JOB` or
-            `ANSWER_CHAT_MESSAGE_JOB`.
+        job_name: `INDEX_SAVED_ITEM_JOB` or `ANSWER_CHAT_MESSAGE_JOB`.
 
     Returns:
         The queue's Redis key.
@@ -96,18 +87,6 @@ def index_job_id(saved_item_id: UUID) -> str:
     return f"index:{saved_item_id}"
 
 
-def finalize_job_id(saved_item_id: UUID) -> str:
-    """Return the id of the job that saves an item's final `failed` status.
-
-    Args:
-        saved_item_id: The saved item's id.
-
-    Returns:
-        The job id. An item has at most one such job at a time.
-    """
-    return f"finalize:{saved_item_id}"
-
-
 def chat_job_id(message_receipt_id: UUID) -> str:
     """Return the id of the job that answers one chat message.
 
@@ -123,21 +102,13 @@ def chat_job_id(message_receipt_id: UUID) -> str:
 class JobQueue(Protocol):
     """Where ingestion puts background jobs."""
 
-    async def enqueue(
-        self,
-        job_name: str,
-        job_id: str,
-        arguments: JobArguments,
-        *,
-        defer_seconds: float | None = None,
-    ) -> bool:
+    async def enqueue(self, job_name: str, job_id: str, arguments: JobArguments) -> bool:
         """Queue a job, unless a job with the same id is already known.
 
         Args:
             job_name: The name of the worker function to run.
             job_id: The job's id. A second job with a known id is not queued.
             arguments: The function's keyword arguments, as JSON-compatible values.
-            defer_seconds: Run the job no sooner than this; `None` runs it at once.
 
         Returns:
             Whether the job was queued. `False` means the id was already known.
@@ -164,21 +135,13 @@ class ArqJobQueue:
         """
         self._redis = redis
 
-    async def enqueue(
-        self,
-        job_name: str,
-        job_id: str,
-        arguments: JobArguments,
-        *,
-        defer_seconds: float | None = None,
-    ) -> bool:
+    async def enqueue(self, job_name: str, job_id: str, arguments: JobArguments) -> bool:
         """Queue a job on Redis, unless arq already knows the job id.
 
         Args:
             job_name: The name of the worker function to run.
             job_id: The job's id.
             arguments: The function's keyword arguments.
-            defer_seconds: Run the job no sooner than this; `None` runs it at once.
 
         Returns:
             Whether the job was queued.
@@ -187,11 +150,35 @@ class ArqJobQueue:
             ValueError: If no queue is set for the job name.
             redis.exceptions.RedisError: If Redis cannot be reached.
         """
-        options: dict[str, Any] = {"_job_id": job_id, "_queue_name": queue_of(job_name)}
-        if defer_seconds is not None:
-            options["_defer_by"] = defer_seconds
-        job = await self._redis.enqueue_job(job_name, **options, **arguments)
+        job = await self._redis.enqueue_job(
+            job_name, _job_id=job_id, _queue_name=queue_of(job_name), **arguments
+        )
         return job is not None
+
+    async def requeue(self, job_name: str, job_id: str, arguments: JobArguments) -> bool:
+        """Queue a job again whose earlier run is over, even while arq keeps its result.
+
+        arq refuses a job id while it still keeps the result of a finished run
+        (an hour by default). A finished job is over, so its kept result is
+        dropped first. A job that is queued, deferred or running is left alone,
+        and the new one is refused as a duplicate.
+
+        Args:
+            job_name: The name of the worker function to run.
+            job_id: The job's id.
+            arguments: The function's keyword arguments.
+
+        Returns:
+            Whether the job was queued. `False` means it is queued or running.
+
+        Raises:
+            ValueError: If no queue is set for the job name.
+            redis.exceptions.RedisError: If Redis cannot be reached.
+        """
+        earlier = Job(job_id, self._redis, _queue_name=queue_of(job_name))
+        if await earlier.status() is JobStatus.complete:
+            await self._redis.delete(result_key_prefix + job_id)
+        return await self.enqueue(job_name, job_id, arguments)
 
     async def discard(self, job_ids: Sequence[str]) -> None:
         """Remove jobs from every queue, with their retry state and kept results.

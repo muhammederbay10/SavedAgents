@@ -290,7 +290,7 @@ Every saved item is understood once, when it is saved (`docs/ARCHITECTURE.md` §
 5. **Normalize:** open values (category, tags, cuisine, subject…) go through the shared vocabulary: exact hit, privacy gate, then match-or-new (§3.4).
 6. **Embed** the summary and transcript, mark the item `done`, and **confirm** by DM how it was saved, in the user's language, or in English while it isn't known.
 
-Each step's result is kept in `enrichment_run`, so a job that runs again continues where it stopped. A run that can't read its payload or item, or that passes `INDEXING_RUN_DEADLINE_SECONDS`, runs again too, and an ffmpeg or ffprobe run it was waiting for is stopped first. That deadline starts before the payload is read, so a slow start (for example, the user's row locked by "delete my data") uses the same budget as the steps. The last of `INDEXING_MAX_TRIES` runs marks the item `failed`. It also queues a small `finalize_saved_item` job (ids only) that writes that status again until it is saved, in case the database was locked or down at that moment. The worker reads only the indexing queue; chat jobs wait in theirs. Logs hold, for each item, its type, whether it was escalated, and the cost of its model calls.
+Each step's result is kept in `enrichment_run`, so a job that runs again continues where it stopped. A run that can't read its payload or item, or that passes `INDEXING_RUN_DEADLINE_SECONDS`, runs again too, and an ffmpeg or ffprobe run it was waiting for is stopped and reaped first. That deadline starts before the payload is read, so a slow start (for example, the user's row locked by "delete my data") uses the same budget as the steps. An item gets `INDEXING_MAX_TRIES` runs in all, counted on the item across requeues; the last marks it `failed` as well as it can. Whatever a job couldn't write, the **stuck-item sweeper** repairs: an arq cron in the worker that, every `INDEXING_SWEEP_INTERVAL_SECONDS`, finds items still `pending` or `enriching` that no job has worked on for `INDEXING_STALE_AFTER_SECONDS`, and queues each again (tries left, payload still there) or marks it `failed`. It reads Postgres only, takes each owner's row lock with `SKIP LOCKED`, and is safe with several workers. The worker reads only the indexing queue; chat jobs wait in theirs. Logs hold, for each item, its type, whether it was escalated, and the cost of its model calls.
 
 Run the worker on your machine (it reads `.env`, and needs ffmpeg, Postgres and Redis):
 
@@ -313,7 +313,7 @@ The worker reads `Settings`, `ModelSettings`, `MessengerSettings` and `PipelineS
 | `MEDIA_DOWNLOAD_TIMEOUT_SECONDS`, `MEDIA_MAX_DOWNLOAD_BYTES` | Time limit and largest size of one download. Larger media is skipped and the item indexed from its text |
 | `MEDIA_STORED_HEIGHT_PIXELS` | Height of the stored copies (360). Smaller media keeps its size |
 | `FFMPEG_PATH`, `FFPROBE_PATH`, `MEDIA_TOOL_TIMEOUT_SECONDS` | The two programs, and the time limit of one run |
-| `MEDIA_TOOL_STOP_TIMEOUT_SECONDS` | A run that times out, or is cancelled by the run's deadline, stops its own child: SIGTERM, then SIGKILL if it hasn't exited within this time, and it waits for the child to be reaped |
+| `MEDIA_TOOL_STOP_TIMEOUT_SECONDS` | A run that times out, or is cancelled by the run's deadline, stops its own child: SIGTERM, then SIGKILL if it hasn't exited within this time, then waits up to this time again for it to be reaped. A cancellation during that clean-up doesn't cut it short |
 | `TRANSCRIPT_MIN_SPEECH_CHARACTERS` | The near-empty rule above |
 | `CLASSIFY_IS_LIST_MIN_PROBABILITY` | A post counts as a list from this probability of yes |
 | `EXTRACTION_TEMPERATURE`, `EXTRACTION_MAX_OUTPUT_TOKENS` | Sampling and reply length of extraction and the escalation |
@@ -324,8 +324,12 @@ The worker reads `Settings`, `ModelSettings`, `MessengerSettings` and `PipelineS
 | `INDEXING_CONCURRENCY` | Jobs one worker runs at once; a bulk import fans out over every slot of every worker |
 | `INDEXING_MAX_TRIES`, `INDEXING_RETRY_DELAY_SECONDS` | Runs of one job, and the wait before the next run, multiplied by the run's number |
 | `INDEXING_RUN_DEADLINE_SECONDS` | How long one run may take, from before it reads the payload to the end of its last step. A run that passes it stops itself, records where it was, and runs again; the last try marks the item `failed` |
-| `INDEXING_FAILURE_RECORDING_SECONDS` | How long recording a failure may take after that. If the database doesn't answer in time, the failure is only logged, and the job still ends itself |
-| `INDEXING_JOB_TIMEOUT_SECONDS` | arq's own limit on one run, a backstop that cancels without a retry. Must be longer than the run deadline plus the recording time |
+| `INDEXING_FAILURE_RECORDING_SECONDS` | How long recording a failure may take after that, from one deadline. If the database doesn't answer in time, the failure is only logged, the job still ends itself, and the sweeper repairs the item later |
+| `INDEXING_CLEANUP_RESERVE_SECONDS` | Time kept free for clean-up after a stopped run, at least twice `MEDIA_TOOL_STOP_TIMEOUT_SECONDS` |
+| `INDEXING_JOB_TIMEOUT_SECONDS` | arq's own limit on one run, a backstop that cancels without a retry. Must be longer than the run deadline, the recording time and the clean-up reserve together |
+| `INDEXING_SWEEP_INTERVAL_SECONDS` | How often the stuck-item sweeper runs. It must divide a minute, or be whole minutes that divide an hour |
+| `INDEXING_STALE_AFTER_SECONDS` | How long an unfinished item goes without any job working on it before the sweeper takes it. Longer than a whole run plus every retry wait |
+| `INDEXING_SWEEP_BATCH_SIZE` | The most stuck items one sweep handles |
 
 ## Models
 

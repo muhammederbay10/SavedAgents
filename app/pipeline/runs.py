@@ -14,7 +14,7 @@ import uuid
 from enum import StrEnum
 from typing import Final
 
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import EnrichmentRun, PlatformAccount, SavedItem, User
@@ -55,6 +55,24 @@ async def load_item(session: AsyncSession, saved_item_id: uuid.UUID) -> SavedIte
         The item, or `None` if it is gone.
     """
     return await session.get(SavedItem, saved_item_id)
+
+
+async def mark_worked_on(session: AsyncSession, saved_item_id: uuid.UUID) -> None:
+    """Set the item's `indexing_updated_at` to the database's time.
+
+    The stuck-item sweeper compares it with the database's clock, so it never
+    depends on a worker's clock.
+
+    Args:
+        session: The session to work in.
+        saved_item_id: The item.
+    """
+    await session.execute(
+        update(SavedItem)
+        .where(SavedItem.id == saved_item_id)
+        .values(indexing_updated_at=func.now())
+        .execution_options(synchronize_session=False)
+    )
 
 
 async def finished_steps(session: AsyncSession, saved_item_id: uuid.UUID) -> dict[Step, JsonObject]:

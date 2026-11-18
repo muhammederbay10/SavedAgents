@@ -139,11 +139,12 @@ def slow_tool(tmp_path: Path, *, ignore_terminate: bool = False) -> tuple[Path, 
     """A stand-in for ffprobe that records its pid, works for a while, then leaves a marker."""
     pid_file = tmp_path / "tool.pid"
     marker = tmp_path / "tool.finished"
-    ignore = "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n" if ignore_terminate else ""
+    # Ignored from the start: the shell ignores SIGTERM before `exec`, and the
+    # child inherits that, so no signal can arrive before Python is ready.
+    trap = "trap '' TERM\n" if ignore_terminate else ""
     script = tmp_path / "slow_tool.py"
     script.write_text(
-        "import os, pathlib, signal, time\n"
-        f"{ignore}"
+        "import os, pathlib, time\n"
         f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid()))\n"
         f"time.sleep({SLOW_TOOL_SECONDS})\n"
         f"pathlib.Path({str(marker)!r}).write_text('done')\n",
@@ -151,7 +152,9 @@ def slow_tool(tmp_path: Path, *, ignore_terminate: bool = False) -> tuple[Path, 
     )
     wrapper = tmp_path / "slow_tool"
     # `exec` replaces the shell, so the pid the script records is the child's own.
-    wrapper.write_text(f'#!/bin/sh\nexec {sys.executable} -I {script} "$@"\n', encoding="utf-8")
+    wrapper.write_text(
+        f'#!/bin/sh\n{trap}exec {sys.executable} -I {script} "$@"\n', encoding="utf-8"
+    )
     wrapper.chmod(0o755)
     return wrapper, pid_file, marker
 
@@ -226,3 +229,30 @@ def tool_runner(program: Path, *, timeout_seconds: float) -> FfmpegMediaTools:
         timeout_seconds=timeout_seconds,
         stop_timeout_seconds=STOP_TIMEOUT_SECONDS,
     )
+
+
+async def test_a_cancellation_during_timeout_cleanup_still_kills_and_reaps_the_tool(
+    tmp_path: Path,
+) -> None:
+    # The tool times out at 0.3 s; while it is being stopped (SIGTERM, refused, then
+    # a wait of up to 0.8 s before SIGKILL), the run's deadline cancels at 0.5 s.
+    program, pid_file, marker = slow_tool(tmp_path, ignore_terminate=True)
+    tools = FfmpegMediaTools(
+        ffmpeg_path=str(program),
+        ffprobe_path=str(program),
+        timeout_seconds=0.3,
+        stop_timeout_seconds=0.8,
+    )
+    started = time.monotonic()
+
+    with pytest.raises(TimeoutError):
+        async with asyncio.timeout(DEADLINE_SECONDS):
+            await tools.probe(tmp_path / "clip.mp4")
+
+    elapsed = time.monotonic() - started
+    pid = await wait_for_pid(pid_file)
+    assert not is_running(pid)
+    # Bounded: the tool timeout plus SIGTERM's grace and SIGKILL's wait, with slack.
+    assert elapsed < 0.3 + 2 * 0.8 + 0.5
+    await asyncio.sleep(SLOW_TOOL_SECONDS)
+    assert not await asyncio.to_thread(marker.exists)
