@@ -243,7 +243,7 @@ async with httpx.AsyncClient() as http_client:
   - otherwise the built-in English or Turkish wording, chosen by the primary subtag (`tr-TR` → Turkish);
   - otherwise `ReplyWordingUnavailableError`. Nothing falls back to English silently.
 
-  For other languages the caller supplies the wording. SAV-17's response agent, which already writes replies in the user's language, owns producing it; `has_built_in_wording(language)` tells it when it must. Supplied wording is validated: every field non-empty, and exactly the placeholders listed on `ReplyWording`. Names, open categories, option labels, count labels and other values are shown exactly as passed in.
+  For other languages the caller supplies the wording. SAV-17's response agent, which already writes replies in the user's language, owns producing it; `has_built_in_wording(language)` tells it when it must. Supplied wording is validated when it is built: every field non-empty, and exactly the placeholders listed on `ReplyWording`, as bare names such as `{item}`. A format spec (`{item:.0}`), a conversion (`{item!r}`), an index or an attribute is refused, so a caller's value is always shown whole. Names, open categories, option labels, count labels and other values are shown exactly as passed in.
 - **Logs** hold the kind of message, the attempt, the HTTP status and Meta's error code, never the recipient, a message id, the text or the token.
 
 ## Logging

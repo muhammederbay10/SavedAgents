@@ -67,7 +67,10 @@ class ReplyWording:
     """The bot's own words for the fixed messages, in one language.
 
     Placeholders in braces are filled in by the templates and must appear
-    exactly as listed. No other braces are allowed.
+    exactly as listed, as bare names such as `{item}`: no format spec
+    (`{item:.0}`), conversion (`{item!r}`), index or attribute, so a caller's
+    value is always shown whole. No other braces are allowed. Wording that
+    breaks this is refused when it is built, not when a message is rendered.
 
     Attributes:
         saved_named: Confirmation for an item with a name; `{item}`, e.g.
@@ -102,8 +105,9 @@ class ReplyWording:
         """Reject empty wording and wrong placeholders.
 
         Raises:
-            ValueError: If a field is empty, has malformed braces, or doesn't
-                have exactly its placeholders. The message names the field.
+            ValueError: If a field is empty, has malformed braces, uses a
+                placeholder with a format spec or conversion, or doesn't have
+                exactly its placeholders. The message names the field.
         """
         for field in fields(self):
             text: str = getattr(self, field.name)
@@ -123,7 +127,19 @@ def _placeholders(field_name: str, text: str) -> frozenset[str]:
         parsed = list(string.Formatter().parse(text))
     except ValueError as error:
         raise ValueError(f"{field_name} has malformed braces") from error
-    return frozenset(name for _, name, _, _ in parsed if name is not None)
+    names: set[str] = set()
+    for _, name, format_spec, conversion in parsed:
+        if name is None:
+            continue
+        # A format spec or conversion can crash rendering ("{item:{x}}", "{item!z}")
+        # or change the caller's value ("{item:.0}" shows nothing of it).
+        if format_spec or conversion is not None:
+            raise ValueError(
+                f"{field_name} may only use bare placeholders such as {{{name}}}, "
+                "without a format spec or conversion"
+            )
+        names.add(name)
+    return frozenset(names)
 
 
 _BUILT_IN_WORDINGS: Final[dict[str, ReplyWording]] = {

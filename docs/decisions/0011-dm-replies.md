@@ -30,7 +30,7 @@ Meta's documentation, read on 18 Nov 2026 (no live call was made for SAV-12):
    - otherwise built-in wording, which exists for English and Turkish;
    - otherwise it raises `ReplyWordingUnavailableError`. A user is never silently answered in another language (record 0005 §9, SAV-22).
 
-   Supplied wording is validated: every field is non-empty and has exactly its placeholders. Names, open categories, genres, areas, platforms, option labels and count labels are shown exactly as the caller passes them (record 0005).
+   Supplied wording is validated when it is built: every field is non-empty and has exactly its placeholders, as bare names such as `{item}`. Format specs, conversions, indexes and attributes are refused, because they can crash rendering or cut a caller's value (`{item:.0}` shows nothing of it). Names, open categories, genres, areas, platforms, option labels and count labels are shown exactly as the caller passes them (record 0005).
 7. **"Which one?" buttons carry their number** ("1. Kronotrop Bebek"), so two options stay apart when Meta cuts a long title.
 8. **Logs hold no personal data:** no recipient id, message id, text, token or Meta error message. They hold the kind of message, the attempt, the HTTP status and Meta's numeric error code.
 

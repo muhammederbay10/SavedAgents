@@ -115,6 +115,34 @@ def test_supplied_wording_with_wrong_placeholders_or_empty_text_is_refused(
         dataclasses.replace(JAPANESE, **{field: value})
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("saved_named", "Saved: {item:{unknown}}"),  # nested field: KeyError when rendered
+        ("saved_named", "Saved: {item!z}"),  # invalid conversion: ValueError when rendered
+        ("saved_named", "Saved: {item:.0}"),  # format spec that cuts the name to nothing
+        ("saved_named", "Saved: {item!r}"),  # valid conversion that still changes the value
+        ("saved_as", "Saved as {category:>40}"),  # padding
+        ("streaming_on", "on {platforms[0]}"),  # index: keeps one character
+        ("import_progress", "{done.real}/{total}"),  # attribute access
+        ("import_progress_with_counts", "{done}/{total}… {counts!s}"),
+    ],
+)
+def test_supplied_wording_allows_only_bare_named_placeholders(field: str, value: str) -> None:
+    # Refused when the wording is built, before any message is rendered.
+    with pytest.raises(ValueError, match=field):
+        dataclasses.replace(JAPANESE, **{field: value})
+
+
+def test_bare_placeholders_keep_the_whole_caller_value() -> None:
+    wording = dataclasses.replace(ENGLISH, saved_named="Saved → {item} ✓")
+    summary = SavedItemSummary(category="movie", name="Spirited Away: 千と千尋の神隠し", year=2001)
+
+    assert save_confirmation(summary, wording).text == (
+        "Saved → Spirited Away: 千と千尋の神隠し (2001) ✓"
+    )
+
+
 # --- save confirmation -----------------------------------------------------------------------
 
 
