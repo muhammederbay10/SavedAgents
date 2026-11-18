@@ -1,17 +1,22 @@
+import dataclasses
+
 import pytest
 
 from app.agent.messenger import MAX_QUICK_REPLIES, QuickReply, build_message_body
 from app.agent.reply_templates import (
     ChoiceOption,
     ImportCount,
+    ReplyWording,
+    ReplyWordingUnavailableError,
     ResultLine,
     SavedItemSummary,
     error_message,
+    has_built_in_wording,
     import_progress,
+    reply_wording,
     result_reply,
     save_confirmation,
     which_one_question,
-    wording_language,
 )
 from tests.agent.support import RECIPIENT_ID, SAVED_MESSAGE_ID
 
@@ -24,6 +29,23 @@ INCEPTION = SavedItemSummary(
     emoji="🎬",
 )
 CAR_REVIEW = SavedItemSummary(category="car review", details=("BMW M3",), emoji="🚗")
+ENGLISH = reply_wording("en")
+TURKISH = reply_wording("tr")
+# Wording a caller (the response agent, SAV-17) supplies for a language with no
+# built-in wording. Japanese stands for any such language.
+JAPANESE = ReplyWording(
+    saved_named="保存しました: {item}",
+    saved_as="{category}として保存しました",
+    streaming_on="{platforms}で配信中",
+    which_one="どれを保存しましたか",
+    none_of_these="どれでもない",
+    import_progress="{done}/{total}件をインポートしました…",
+    import_progress_with_counts="{done}/{total}件をインポートしました…これまでに{counts}",
+    error="すみません、問題が発生しました。数分後にもう一度お試しください。",
+    open_now="営業中",
+    closed_now="営業時間外",
+    list_separator="、",
+)
 KRONOTROP = ResultLine(
     position=1,
     total=3,
@@ -40,19 +62,64 @@ KRONOTROP = ResultLine(
 
 @pytest.mark.parametrize(
     ("language", "expected"),
-    [("tr", "tr"), ("tr-TR", "tr"), ("TR", "tr"), ("en_GB", "en"), ("ja", "en"), (None, "en")],
+    [("en", ENGLISH), ("en-GB", ENGLISH), ("tr", TURKISH), ("tr-TR", TURKISH), ("TR", TURKISH)],
 )
-def test_wording_language_uses_the_primary_subtag_and_falls_back_to_english(
-    language: str | None, expected: str
+def test_built_in_wording_is_found_by_the_primary_language_subtag(
+    language: str, expected: ReplyWording
 ) -> None:
-    assert wording_language(language) == expected
+    assert has_built_in_wording(language)
+    assert reply_wording(language) == expected
+
+
+@pytest.mark.parametrize("language", ["ja", "ja-JP", "de", "pt_BR"])
+def test_language_without_built_in_or_supplied_wording_is_an_explicit_error(
+    language: str,
+) -> None:
+    assert not has_built_in_wording(language)
+
+    with pytest.raises(ReplyWordingUnavailableError) as raised:
+        reply_wording(language)
+
+    assert raised.value.language == language
+
+
+def test_supplied_wording_is_used_for_a_language_without_built_in_wording() -> None:
+    assert reply_wording("ja-JP", localized=JAPANESE) is JAPANESE
+
+
+def test_supplied_wording_takes_precedence_over_built_in_wording() -> None:
+    assert reply_wording("en", localized=JAPANESE) is JAPANESE
+
+
+@pytest.mark.parametrize("language", ["", "  "])
+def test_empty_language_is_refused(language: str) -> None:
+    with pytest.raises(ValueError, match="language"):
+        reply_wording(language)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("saved_named", "保存しました"),  # {item} missing
+        ("saved_as", "{category} {name}"),  # unknown placeholder
+        ("import_progress", "{done} of {total"),  # malformed
+        ("error", "Failed: {item}"),  # no placeholder allowed here
+        ("none_of_these", "   "),
+        ("list_separator", ""),
+    ],
+)
+def test_supplied_wording_with_wrong_placeholders_or_empty_text_is_refused(
+    field: str, value: str
+) -> None:
+    with pytest.raises(ValueError, match=field):
+        dataclasses.replace(JAPANESE, **{field: value})
 
 
 # --- save confirmation -----------------------------------------------------------------------
 
 
 def test_save_confirmation_for_a_named_item_in_english() -> None:
-    message = save_confirmation(INCEPTION, "en")
+    message = save_confirmation(INCEPTION, ENGLISH)
 
     assert message.text == "Saved: Inception (2010) · Sci-fi · on Netflix 🎬"
     assert message.quick_replies == ()
@@ -60,14 +127,14 @@ def test_save_confirmation_for_a_named_item_in_english() -> None:
 
 
 def test_save_confirmation_for_a_named_item_in_turkish() -> None:
-    message = save_confirmation(INCEPTION, "tr")
+    message = save_confirmation(INCEPTION, TURKISH)
 
     assert message.text == "Kaydedildi: Inception (2010) · Sci-fi · Netflix platformunda 🎬"
 
 
 def test_save_confirmation_without_a_name_says_the_open_category() -> None:
-    assert save_confirmation(CAR_REVIEW, "en").text == "Saved as 🚗 car review · BMW M3"
-    assert save_confirmation(CAR_REVIEW, "tr").text == "🚗 car review olarak kaydedildi · BMW M3"
+    assert save_confirmation(CAR_REVIEW, ENGLISH).text == "Saved as 🚗 car review · BMW M3"
+    assert save_confirmation(CAR_REVIEW, TURKISH).text == "🚗 car review olarak kaydedildi · BMW M3"
 
 
 def test_save_confirmation_shows_open_values_exactly_as_given() -> None:
@@ -77,7 +144,7 @@ def test_save_confirmation_shows_open_values_exactly_as_given() -> None:
         streaming_platforms=("Disney+", "MUBI"),
     )
 
-    message = save_confirmation(summary, "ja")
+    message = save_confirmation(summary, ENGLISH)
 
     assert message.text == "Saved as ラーメン店 · Kore mutfağı · Brooklyn, NY · on Disney+, MUBI"
 
@@ -85,7 +152,7 @@ def test_save_confirmation_shows_open_values_exactly_as_given() -> None:
 def test_save_confirmation_with_only_a_name() -> None:
     summary = SavedItemSummary(category="restaurant", name="Kronotrop")
 
-    assert save_confirmation(summary, None).text == "Saved: Kronotrop"
+    assert save_confirmation(summary, ENGLISH).text == "Saved: Kronotrop"
 
 
 # --- which one? ------------------------------------------------------------------------------
@@ -97,7 +164,7 @@ def test_which_one_question_numbers_the_options_and_adds_none_of_these() -> None
         ChoiceOption(label="Kronotrop Karaköy", payload="choice:karakoy"),
     ]
 
-    message = which_one_question(options, none_payload="choice:none", language="en")
+    message = which_one_question(options, none_payload="choice:none", wording=ENGLISH)
 
     assert message.text == "Which one did you save?\n1. Kronotrop Bebek\n2. Kronotrop Karaköy"
     assert message.quick_replies == (
@@ -110,7 +177,7 @@ def test_which_one_question_numbers_the_options_and_adds_none_of_these() -> None
 def test_which_one_question_in_turkish() -> None:
     options = [ChoiceOption(label="Dune (2021)", payload="tmdb:1")]
 
-    message = which_one_question(options, none_payload="none", language="tr-TR")
+    message = which_one_question(options, none_payload="none", wording=TURKISH)
 
     assert message.text == "Hangisini kaydettin?\n1. Dune (2021)"
     assert message.quick_replies[-1] == QuickReply(title="Hiçbiri", payload="none")
@@ -121,13 +188,13 @@ def test_which_one_question_needs_room_for_every_button(count: int) -> None:
     options = [ChoiceOption(label=f"Option {n}", payload=str(n)) for n in range(count)]
 
     with pytest.raises(ValueError, match="options"):
-        which_one_question(options, none_payload="none", language="en")
+        which_one_question(options, none_payload="none", wording=ENGLISH)
 
 
 def test_which_one_question_accepts_as_many_options_as_buttons_allow() -> None:
     options = [ChoiceOption(label=f"Option {n}", payload=str(n)) for n in range(12)]
 
-    message = which_one_question(options, none_payload="none", language="en")
+    message = which_one_question(options, none_payload="none", wording=ENGLISH)
 
     assert len(message.quick_replies) == MAX_QUICK_REPLIES
 
@@ -143,7 +210,7 @@ def test_import_progress_lists_what_was_found_so_far() -> None:
         ImportCount(label="recipes", count=0),
     ]
 
-    message = import_progress(230, 500, counts, "en")
+    message = import_progress(230, 500, counts, ENGLISH)
 
     assert message.text == "Imported 230/500… 61 places, 40 movies, 25 study posts so far"
 
@@ -151,33 +218,32 @@ def test_import_progress_lists_what_was_found_so_far() -> None:
 def test_import_progress_in_turkish_and_without_counts() -> None:
     counts = [ImportCount(label="mekan", count=3)]
 
-    assert import_progress(5, 500, counts, "tr").text == (
+    assert import_progress(5, 500, counts, TURKISH).text == (
         "5/500 içe aktarıldı… şu ana kadar 3 mekan"
     )
-    assert import_progress(0, 500, [], "tr").text == "0/500 içe aktarıldı…"
-    assert import_progress(0, 500, [], "en").text == "Imported 0/500…"
+    assert import_progress(0, 500, [], TURKISH).text == "0/500 içe aktarıldı…"
+    assert import_progress(0, 500, [], ENGLISH).text == "Imported 0/500…"
 
 
 @pytest.mark.parametrize(("done", "total"), [(-1, 10), (11, 10)])
 def test_import_progress_refuses_impossible_numbers(done: int, total: int) -> None:
     with pytest.raises(ValueError, match="done"):
-        import_progress(done, total, [], "en")
+        import_progress(done, total, [], ENGLISH)
 
 
 # --- error -----------------------------------------------------------------------------------
 
 
 def test_error_message_in_english_and_turkish() -> None:
-    assert error_message("en").text.startswith("Sorry, something went wrong")
-    assert error_message("tr").text.startswith("Üzgünüm, bir şeyler ters gitti")
-    assert error_message("de").text == error_message("en").text
+    assert error_message(ENGLISH).text.startswith("Sorry, something went wrong")
+    assert error_message(TURKISH).text.startswith("Üzgünüm, bir şeyler ters gitti")
 
 
 # --- result lines ----------------------------------------------------------------------------
 
 
 def test_result_reply_quotes_the_saved_reel_with_one_short_line() -> None:
-    message = result_reply(KRONOTROP, SAVED_MESSAGE_ID, "en")
+    message = result_reply(KRONOTROP, SAVED_MESSAGE_ID, ENGLISH)
 
     assert message.text == "🍽 1/3 · Kronotrop, Beşiktaş · open now · https://maps.example/kronotrop"
     assert build_message_body(RECIPIENT_ID, message) == {
@@ -192,7 +258,7 @@ def test_result_reply_quotes_the_saved_reel_with_one_short_line() -> None:
 def test_result_reply_in_turkish_for_a_closed_place() -> None:
     line = ResultLine(position=2, total=3, name="Kronotrop", area="Karaköy", open_now=False)
 
-    message = result_reply(line, SAVED_MESSAGE_ID, "tr")
+    message = result_reply(line, SAVED_MESSAGE_ID, TURKISH)
 
     assert message.text == "2/3 · Kronotrop, Karaköy · şu an kapalı"
 
@@ -207,7 +273,7 @@ def test_result_reply_without_a_message_id_is_a_plain_message_with_the_post_link
         emoji="🎬",
     )
 
-    message = result_reply(line, None, "en")
+    message = result_reply(line, None, ENGLISH)
 
     assert message.text == "🎬 3/3 · Inception · Sci-fi · https://www.instagram.com/reel/SYNTHETIC/"
     assert "reply_to" not in build_message_body(RECIPIENT_ID, message)
@@ -218,4 +284,41 @@ def test_result_reply_refuses_a_position_outside_the_list(position: int) -> None
     line = ResultLine(position=position, total=3, name="Kronotrop")
 
     with pytest.raises(ValueError, match="position"):
-        result_reply(line, None, "en")
+        result_reply(line, None, ENGLISH)
+
+
+# --- a third language, through supplied wording ----------------------------------------------
+
+
+def test_every_template_uses_supplied_wording_for_a_third_language() -> None:
+    wording = reply_wording("ja", localized=JAPANESE)
+    movie = SavedItemSummary(
+        category="映画",
+        name="千と千尋の神隠し",
+        year=2001,
+        streaming_platforms=("Netflix", "U-NEXT"),
+    )
+    ramen = SavedItemSummary(category="ラーメン店", details=("一蘭",), emoji="🍜")
+    options = [
+        ChoiceOption(label="一蘭 渋谷店", payload="a"),
+        ChoiceOption(label="一蘭 新宿店", payload="b"),
+    ]
+    counts = [ImportCount(label="件のお店", count=12), ImportCount(label="本の映画", count=3)]
+    line = ResultLine(position=1, total=2, name="一蘭", area="渋谷区", open_now=False)
+
+    assert save_confirmation(movie, wording).text == (
+        "保存しました: 千と千尋の神隠し (2001) · Netflix、U-NEXTで配信中"
+    )
+    assert save_confirmation(ramen, wording).text == "🍜 ラーメン店として保存しました · 一蘭"
+    question = which_one_question(options, none_payload="none", wording=wording)
+    assert question.text == "どれを保存しましたか\n1. 一蘭 渋谷店\n2. 一蘭 新宿店"
+    assert [button.title for button in question.quick_replies] == [
+        "1. 一蘭 渋谷店",
+        "2. 一蘭 新宿店",
+        "どれでもない",
+    ]
+    assert import_progress(40, 100, counts, wording).text == (
+        "40/100件をインポートしました…これまでに12 件のお店、3 本の映画"
+    )
+    assert error_message(wording).text == JAPANESE.error
+    assert result_reply(line, SAVED_MESSAGE_ID, wording).text == "1/2 · 一蘭、渋谷区 · 営業時間外"

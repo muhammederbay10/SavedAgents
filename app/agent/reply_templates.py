@@ -5,28 +5,87 @@ question, import progress, the error message and one line per search result
 (`docs/ARCHITECTURE.md` §3.3 and §3.5, decision record 0004). Everything else
 the bot says is written by the response agent (SAV-17).
 
-Only the bot's own words are translated. Every value the caller passes, such as
-a name, an open category, a genre, an area or a platform, is shown exactly as
-given, never mapped to a fixed list (decision record 0005). Wording exists for
-English and Turkish; another language is one more `_Wording` entry, and a
-language without one gets English.
+**Caller contract.** Every template takes a `ReplyWording`: the bot's own words
+in the user's language. Get it with `reply_wording(language, localized)`:
+
+- `localized`, when given, is used as it is. This is how any language is
+  served: the caller (the response agent, which already writes replies in the
+  user's language) supplies wording for a language with no built-in wording.
+- Otherwise built-in wording is used when it exists (English and Turkish).
+- Otherwise `ReplyWordingUnavailableError` is raised. A user is never silently
+  answered in another language (decision record 0005); the caller decides.
+
+Every value the caller passes, such as a name, an open category, a genre, an
+area, a platform, an option label or a count label, is shown exactly as given,
+never translated or mapped to a fixed list (decision record 0005).
 """
 
+import string
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Final
 
 from app.agent.messenger import MAX_QUICK_REPLIES, OutgoingMessage, QuickReply
 
-# The language whose wording a user gets when there is none for theirs.
-FALLBACK_LANGUAGE: Final = "en"
+# Joins the parts of one line ("Kronotrop, Beşiktaş · open now"). The middle dot
+# is the bot's own layout, used in every language.
 SEPARATOR: Final = " · "
-_LIST_SEPARATOR: Final = ", "
 _LANGUAGE_SUBTAG_SEPARATORS: Final = ("-", "_")
+
+# The placeholders each wording field must contain, exactly. Fields not listed
+# take none.
+_PLACEHOLDERS: Final[dict[str, frozenset[str]]] = {
+    "saved_named": frozenset({"item"}),
+    "saved_as": frozenset({"category"}),
+    "streaming_on": frozenset({"platforms"}),
+    "import_progress": frozenset({"done", "total"}),
+    "import_progress_with_counts": frozenset({"done", "total", "counts"}),
+}
+
+
+class ReplyWordingUnavailableError(LookupError):
+    """There is no wording for the user's language, built in or supplied.
+
+    Attributes:
+        language: The language tag that was asked for.
+    """
+
+    def __init__(self, language: str) -> None:
+        """Create the error.
+
+        Args:
+            language: The language tag that was asked for.
+        """
+        super().__init__(
+            f"no reply wording for language {language!r}: pass localized wording for it"
+        )
+        self.language = language
 
 
 @dataclass(frozen=True)
-class _Wording:
+class ReplyWording:
+    """The bot's own words for the fixed messages, in one language.
+
+    Placeholders in braces are filled in by the templates and must appear
+    exactly as listed. No other braces are allowed.
+
+    Attributes:
+        saved_named: Confirmation for an item with a name; `{item}`, e.g.
+            "Saved: {item}".
+        saved_as: Confirmation for an item without one; `{category}`, e.g.
+            "Saved as {category}".
+        streaming_on: Where it streams; `{platforms}`, e.g. "on {platforms}".
+        which_one: The "which one?" question, e.g. "Which one did you save?".
+        none_of_these: The button for "none of the options".
+        import_progress: Progress with nothing found yet; `{done}` and `{total}`.
+        import_progress_with_counts: Progress with what was found; `{done}`,
+            `{total}` and `{counts}`.
+        error: The message sent when the bot failed to handle a message.
+        open_now: Said of a place that is open now.
+        closed_now: Said of a place that is closed now.
+        list_separator: Joins values in a list, e.g. ", " or "、".
+    """
+
     saved_named: str
     saved_as: str
     streaming_on: str
@@ -37,24 +96,51 @@ class _Wording:
     error: str
     open_now: str
     closed_now: str
+    list_separator: str
+
+    def __post_init__(self) -> None:
+        """Reject empty wording and wrong placeholders.
+
+        Raises:
+            ValueError: If a field is empty, has malformed braces, or doesn't
+                have exactly its placeholders. The message names the field.
+        """
+        for field in fields(self):
+            text: str = getattr(self, field.name)
+            # A separator may be only a space; every other field needs words.
+            is_blank = not text if field.name == "list_separator" else not text.strip()
+            if is_blank:
+                raise ValueError(f"{field.name} must not be empty")
+            expected = _PLACEHOLDERS.get(field.name, frozenset())
+            if _placeholders(field.name, text) != expected:
+                raise ValueError(
+                    f"{field.name} must contain exactly the placeholders {sorted(expected)}"
+                )
 
 
-_ENGLISH: Final = _Wording(
-    saved_named="Saved: {item}",
-    saved_as="Saved as {category}",
-    streaming_on="on {platforms}",
-    which_one="Which one did you save?",
-    none_of_these="None of these",
-    import_progress="Imported {done}/{total}…",
-    import_progress_with_counts="Imported {done}/{total}… {counts} so far",
-    error="Sorry, something went wrong on my side. Please try again in a few minutes.",
-    open_now="open now",
-    closed_now="closed now",
-)
+def _placeholders(field_name: str, text: str) -> frozenset[str]:
+    try:
+        parsed = list(string.Formatter().parse(text))
+    except ValueError as error:
+        raise ValueError(f"{field_name} has malformed braces") from error
+    return frozenset(name for _, name, _, _ in parsed if name is not None)
 
-_WORDINGS: Final[dict[str, _Wording]] = {
-    FALLBACK_LANGUAGE: _ENGLISH,
-    "tr": _Wording(
+
+_BUILT_IN_WORDINGS: Final[dict[str, ReplyWording]] = {
+    "en": ReplyWording(
+        saved_named="Saved: {item}",
+        saved_as="Saved as {category}",
+        streaming_on="on {platforms}",
+        which_one="Which one did you save?",
+        none_of_these="None of these",
+        import_progress="Imported {done}/{total}…",
+        import_progress_with_counts="Imported {done}/{total}… {counts} so far",
+        error="Sorry, something went wrong on my side. Please try again in a few minutes.",
+        open_now="open now",
+        closed_now="closed now",
+        list_separator=", ",
+    ),
+    "tr": ReplyWording(
         saved_named="Kaydedildi: {item}",
         saved_as="{category} olarak kaydedildi",
         streaming_on="{platforms} platformunda",
@@ -65,8 +151,57 @@ _WORDINGS: Final[dict[str, _Wording]] = {
         error="Üzgünüm, bir şeyler ters gitti. Lütfen birkaç dakika sonra tekrar dene.",
         open_now="şu an açık",
         closed_now="şu an kapalı",
+        list_separator=", ",
     ),
 }
+
+
+def has_built_in_wording(language: str) -> bool:
+    """Tell whether a language has built-in wording.
+
+    Args:
+        language: A BCP 47 language tag, e.g. "tr" or "en-GB".
+
+    Returns:
+        True when its primary subtag has built-in wording.
+
+    Raises:
+        ValueError: If the tag is empty.
+    """
+    return _primary_subtag(language) in _BUILT_IN_WORDINGS
+
+
+def reply_wording(language: str, localized: ReplyWording | None = None) -> ReplyWording:
+    """Return the wording to use for a user.
+
+    Args:
+        language: The user's language as a BCP 47 tag, e.g. "tr" or "ja-JP".
+        localized: Wording the caller supplies for that language. It is used
+            when given, also for a language with built-in wording.
+
+    Returns:
+        `localized`, or the built-in wording for the language.
+
+    Raises:
+        ValueError: If the tag is empty.
+        ReplyWordingUnavailableError: If there is no built-in wording for the
+            language and none was supplied.
+    """
+    primary = _primary_subtag(language)
+    if localized is not None:
+        return localized
+    if primary not in _BUILT_IN_WORDINGS:
+        raise ReplyWordingUnavailableError(language)
+    return _BUILT_IN_WORDINGS[primary]
+
+
+def _primary_subtag(language: str) -> str:
+    primary = language.strip().lower()
+    for separator in _LANGUAGE_SUBTAG_SEPARATORS:
+        primary = primary.split(separator, 1)[0]
+    if not primary:
+        raise ValueError("language must not be empty")
+    return primary
 
 
 @dataclass(frozen=True)
@@ -144,37 +279,17 @@ class ResultLine:
     emoji: str | None = None
 
 
-def wording_language(language: str | None) -> str:
-    """Return the language whose wording a user gets.
-
-    Args:
-        language: The user's language as a BCP 47 tag, e.g. "tr" or "en-GB",
-            or `None` when it isn't known.
-
-    Returns:
-        The primary language subtag when wording exists for it, else
-        `FALLBACK_LANGUAGE`.
-    """
-    if language is None:
-        return FALLBACK_LANGUAGE
-    primary = language.strip().lower()
-    for separator in _LANGUAGE_SUBTAG_SEPARATORS:
-        primary = primary.split(separator, 1)[0]
-    return primary if primary in _WORDINGS else FALLBACK_LANGUAGE
-
-
-def save_confirmation(summary: SavedItemSummary, language: str | None) -> OutgoingMessage:
+def save_confirmation(summary: SavedItemSummary, wording: ReplyWording) -> OutgoingMessage:
     """Build the DM that confirms a save and says how it was saved.
 
     Args:
         summary: What to say about the item.
-        language: The user's language.
+        wording: The bot's words in the user's language, from `reply_wording`.
 
     Returns:
         E.g. "Saved: Inception (2010) · Sci-fi · on Netflix 🎬", or
         "Saved as 🚗 car review · BMW M3" for an item without a name.
     """
-    wording = _wording(language)
     if summary.name is not None:
         item = summary.name if summary.year is None else f"{summary.name} ({summary.year})"
         parts = [wording.saved_named.format(item=item), *summary.details]
@@ -182,7 +297,7 @@ def save_confirmation(summary: SavedItemSummary, language: str | None) -> Outgoi
         category = _with_emoji_before(summary.emoji, summary.category)
         parts = [wording.saved_as.format(category=category), *summary.details]
     if summary.streaming_platforms:
-        platforms = _LIST_SEPARATOR.join(summary.streaming_platforms)
+        platforms = wording.list_separator.join(summary.streaming_platforms)
         parts.append(wording.streaming_on.format(platforms=platforms))
     text = SEPARATOR.join(parts)
     if summary.name is not None and summary.emoji is not None:
@@ -191,7 +306,7 @@ def save_confirmation(summary: SavedItemSummary, language: str | None) -> Outgoi
 
 
 def which_one_question(
-    options: Sequence[ChoiceOption], none_payload: str, language: str | None
+    options: Sequence[ChoiceOption], none_payload: str, wording: ReplyWording
 ) -> OutgoingMessage:
     """Build the "which one?" question, with one button per option.
 
@@ -201,7 +316,7 @@ def which_one_question(
     Args:
         options: The candidates, best first.
         none_payload: What the webhook reports when the user taps "None of these".
-        language: The user's language.
+        wording: The bot's words in the user's language, from `reply_wording`.
 
     Returns:
         The question, with a button per option and a last "None of these" button.
@@ -212,7 +327,6 @@ def which_one_question(
     max_options = MAX_QUICK_REPLIES - 1
     if not options or len(options) > max_options:
         raise ValueError(f"a 'which one?' question needs 1 to {max_options} options")
-    wording = _wording(language)
     numbered = [f"{number}. {option.label}" for number, option in enumerate(options, start=1)]
     buttons = [
         QuickReply(title=label, payload=option.payload)
@@ -225,7 +339,7 @@ def which_one_question(
 
 
 def import_progress(
-    done: int, total: int, counts: Sequence[ImportCount], language: str | None
+    done: int, total: int, counts: Sequence[ImportCount], wording: ReplyWording
 ) -> OutgoingMessage:
     """Build an import progress update.
 
@@ -233,7 +347,7 @@ def import_progress(
         done: How many posts have been imported.
         total: How many posts the import has.
         counts: What was found so far, by kind. Kinds with a count of 0 are left out.
-        language: The user's language.
+        wording: The bot's words in the user's language, from `reply_wording`.
 
     Returns:
         E.g. "Imported 230/500… 61 places, 40 movies, 25 study posts so far".
@@ -243,30 +357,29 @@ def import_progress(
     """
     if not 0 <= done <= total:
         raise ValueError("done must be between 0 and total")
-    wording = _wording(language)
     found = [f"{count.count} {count.label}" for count in counts if count.count > 0]
     if not found:
         return OutgoingMessage(text=wording.import_progress.format(done=done, total=total))
     text = wording.import_progress_with_counts.format(
-        done=done, total=total, counts=_LIST_SEPARATOR.join(found)
+        done=done, total=total, counts=wording.list_separator.join(found)
     )
     return OutgoingMessage(text=text)
 
 
-def error_message(language: str | None) -> OutgoingMessage:
+def error_message(wording: ReplyWording) -> OutgoingMessage:
     """Build the DM sent when the bot failed to handle the user's message.
 
     Args:
-        language: The user's language.
+        wording: The bot's words in the user's language, from `reply_wording`.
 
     Returns:
         A short apology that asks the user to try again later.
     """
-    return OutgoingMessage(text=_wording(language).error)
+    return OutgoingMessage(text=wording.error)
 
 
 def result_reply(
-    line: ResultLine, reply_to_message_id: str | None, language: str | None
+    line: ResultLine, reply_to_message_id: str | None, wording: ReplyWording
 ) -> OutgoingMessage:
     """Build the message for one search result.
 
@@ -277,7 +390,7 @@ def result_reply(
         line: The result to show.
         reply_to_message_id: The item's `source_message_id`, or `None` when it
             has none (e.g. an imported item); then put the post link in `line.link`.
-        language: The user's language.
+        wording: The bot's words in the user's language, from `reply_wording`.
 
     Returns:
         E.g. "🍽 1/3 · Kronotrop, Beşiktaş · open now · https://maps…", as a
@@ -288,18 +401,13 @@ def result_reply(
     """
     if not 1 <= line.position <= line.total:
         raise ValueError("position must be between 1 and total")
-    wording = _wording(language)
-    place = line.name if line.area is None else f"{line.name}{_LIST_SEPARATOR}{line.area}"
+    place = line.name if line.area is None else f"{line.name}{wording.list_separator}{line.area}"
     parts = [_with_emoji_before(line.emoji, f"{line.position}/{line.total}"), place, *line.details]
     if line.open_now is not None:
         parts.append(wording.open_now if line.open_now else wording.closed_now)
     if line.link is not None:
         parts.append(line.link)
     return OutgoingMessage(text=SEPARATOR.join(parts), reply_to_message_id=reply_to_message_id)
-
-
-def _wording(language: str | None) -> _Wording:
-    return _WORDINGS[wording_language(language)]
 
 
 def _with_emoji_before(emoji: str | None, text: str) -> str:
