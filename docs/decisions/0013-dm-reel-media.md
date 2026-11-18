@@ -1,4 +1,4 @@
-# 0013: No official API gives us the video of a reel shared by DM
+# 0013: In our test, no official API call returned the video of a third-party reel shared by DM
 
 - Status: spike result recorded. It confirms the caption-only path Muhammed approved for DM-shared reels in SAV-14 (record 0012, point 9). Nothing changes in code.
 - Date: 2026-11-18
@@ -16,10 +16,10 @@ This spike first read Meta's current documentation. Then, with Muhammed's approv
 |---|---|---|
 | Webhook shares | "Only the URL for the shared media or post is included in the notification." `ig_reel` lists `url`, `title`, `reel_video_id`. `ig_post` lists the shared post's id. | `/docs/messenger-platform/reference/webhook-events/messages` |
 | Message node | `GET /{message-id}`, with `attachments{image_data,video_data,file_url}`, `shares{name,description,type,url,id}` ("you need to request the sub-fields also"), and `is_unsupported`. Only "the 20 most recent messages" of a conversation can be read. It needs a Page-linked professional account, a Page token, and `instagram_basic`, `instagram_manage_messages`, `pages_manage_metadata` and `pages_messaging`. | `/docs/graph-api/reference/message` |
-| IG Media node | `GET /{ig-media-id}` returns "only data for media owned by Instagram professional accounts". `owner` is returned only when the app user created the media. `media_url` is left out when the owner turned off downloads or the audio is copyrighted. Reading someone else's media by id is not documented. | `/docs/instagram-platform/reference/instagram-media` |
+| IG Media node | `GET /{ig-media-id}` returns "only data for media owned by Instagram professional accounts". `owner` is returned only when the app user created the media. `media_url` is left out when the owner turned off downloads or the audio is copyrighted. The page doesn't say whether a token can read a professional account's media that another account owns. | `/docs/instagram-platform/reference/instagram-media` |
 | Business Discovery | Another Business or Creator account's media, `media_url` included (not guaranteed). It takes that account's **username**, not a media id. Facebook Login only, and it needs `instagram_manage_insights` and `pages_read_engagement`. | `/docs/instagram-platform/instagram-graph-api/reference/ig-user/business_discovery` |
 | oEmbed | Embed `html` only, with no video URL. It is "**only** meant to be used for embedding". Deriving information "for analytics purposes" is "strictly prohibited". | `/docs/instagram-platform/oembed` |
-| Instagram Login (`graph.instagram.com`) | Needs its own Instagram User token from Business Login for Instagram. "Only the image or video URL for a share will be included in the data returned in a call to the API." It documents fewer message fields than the Message node and has no Business Discovery. | `/docs/instagram-platform/instagram-api-with-instagram-login/conversations-api` |
+| Instagram Login (`graph.instagram.com`) | Needs its own Instagram User token from Business Login for Instagram. "Only the image or video URL for a share will be included in the data returned in a call to the API." Business Discovery is listed for Facebook Login only. | `/docs/instagram-platform/instagram-api-with-instagram-login/conversations-api` |
 | App Review | `instagram_manage_messages` and `instagram_business_manage_messages` need App Review and Advanced Access (with Business Verification) for people without a role on the app. | `/docs/permissions`, `/docs/instagram-platform/app-review` |
 | Versions | v27.0 (4 Nov 2026) is the latest. v26.0, v25.0 and v24.0 are still available. | `/docs/graph-api/changelog` |
 
@@ -52,22 +52,25 @@ Every call was a `GET` to `graph.facebook.com` with the bot's token from the "AP
 ## Findings
 
 1. **`reel_video_id` is the reel's IG Media id.** For the bot's own reel (S4), `GET /{reel_video_id}` returned a playable MP4 `media_url`, the permalink and the shortcode, on v27.0 and v24.0. The id itself is not the obstacle.
-2. **Third-party reels and posts are not readable with this token.** The same request, token, fields and versions failed with code 100/33 for both public third-party reels and both public third-party photos. Only ownership differed from S4. This matches the documentation, which describes `GET /{ig-media-id}` only for media the account owns and offers no lookup of someone else's media by id. Error 100/33 by itself does not say which cause applies. Two possibilities remain untested:
-   - whether App Review or Advanced Access would change the answer (nothing in the docs suggests it would);
-   - whether S1's creator has a professional account (it was a public creator, but we didn't check the account type).
-3. **The message routes don't add anything.** In the conversation, every share is `is_unsupported` with no `shares` and no `attachments`, even with the sub-fields the docs ask for. This is the same Message node a direct lookup would return.
+2. **The tested third-party lookups failed, and the bot-owned control succeeded.**
+   - **Observed:** with the same token, fields and versions, `GET /{reel_video_id}` failed with code 100/33 for both public third-party reels, and `GET /{ig_post_media_id}` failed the same way for both public third-party photos. The same reel lookup succeeded for the reel the bot owns (S4).
+   - **Not established:** why the third-party lookups failed. Error 100/33 says the object "does not exist, cannot be loaded due to missing permissions, or does not support this operation", and doesn't say which. Possible explanations, none of them verified:
+     - ownership: the media isn't the token account's own;
+     - the account type: the media reference returns data only for media "owned by Instagram professional accounts", and we didn't check whether the third-party accounts (S1's creator included) are professional accounts;
+     - permissions: the token lacks `pages_read_engagement` and `instagram_manage_insights`, and the app has no Advanced Access.
+3. **The message routes don't add anything.** In the conversation, every share is `is_unsupported` with no `shares` and no `attachments`, even with the sub-fields the docs ask for. A direct lookup would read the same Message node, so it would probably return the same; that is untested.
 4. **Direct lookup by the webhook's `mid` stays inconclusive.** It failed with HTTP 500 on every version, within minutes of the send, so the 20-message limit doesn't explain it. Two other explanations remain:
    - the webhook `mid` is **not the Graph message id**: the Conversations API ids have a different encoding (they decode to a `new_ig…` prefix, the webhook's to `ig_…`), and none of them matched;
    - the token lacks `pages_manage_metadata` and `pages_messaging`, which the Message node's documentation lists.
 
    A lookup by the Graph message id from A2 was not in the approved batch. Point 3 suggests it would return the same `is_unsupported` message.
 5. **Business Discovery doesn't fit.** It needs the creator's username. Neither the webhook nor any API response above gives it: `from` is the sender, and the URL holds only the shortcode. It also needs scopes the token lacks, works only for Business and Creator accounts, and may leave out `media_url`.
-6. **`graph.instagram.com` doesn't accept this token** (401, code 190). Using that host would mean a new Instagram-Login token, which wasn't approved. The documentation there promises less than the Message node: only "the image or video URL for a share".
+6. **`graph.instagram.com` rejected the existing token** (401, code 190). That is all B0 shows. **Getting media through Instagram Login with a valid Instagram-Login token is untested, because a new token was not authorized.** Its conversations guide says that "only the image or video URL for a share" is returned. Whether that URL plays, and what it holds for a DM-shared reel, is unknown.
 7. **oEmbed and the reel's page are ruled out.** oEmbed's terms forbid analysis, and it has no video URL. Fetching the page would be scraping.
 
 ## Decision
 
-**No: no official route gives us the video (or the caption) of a third-party reel shared by DM**, with this app, this token and its granted permissions, on the routes and versions we tried. DM-shared reels stay **caption-only** (record 0012, point 9), until a capture path that has the file provides it:
+**In the tested setup, no: no official route we tried returned the video (or the caption) of a third-party reel shared by DM.** "The tested setup" is this app in development mode, the bot's existing Unified-login token with the permissions it has, the routes and versions in the table, and samples S1 and S3 plus the extras. This does not show that every official route is impossible. Two routes stay open: Instagram Login with a valid token (not tried), and the Message node with the Graph message id (not tried). The webhook itself still gives us the caption whenever the reel has one. DM-shared reels stay **caption-only** (record 0012, point 9), until a capture path that has the file provides it:
 - the reel saved into a collaborative collection with the bot (record 0003), which does come with an MP4 link;
 - the mobile share extension (Phase 3).
 
@@ -75,8 +78,8 @@ No follow-up ticket is proposed for the adapter or the pipeline.
 
 ## Alternatives considered
 
-- **Asking for more permissions** (`pages_read_engagement`, `instagram_manage_insights`, Advanced Access) to retry A6 or run Business Discovery. The documentation gives no route for someone else's media by id, and Business Discovery still needs a username we don't get. It isn't worth an App Review request.
-- **An Instagram-Login token on `graph.instagram.com`.** It needs a new login and token, and its documentation promises less than the route tested here.
+- **Asking for more permissions** (`pages_read_engagement`, `instagram_manage_insights`, Advanced Access) to retry A6 or run Business Discovery. Whether more permissions change A6 is untested. Business Discovery would still need a username we don't get. Not pursued now, because caption-only is the approved path.
+- **An Instagram-Login token on `graph.instagram.com`.** Untested: it needs a new login and token, which were not authorized. It stays a candidate for a later spike if Muhammed wants one.
 - **oEmbed or the reel's page.** Ruled out by Meta's oEmbed terms and by `AGENTS.md` §6.
 
 ## Consequences
@@ -84,8 +87,10 @@ No follow-up ticket is proposed for the adapter or the pipeline.
 - **SAV-14 is unchanged.** DM reels are indexed from the caption only. Reels with no caption (S4 had none) arrive with no `title`, so for them the bot only has the page link. The "ask when unsure" path applies.
 - **SAV-11, for later:** the webhook `mid` is the right id for `reply_to` (record 0004), but it doesn't look like the id the Conversations API uses. Any future message lookup has to map between the two first.
 - **Open, not planned:**
+  - media retrieval through Instagram Login with a valid token;
   - a lookup by the Graph message id;
+  - whether the third-party accounts are professional accounts;
   - a private-account reel (S2);
-  - the effect of App Review or Advanced Access.
+  - the effect of extra permissions, App Review or Advanced Access.
 
-  None of them is expected to give us a file. Each would need a new proposal and Muhammed's approval.
+  Each would need a new proposal and Muhammed's approval.
