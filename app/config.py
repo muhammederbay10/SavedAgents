@@ -24,6 +24,10 @@ LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 # pgvector cannot build an HNSW index on a `vector` column with more dimensions.
 MAX_EMBEDDING_DIMENSION = 2000
 
+# Instagram accepts a reply only this long after the user's last message
+# (Instagram "Messaging API" page). A setting can shorten the window, never widen it.
+MAX_INSTAGRAM_REPLY_WINDOW_HOURS = 24.0
+
 
 class Settings(BaseSettings):
     """Runtime configuration for the API.
@@ -236,8 +240,9 @@ class MessengerSettings(BaseSettings):
         instagram_access_token: The bot's access token for the Send API
             (`INSTAGRAM_ACCESS_TOKEN`). It is sent in a header, never in a URL.
         instagram_reply_window_hours: How long after the user's last message
-            the bot may still reply (`INSTAGRAM_REPLY_WINDOW_HOURS`). Instagram
-            allows 24 hours; a message for an older conversation is skipped.
+            the bot may still reply (`INSTAGRAM_REPLY_WINDOW_HOURS`), at most
+            `MAX_INSTAGRAM_REPLY_WINDOW_HOURS` (Instagram's 24 hours). A message
+            for an older conversation is skipped. Every number here must be finite.
         send_api_timeout_seconds: Time limit of one Send API request
             (`SEND_API_TIMEOUT_SECONDS`).
         send_api_max_attempts: How often one message is tried before it fails,
@@ -258,11 +263,13 @@ class MessengerSettings(BaseSettings):
     instagram_graph_api_url: Annotated[HttpUrl, UrlConstraints(allowed_schemes=["https"])]
     instagram_account_id: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
     instagram_access_token: SecretStr = Field(min_length=1)
-    instagram_reply_window_hours: float = Field(gt=0)
-    send_api_timeout_seconds: float = Field(gt=0)
+    instagram_reply_window_hours: float = Field(
+        gt=0, le=MAX_INSTAGRAM_REPLY_WINDOW_HOURS, allow_inf_nan=False
+    )
+    send_api_timeout_seconds: float = Field(gt=0, allow_inf_nan=False)
     send_api_max_attempts: int = Field(ge=1)
-    send_api_retry_base_delay_seconds: float = Field(gt=0)
-    send_api_retry_max_delay_seconds: float = Field(gt=0)
+    send_api_retry_base_delay_seconds: float = Field(gt=0, allow_inf_nan=False)
+    send_api_retry_max_delay_seconds: float = Field(gt=0, allow_inf_nan=False)
 
     @model_validator(mode="after")
     def _longest_wait_is_not_below_the_first(self) -> Self:

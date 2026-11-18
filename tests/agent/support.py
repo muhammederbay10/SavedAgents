@@ -1,9 +1,9 @@
-"""Helpers for the messenger tests: settings, a recording Send API and a fixed clock."""
+"""Helpers for the messenger tests: settings, a recording Send API and a fake clock."""
 
 import json
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -67,7 +67,11 @@ Answer = httpx.Response | Exception
 
 @dataclass
 class RecordingSendApi:
-    """A mock Send API that answers from a script and records every request."""
+    """A mock Send API that answers from a script and records every request.
+
+    A recorded request counts as delivered, also when its scripted answer is an
+    error: that is how a server that took the message and then failed behaves.
+    """
 
     answers: Sequence[Answer]
     requests: list[httpx.Request] = field(default_factory=list)
@@ -85,10 +89,17 @@ class RecordingSendApi:
 
 @dataclass
 class RecordingSleep:
+    """Records each wait and moves the fake clock forward by it."""
+
+    now: datetime = NOW
     delays: list[float] = field(default_factory=list)
 
     async def __call__(self, seconds: float) -> None:
         self.delays.append(seconds)
+        self.now += timedelta(seconds=seconds)
+
+    def clock(self) -> datetime:
+        return self.now
 
 
 @dataclass
@@ -101,12 +112,13 @@ class MessengerUnderTest:
 def build_messenger(
     answers: Sequence[Answer],
     max_attempts: int = MAX_ATTEMPTS,
-    clock: Callable[[], datetime] = lambda: NOW,
+    settings: MessengerSettings | None = None,
 ) -> MessengerUnderTest:
+    """A messenger on a scripted Send API. Its clock only moves while it waits."""
     api = RecordingSendApi(answers)
     sleep = RecordingSleep()
     client = httpx.AsyncClient(transport=httpx.MockTransport(api.handle))
     messenger = InstagramMessenger(
-        client, messenger_settings(max_attempts), sleep=sleep, clock=clock
+        client, settings or messenger_settings(max_attempts), sleep=sleep, clock=sleep.clock
     )
     return MessengerUnderTest(messenger, api, sleep)

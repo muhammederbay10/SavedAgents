@@ -28,6 +28,7 @@ from tests.agent.support import (
     SAVED_MESSAGE_ID,
     build_messenger,
     json_response,
+    messenger_settings,
     rate_limited,
     sent,
 )
@@ -165,22 +166,42 @@ async def test_connection_that_never_opened_is_retried() -> None:
     assert result.attempts == 2
 
 
-async def test_service_unavailable_on_every_attempt_raises_unavailable() -> None:
-    under_test = build_messenger([httpx.Response(503)] * MAX_ATTEMPTS)
+async def test_connection_that_never_opens_on_any_attempt_raises_unavailable() -> None:
+    under_test = build_messenger([httpx.ConnectError("refused")] * MAX_ATTEMPTS)
 
     with pytest.raises(MessengerUnavailableError) as raised:
         await under_test.messenger.send(RECIPIENT_ID, OutgoingMessage(text=TEXT), RECENT)
 
+    assert raised.value.status is None
+    assert raised.value.attempts == MAX_ATTEMPTS
+
+
+async def test_message_accepted_then_answered_with_503_is_delivered_once_and_not_retried() -> None:
+    # The server took the message (it is recorded) and then answered 503. A
+    # bare 503 doesn't show the message was not delivered, so it is not repeated.
+    under_test = build_messenger([httpx.Response(503), sent()])
+
+    with pytest.raises(MessengerDeliveryUnknownError) as raised:
+        await under_test.messenger.send(RECIPIENT_ID, OutgoingMessage(text=TEXT), RECENT)
+
+    assert len(under_test.api.requests) == 1
+    assert under_test.sleep.delays == []
     assert raised.value.status == 503
-    assert len(under_test.api.requests) == MAX_ATTEMPTS
+    assert raised.value.attempts == 1
 
 
 @pytest.mark.parametrize(
     "answer",
-    [httpx.ReadTimeout("slow"), httpx.Response(500), httpx.Response(504)],
-    ids=["read_timeout", "http_500", "http_504"],
+    [
+        httpx.ReadTimeout("slow"),
+        httpx.Response(500),
+        httpx.Response(503),
+        httpx.Response(503, headers={"Retry-After": "1"}),
+        httpx.Response(504),
+    ],
+    ids=["read_timeout", "http_500", "http_503", "http_503_retry_after", "http_504"],
 )
-async def test_failure_after_the_request_went_out_is_not_retried_so_no_dm_is_sent_twice(
+async def test_failure_after_the_request_went_out_is_not_retried(
     answer: httpx.Response | Exception,
 ) -> None:
     under_test = build_messenger([answer, sent()])
@@ -251,6 +272,41 @@ async def test_window_is_measured_across_time_zones() -> None:
     result = await under_test.messenger.send(RECIPIENT_ID, OutgoingMessage(text=TEXT), istanbul)
 
     assert result.status is SendStatus.SENT
+
+
+async def test_window_closing_during_backoff_stops_before_the_next_request(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    under_test = build_messenger([rate_limited(), sent()])
+    # 0.25 s before the window closes; the first backoff waits 0.5 s.
+    almost_expired = NOW - timedelta(hours=24) + timedelta(seconds=0.25)
+
+    with caplog.at_level(logging.INFO, logger="app.agent.messenger"):
+        result = await under_test.messenger.send(
+            RECIPIENT_ID, OutgoingMessage(text=TEXT), almost_expired
+        )
+
+    assert under_test.sleep.delays == [BASE_DELAY_SECONDS]
+    assert len(under_test.api.requests) == 1
+    assert result.status is SendStatus.OUTSIDE_REPLY_WINDOW
+    assert result.message_id is None
+    assert result.attempts == 1
+    skipped = [r for r in caplog.records if r.getMessage() == "dm_skipped_outside_reply_window"]
+    assert [record.__dict__["attempts"] for record in skipped] == [1]
+    assert skipped[0].__dict__["reason"] == "reply_window_elapsed"
+
+
+async def test_configured_window_longer_than_instagram_allows_cannot_reach_the_api() -> None:
+    # Validation refuses 48 hours; this also covers settings built without it.
+    widened = messenger_settings().model_copy(update={"instagram_reply_window_hours": 48.0})
+    under_test = build_messenger([sent()], settings=widened)
+
+    result = await under_test.messenger.send(
+        RECIPIENT_ID, OutgoingMessage(text=TEXT), NOW - timedelta(hours=25)
+    )
+
+    assert result.status is SendStatus.OUTSIDE_REPLY_WINDOW
+    assert under_test.api.requests == []
 
 
 async def test_meta_rejecting_a_closed_window_is_reported_as_skipped_and_not_retried() -> None:

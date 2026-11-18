@@ -15,11 +15,15 @@ Two rules decide whether a message is sent at all:
   user's last message), and a message for an older conversation is skipped and
   logged instead of being sent. Meta's own "outside the window" rejection is
   reported the same way.
-- **Retries never send a message twice.** Only failures where Meta certainly
-  did not deliver the message are retried, with exponential backoff: rate-limit
-  rejections, connections that never opened, and HTTP 503. A timeout after the
-  request went out, or another server error, may have delivered it, so it is
-  raised as `MessengerDeliveryUnknownError` and not repeated.
+- **The window is checked before every request**, also before a retry, so a
+  wait between attempts can't carry a message past it.
+- **Only failures that show the message was not taken are retried**, with
+  exponential backoff: Meta's throttling errors (the call was refused) and
+  connections that never opened (nothing was sent). Any other failure after the
+  request went out, such as a timeout or any 5xx including 503, may have
+  delivered the message, so it is raised as `MessengerDeliveryUnknownError` and
+  not repeated. This keeps our retries from causing duplicates; it can't rule
+  out one if a throttling answer was itself wrong.
 
 Nothing personal is logged: no recipient id, message id, text or Meta error
 message. Logs hold the kind of message, the attempt, the HTTP status and
@@ -38,7 +42,7 @@ from typing import Final
 
 import httpx
 
-from app.config import MessengerSettings
+from app.config import MAX_INSTAGRAM_REPLY_WINDOW_HOURS, MessengerSettings
 
 logger = logging.getLogger(__name__)
 
@@ -206,13 +210,14 @@ class MessengerRateLimitError(MessengerError):
 
 
 class MessengerUnavailableError(MessengerError):
-    """Meta could not be reached, or answered 503, on every attempt. Not sent."""
+    """The connection to Meta never opened, on every attempt. Nothing was sent."""
 
 
 class MessengerDeliveryUnknownError(MessengerError):
     """The request went out but no clear answer came back. It may have been sent.
 
-    It is not retried, so the user never gets the same message twice.
+    A timeout after sending or any 5xx, including 503. It is not retried, so a
+    retry can't give the user the same message twice.
     """
 
 
@@ -297,7 +302,11 @@ class InstagramMessenger:
         self._clock = clock
         base_url = str(settings.instagram_graph_api_url).rstrip("/")
         self._messages_url = f"{base_url}/{settings.instagram_account_id}/messages"
-        self._reply_window = timedelta(hours=settings.instagram_reply_window_hours)
+        # Settings validation already caps the window; this keeps settings built
+        # without validation from widening it.
+        self._reply_window_hours = min(
+            settings.instagram_reply_window_hours, MAX_INSTAGRAM_REPLY_WINDOW_HOURS
+        )
 
     async def send(
         self, recipient_id: str, message: OutgoingMessage, last_user_message_at: datetime
@@ -320,29 +329,32 @@ class InstagramMessenger:
             ValueError: If `recipient_id` is empty or `last_user_message_at`
                 has no time zone.
             MessengerRateLimitError: Still throttled after the last attempt.
-            MessengerUnavailableError: Meta unreachable or 503 on every attempt.
+            MessengerUnavailableError: The connection never opened, on every attempt.
             MessengerDeliveryUnknownError: The request went out, but the answer
-                was a timeout or a server error. Not retried.
+                was a timeout or a server error (5xx). Not retried.
             MessengerRequestError: Meta refused the message.
             MessengerResponseError: Meta answered without a message id.
         """
         if not recipient_id.strip():
             raise ValueError("recipient_id must not be empty")
-        hours_since = self._hours_since(last_user_message_at)
-        if hours_since > self._reply_window / timedelta(hours=1):
-            _log_outside_window(message.kind, "reply_window_elapsed", hours_since, attempts=0)
-            return SendResult(SendStatus.OUTSIDE_REPLY_WINDOW, message_id=None, attempts=0)
-        return await self._send_with_retries(build_message_body(recipient_id, message), message)
-
-    def _hours_since(self, moment: datetime) -> float:
-        if moment.tzinfo is None or moment.utcoffset() is None:
+        if last_user_message_at.tzinfo is None or last_user_message_at.utcoffset() is None:
             raise ValueError("last_user_message_at must carry a time zone")
-        return (self._clock() - moment) / timedelta(hours=1)
+        body = build_message_body(recipient_id, message)
+        return await self._send_with_retries(body, message, last_user_message_at)
 
-    async def _send_with_retries(self, body: JsonObject, message: OutgoingMessage) -> SendResult:
+    async def _send_with_retries(
+        self, body: JsonObject, message: OutgoingMessage, last_user_message_at: datetime
+    ) -> SendResult:
         started = time.perf_counter()
         max_attempts = self._settings.send_api_max_attempts
         for attempt in range(1, max_attempts + 1):
+            hours_since = (self._clock() - last_user_message_at) / timedelta(hours=1)
+            if hours_since > self._reply_window_hours:
+                requests_made = attempt - 1
+                _log_outside_window(
+                    message.kind, "reply_window_elapsed", hours_since, attempts=requests_made
+                )
+                return SendResult(SendStatus.OUTSIDE_REPLY_WINDOW, None, attempts=requests_made)
             outcome = await self._attempt(body)
             if isinstance(outcome, str):
                 _log_attempt(logging.INFO, "dm_sent", message.kind, attempt, started)
@@ -420,8 +432,6 @@ def _read_response(response: httpx.Response) -> str | _Failure:
 def _failure_class(status: int, error_code: int | None) -> type[MessengerError]:
     if status == HTTPStatus.TOO_MANY_REQUESTS or error_code in _RATE_LIMIT_ERROR_CODES:
         return MessengerRateLimitError
-    if status == HTTPStatus.SERVICE_UNAVAILABLE:
-        return MessengerUnavailableError
     if status >= HTTPStatus.INTERNAL_SERVER_ERROR:
         return MessengerDeliveryUnknownError
     return MessengerRequestError

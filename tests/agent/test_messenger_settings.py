@@ -63,6 +63,15 @@ def test_graph_api_url_must_use_https(environment: pytest.MonkeyPatch) -> None:
     ("variable", "value"),
     [
         ("INSTAGRAM_REPLY_WINDOW_HOURS", "0"),
+        ("INSTAGRAM_REPLY_WINDOW_HOURS", "-1"),
+        ("INSTAGRAM_REPLY_WINDOW_HOURS", "24.01"),
+        ("INSTAGRAM_REPLY_WINDOW_HOURS", "48"),
+        ("INSTAGRAM_REPLY_WINDOW_HOURS", "inf"),
+        ("INSTAGRAM_REPLY_WINDOW_HOURS", "nan"),
+        ("SEND_API_TIMEOUT_SECONDS", "inf"),
+        ("SEND_API_TIMEOUT_SECONDS", "nan"),
+        ("SEND_API_RETRY_BASE_DELAY_SECONDS", "nan"),
+        ("SEND_API_RETRY_MAX_DELAY_SECONDS", "inf"),
         ("SEND_API_MAX_ATTEMPTS", "0"),
         ("SEND_API_TIMEOUT_SECONDS", "-1"),
         ("INSTAGRAM_ACCOUNT_ID", "  "),
@@ -75,6 +84,15 @@ def test_impossible_values_are_rejected(
 
     with pytest.raises(ValidationError, match=variable.lower()):
         load_from_environment_only()
+
+
+@pytest.mark.parametrize("hours", ["24", "0.5"])
+def test_reply_window_up_to_instagrams_24_hours_is_accepted(
+    environment: pytest.MonkeyPatch, hours: str
+) -> None:
+    environment.setenv("INSTAGRAM_REPLY_WINDOW_HOURS", hours)
+
+    assert load_from_environment_only().instagram_reply_window_hours == float(hours)
 
 
 def test_longest_wait_below_the_first_is_rejected(environment: pytest.MonkeyPatch) -> None:
