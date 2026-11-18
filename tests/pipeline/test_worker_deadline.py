@@ -12,25 +12,39 @@ and Redis (`TEST_REDIS_URL`).
 """
 
 import asyncio
+import contextlib
+import itertools
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 from arq.connections import ArqRedis
-from arq.jobs import Job
+from arq.jobs import Job, JobStatus
+from arq.worker import Worker
 from sqlalchemy import URL, delete, select
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
+from app.adapters.base import CaptureEvent
 from app.config import Settings
 from app.db.models import ItemStatus, User, Vocabulary
-from app.ingestion.jobs import INDEX_SAVED_ITEM_JOB, INDEXING_QUEUE, ArqJobQueue, index_job_id
+from app.ingestion.erasure import IngestionDataEraser
+from app.ingestion.jobs import (
+    INDEX_SAVED_ITEM_JOB,
+    INDEXING_QUEUE,
+    ArqJobQueue,
+    finalize_job_id,
+    index_job_id,
+)
+from app.ingestion.session_state import RedisIngestionState
+from app.models.errors import ModelUnavailableError
 from app.pipeline.indexer import ItemIndexer
-from app.pipeline.worker import WorkerResources, build_worker
-from tests.pipeline.harness import Pipeline, add_item, add_user, load
+from app.pipeline.worker import ArqFinalizationScheduler, WorkerResources, build_worker
+from tests.pipeline.harness import MemoryPayloads, Pipeline, add_item, add_user, load
 from tests.pipeline.support import (
     capture_event,
     open_extraction,
@@ -38,6 +52,8 @@ from tests.pipeline.support import (
     structured_reply,
     transcript,
 )
+
+FINALIZE_DEFER_SECONDS = 0.05
 
 
 @pytest.fixture
@@ -71,9 +87,11 @@ async def job_queue(ingestion_redis: ArqRedis) -> AsyncIterator[ArqJobQueue]:
     queued: list[str] = []
     original = queue.enqueue
 
-    async def recording_enqueue(name: str, job_id: str, arguments: dict[str, Any]) -> bool:
+    async def recording_enqueue(
+        name: str, job_id: str, arguments: dict[str, Any], *, defer_seconds: float | None = None
+    ) -> bool:
         queued.append(job_id)
-        return await original(name, job_id, arguments)
+        return await original(name, job_id, arguments, defer_seconds=defer_seconds)
 
     queue.enqueue = recording_enqueue  # type: ignore[method-assign]
     yield queue
@@ -135,7 +153,9 @@ async def index_with_lock(
         indexing_job_timeout_seconds=job_timeout_seconds,
     )
     indexer = pipeline.indexer(
-        run_deadline_seconds=run_deadline_seconds, failure_recording_seconds=recording_seconds
+        run_deadline_seconds=run_deadline_seconds,
+        failure_recording_seconds=recording_seconds,
+        finalization=ArqFinalizationScheduler(job_queue, defer_seconds=FINALIZE_DEFER_SECONDS),
     )
     worker = build_worker(
         settings,
@@ -188,9 +208,10 @@ async def test_a_delayed_start_then_a_slow_step_shares_one_deadline(
     job_queue: ArqJobQueue,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    # The reviewer's case: start-up waits 0.3 s, then classify hangs. With a
-    # fresh budget after start-up, the run would still be in classify when arq
-    # cancels it at 0.65 s.
+    # The reviewer's case: start-up waits 0.3 s, then classify hangs. With one
+    # budget, the run stops at 0.8 s, inside classify (fetch has 0.5 s to finish).
+    # With a fresh budget after start-up, it would still be in classify at 1.1 s,
+    # after arq cancels it at 1.05 s.
     pipeline.classifier.stalled_calls = 1
     caplog.set_level("INFO", logger="app.pipeline")
 
@@ -201,9 +222,9 @@ async def test_a_delayed_start_then_a_slow_step_shares_one_deadline(
         ingestion_redis,
         job_queue,
         lock_seconds=0.3,
-        run_deadline_seconds=0.4,
+        run_deadline_seconds=0.8,
         recording_seconds=0.2,
-        job_timeout_seconds=0.65,
+        job_timeout_seconds=1.05,
         max_tries=3,
     )
 
@@ -227,7 +248,8 @@ async def test_failure_recording_blocked_by_the_lock_is_bounded_on_the_last_try(
 ) -> None:
     caplog.set_level("INFO", logger="app.pipeline")
     # The lock outlasts every try. The last try can't write `failed` either, but
-    # it gives up on that in time and ends the job itself, before arq would.
+    # it gives up on that in time and ends the job itself, before arq would. The
+    # status write is kept as its own job, which the worker runs until it works.
     item_id, result, elapsed = await index_with_lock(
         pipeline,
         committed_engine,
@@ -242,9 +264,134 @@ async def test_failure_recording_blocked_by_the_lock_is_bounded_on_the_last_try(
     )
 
     assert result == "failed"
-    # Each try ended itself ("failed" is the job's own result, not arq's
-    # TimeoutError), long before the lock was released.
-    assert elapsed < 3.0
     assert any(record.message == "indexing_failure_not_recorded" for record in caplog.records)
-    # The lock kept every write out, so the item is still as it was.
-    assert (await load(pipeline.sessions, item_id)).status == ItemStatus.PENDING
+    # The burst worker went on running the status job until the lock was gone.
+    assert elapsed >= 3.0
+    assert (await load(pipeline.sessions, item_id)).status == ItemStatus.FAILED
+
+
+# --- The final status survives the job that could not save it -------------------
+
+
+class LockingPayloads:
+    """On the given read, has another connection lock the owner's row before going on."""
+
+    def __init__(
+        self,
+        inner: MemoryPayloads,
+        engine: AsyncEngine,
+        *,
+        on_read: int,
+        lock_seconds: float,
+    ) -> None:
+        self.inner = inner
+        self.engine = engine
+        self.on_read = on_read
+        self.lock_seconds = lock_seconds
+        self.reads = 0
+        self.lock: asyncio.Task[None] | None = None
+
+    async def capture(self, user_id: uuid.UUID, saved_item_id: uuid.UUID) -> CaptureEvent | None:
+        self.reads += 1
+        if self.reads == self.on_read:
+            locked = asyncio.Event()
+            self.lock = asyncio.create_task(
+                hold_owner_lock(self.engine, user_id, self.lock_seconds, locked)
+            )
+            await locked.wait()
+        return await self.inner.capture(user_id, saved_item_id)
+
+
+async def wait_until_complete(redis: ArqRedis, job_id: str) -> None:
+    """Wait for a job to finish, by polling Redis the way a separate observer would."""
+    job = Job(job_id, redis, _queue_name=INDEXING_QUEUE)
+    async with asyncio.timeout(10):
+        for _ in itertools.count():
+            if await job.status() is JobStatus.complete:
+                return
+            await asyncio.sleep(0.02)
+
+
+async def test_a_failed_status_the_last_try_could_not_save_is_saved_by_a_later_worker(
+    pipeline: Pipeline,
+    committed_engine: AsyncEngine,
+    settings: Settings,
+    ingestion_redis: ArqRedis,
+    job_queue: ArqJobQueue,
+) -> None:
+    outage = ModelUnavailableError("synthetic outage", operation="generate", model="fake/text")
+    pipeline.script(transcripts=[transcript("synthetic speech")], extractions=[outage])
+    user_id = await add_user(pipeline.sessions)
+    item_id = await add_item(pipeline.sessions, pipeline, capture_event(user_id))
+    # Try 1 runs fetch, classify and transcribe, then the text model fails. Try 2,
+    # the last, finds the owner's row locked until well after it has ended.
+    payloads = LockingPayloads(pipeline.payloads, committed_engine, on_read=2, lock_seconds=2.0)
+    worker_settings = pipeline_settings(
+        indexing_max_tries=2,
+        indexing_run_deadline_seconds=0.4,
+        indexing_failure_recording_seconds=0.3,
+        indexing_job_timeout_seconds=1.0,
+    )
+
+    def worker() -> Worker:
+        indexer = pipeline.indexer(
+            payloads=payloads,
+            run_deadline_seconds=0.4,
+            failure_recording_seconds=0.3,
+            # Long enough that the first worker is gone before the status job runs.
+            finalization=ArqFinalizationScheduler(job_queue, defer_seconds=1.0),
+        )
+        return build_worker(
+            settings,
+            worker_settings,
+            on_startup=startup_with(indexer, 2),
+            redis_pool=ingestion_redis,
+            burst=True,
+        )
+
+    await job_queue.enqueue(
+        INDEX_SAVED_ITEM_JOB,
+        index_job_id(item_id),
+        {"user_id": str(user_id), "saved_item_id": str(item_id)},
+    )
+    first_worker = asyncio.create_task(worker().main())
+    await wait_until_complete(ingestion_redis, index_job_id(item_id))
+    # The worker process goes away; only what is in Redis survives it.
+    first_worker.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await first_worker
+
+    index_job = Job(index_job_id(item_id), ingestion_redis, _queue_name=INDEXING_QUEUE)
+    assert await index_job.result(timeout=1) == "failed"
+    status_job = Job(finalize_job_id(item_id), ingestion_redis, _queue_name=INDEXING_QUEUE)
+    assert await status_job.status() in {JobStatus.deferred, JobStatus.queued}
+    # The lock kept the last try from writing `failed`: the item is stranded mid-way.
+    assert (await load(pipeline.sessions, item_id)).status == ItemStatus.ENRICHING
+
+    assert payloads.lock is not None
+    await payloads.lock
+    await worker().main()
+
+    assert (await load(pipeline.sessions, item_id)).status == ItemStatus.FAILED
+    assert await status_job.status() is JobStatus.not_found
+    # Nothing that had finished was run again.
+    assert pipeline.media_server.requests == 1
+    assert pipeline.classifier.asked_keys().count("content_type") == 1
+    assert len(pipeline.primary_stt.calls) == 1
+    assert len(pipeline.text_model.requests) == 1
+
+
+async def test_erasing_a_user_removes_their_pending_status_job(
+    ingestion_redis: ArqRedis, job_queue: ArqJobQueue
+) -> None:
+    user_id, item_id = uuid.uuid4(), uuid.uuid4()
+    await ArqFinalizationScheduler(job_queue, defer_seconds=60).schedule(user_id, item_id)
+    status_job = Job(finalize_job_id(item_id), ingestion_redis, _queue_name=INDEXING_QUEUE)
+    assert await status_job.status() is JobStatus.deferred
+
+    eraser = IngestionDataEraser(
+        RedisIngestionState(ingestion_redis, timedelta(seconds=60)), job_queue
+    )
+    await eraser.erase_user(user_id, [item_id])
+
+    assert await status_job.status() is JobStatus.not_found

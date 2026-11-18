@@ -12,8 +12,11 @@ more slots. The providers' rate limits set the real ceiling.
 
 **Retries.** A step that fails in a way that may pass later raises
 `RetryLaterError`; the job is tried again after a growing wait, up to
-`INDEXING_MAX_TRIES` runs. The last run marks the item `failed`. Each run
-continues after the steps that already finished (`app.pipeline.indexer`).
+`INDEXING_MAX_TRIES` runs. The last run marks the item `failed`, and first
+queues `finalize_saved_item`, an ids-only job that writes that status again
+until it is saved, so a database that is locked or down at that moment can't
+leave the item unfinished. Each run continues after the steps that already
+finished (`app.pipeline.indexer`).
 Reading the payload and the item at the start is retried the same way.
 
 **One budget per run.** `INDEXING_RUN_DEADLINE_SECONDS` starts before the
@@ -52,7 +55,14 @@ from app.config import (
     get_settings,
 )
 from app.db.session import create_engine, create_session_factory
-from app.ingestion.jobs import INDEX_SAVED_ITEM_JOB, INDEXING_QUEUE
+from app.ingestion.jobs import (
+    FINALIZE_SAVED_ITEM_JOB,
+    INDEX_SAVED_ITEM_JOB,
+    INDEXING_QUEUE,
+    ArqJobQueue,
+    JobQueue,
+    finalize_job_id,
+)
 from app.logging_config import configure_logging
 from app.models.factory import build_model_clients, open_http_client
 from app.pipeline.classify import PostClassifier
@@ -60,7 +70,12 @@ from app.pipeline.confirm import SaveConfirmer
 from app.pipeline.embed import ItemEmbedder
 from app.pipeline.extract import Extractor
 from app.pipeline.fetch import MediaFetcher
-from app.pipeline.indexer import ItemIndexer, PipelineSteps, RetryLaterError
+from app.pipeline.indexer import (
+    FinalizationScheduler,
+    ItemIndexer,
+    PipelineSteps,
+    RetryLaterError,
+)
 from app.pipeline.media import FfmpegMediaTools
 from app.pipeline.normalize import Normalizer, VocabularyRules
 from app.pipeline.payloads import CapturePayloads
@@ -96,6 +111,76 @@ class WorkerResources:
     max_tries: int
     retry_delay_seconds: float
     close: Callable[[], Awaitable[None]]
+
+
+# The status job runs until the status is saved or the item is gone; arq needs a
+# number, so this one is never reached in practice.
+_UNTIL_SAVED: Final = 2**31 - 1
+
+
+class ArqFinalizationScheduler(FinalizationScheduler):
+    """Queues the ids-only job that saves an item's `failed` status, on the indexing queue.
+
+    The job lives in Redis, so it outlives the job that queued it and the
+    worker that ran it. "Delete my data" removes it with the user's other jobs.
+    """
+
+    def __init__(self, job_queue: JobQueue, *, defer_seconds: float) -> None:
+        """Create the scheduler.
+
+        Args:
+            job_queue: The queue to put the job on.
+            defer_seconds: How long the job waits before its first run.
+        """
+        self._job_queue = job_queue
+        self._defer_seconds = defer_seconds
+
+    async def schedule(self, user_id: uuid.UUID, saved_item_id: uuid.UUID) -> None:
+        """Queue the status job, unless one is already queued for the item.
+
+        Args:
+            user_id: The item's owner.
+            saved_item_id: The item.
+
+        Raises:
+            redis.exceptions.RedisError: If Redis cannot be reached.
+        """
+        await self._job_queue.enqueue(
+            FINALIZE_SAVED_ITEM_JOB,
+            finalize_job_id(saved_item_id),
+            {"user_id": str(user_id), "saved_item_id": str(saved_item_id)},
+            defer_seconds=self._defer_seconds,
+        )
+
+
+async def finalize_saved_item(ctx: JobContext, *, user_id: str, saved_item_id: str) -> str:
+    """Save the `failed` status a last indexing try could not save; ids only.
+
+    It runs again, after `INDEXING_RETRY_DELAY_SECONDS` times its try number
+    (capped at `INDEXING_MAX_TRIES` times), until the status is saved, is
+    already final, or the item or its user is gone.
+
+    Args:
+        ctx: arq's job context.
+        user_id: The item's owner, as text.
+        saved_item_id: The item, as text.
+
+    Returns:
+        The outcome's name, e.g. `finalized`.
+
+    Raises:
+        arq.Retry: If the status could not be written yet.
+    """
+    resources: WorkerResources = ctx[_RESOURCES]
+    job_try: int = ctx[_JOB_TRY]
+    try:
+        outcome = await resources.indexer.finalize_failed(
+            uuid.UUID(user_id), uuid.UUID(saved_item_id)
+        )
+    except RetryLaterError as error:
+        delay = resources.retry_delay_seconds * min(job_try, resources.max_tries)
+        raise Retry(defer=delay) from error
+    return outcome.value
 
 
 async def index_saved_item(ctx: JobContext, *, user_id: str, saved_item_id: str) -> str:
@@ -151,6 +236,7 @@ async def start_worker(ctx: JobContext) -> None:
         ffmpeg_path=pipeline_settings.ffmpeg_path,
         ffprobe_path=pipeline_settings.ffprobe_path,
         timeout_seconds=pipeline_settings.media_tool_timeout_seconds,
+        stop_timeout_seconds=pipeline_settings.media_tool_stop_timeout_seconds,
     )
     rules = VocabularyRules(
         privacy_min_probability=pipeline_settings.vocab_privacy_min_probability,
@@ -208,6 +294,10 @@ async def start_worker(ctx: JobContext) -> None:
             alias_min_probability=rules.alias_min_probability,
             run_deadline_seconds=pipeline_settings.indexing_run_deadline_seconds,
             failure_recording_seconds=pipeline_settings.indexing_failure_recording_seconds,
+            finalization=ArqFinalizationScheduler(
+                ArqJobQueue(ctx[_REDIS]),
+                defer_seconds=pipeline_settings.indexing_retry_delay_seconds,
+            ),
         ),
         max_tries=pipeline_settings.indexing_max_tries,
         retry_delay_seconds=pipeline_settings.indexing_retry_delay_seconds,
@@ -259,7 +349,14 @@ def build_worker(
                 index_saved_item,
                 name=INDEX_SAVED_ITEM_JOB,
                 max_tries=pipeline_settings.indexing_max_tries,
-            )
+            ),
+            # No result is kept, so a later failure of the same item can queue it again.
+            func(
+                finalize_saved_item,
+                name=FINALIZE_SAVED_ITEM_JOB,
+                max_tries=_UNTIL_SAVED,
+                keep_result=0,
+            ),
         ],
         queue_name=INDEXING_QUEUE,
         redis_settings=RedisSettings.from_dsn(str(settings.redis_url)),

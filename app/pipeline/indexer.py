@@ -32,7 +32,7 @@ from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Final
+from typing import Final, Protocol
 
 from redis.exceptions import RedisError
 from sqlalchemy.exc import SQLAlchemyError
@@ -116,6 +116,30 @@ class IndexOutcome(StrEnum):
     GONE = "gone"
     NOT_PENDING = "not_pending"
     FAILED = "failed"
+
+
+class FinalizeOutcome(StrEnum):
+    """How one run of a status-finalization job ended."""
+
+    FINALIZED = "finalized"
+    ALREADY_FINAL = "already_final"
+    GONE = "gone"
+
+
+class FinalizationScheduler(Protocol):
+    """Keeps, outside the running job, the intent to save an item's `failed` status."""
+
+    async def schedule(self, user_id: uuid.UUID, saved_item_id: uuid.UUID) -> None:
+        """Queue a durable, ids-only job that saves the status until it is saved.
+
+        Args:
+            user_id: The item's owner.
+            saved_item_id: The item.
+
+        Raises:
+            redis.exceptions.RedisError: If the job could not be queued.
+        """
+        ...
 
 
 class RetryLaterError(Exception):
@@ -241,6 +265,7 @@ class ItemIndexer:
         alias_min_probability: float,
         run_deadline_seconds: float,
         failure_recording_seconds: float,
+        finalization: FinalizationScheduler,
     ) -> None:
         """Create the indexer.
 
@@ -256,6 +281,8 @@ class ItemIndexer:
                 and retried.
             failure_recording_seconds: `INDEXING_FAILURE_RECORDING_SECONDS`: how
                 long recording a failure may take after the run stopped.
+            finalization: Keeps the `failed` status of a last try durable, so it
+                is saved later if this job can't save it.
         """
         self._sessions = sessions
         self._payloads = payloads
@@ -265,6 +292,7 @@ class ItemIndexer:
         self._alias_min_probability = alias_min_probability
         self._run_deadline_seconds = run_deadline_seconds
         self._failure_recording_seconds = failure_recording_seconds
+        self._finalization = finalization
 
     async def index(
         self, user_id: uuid.UUID, saved_item_id: uuid.UUID, *, last_try: bool
@@ -580,9 +608,71 @@ class ItemIndexer:
             yield session, item
 
     async def _fail(self, attempt: _Attempt, error: BaseException) -> IndexOutcome:
+        """Mark the item `failed`, durably even if this job can't write the status now.
+
+        The status job is queued first, ids only, so the intent survives this
+        job and this worker. If the status is written here as well, that job
+        finds it written and ends.
+        """
         logger.warning("saved_item_indexing_failed", extra=attempt.log_details(error))
+        await self._schedule_finalization(attempt)
         await self._record_within_allowance(attempt, error, ItemStatus.FAILED)
         return IndexOutcome.FAILED
+
+    async def _schedule_finalization(self, attempt: _Attempt) -> None:
+        try:
+            async with asyncio.timeout(self._failure_recording_seconds):
+                await self._finalization.schedule(attempt.user_id, attempt.item_id)
+        except (RedisError, OSError) as error:
+            logger.error(
+                "indexing_finalization_not_scheduled",
+                extra={"saved_item_id": str(attempt.item_id), "error": describe(error)},
+            )
+
+    async def finalize_failed(
+        self, user_id: uuid.UUID, saved_item_id: uuid.UUID
+    ) -> FinalizeOutcome:
+        """Save an item's `failed` status, for the job a last try queued.
+
+        It calls no model and repeats no step: it only writes the status, under
+        the owner's row lock, within `INDEXING_FAILURE_RECORDING_SECONDS`.
+
+        Args:
+            user_id: The item's owner.
+            saved_item_id: The item.
+
+        Returns:
+            Whether the status was written now, was already final, or the item
+            or its user is gone.
+
+        Raises:
+            RetryLaterError: If the database could not be written in time; the
+                job runs again.
+        """
+        try:
+            async with asyncio.timeout(self._failure_recording_seconds):
+                return await self._write_failed_status(user_id, saved_item_id)
+        except (SQLAlchemyError, OSError) as error:
+            logger.info(
+                "saved_item_finalization_retry",
+                extra={"saved_item_id": str(saved_item_id), "error": describe(error)},
+            )
+            raise RetryLaterError(None, error) from error
+
+    async def _write_failed_status(
+        self, user_id: uuid.UUID, saved_item_id: uuid.UUID
+    ) -> FinalizeOutcome:
+        async with self._sessions() as session, session.begin():
+            if not await lock_user(session, user_id):
+                return FinalizeOutcome.GONE
+            item = await load_item(session, saved_item_id)
+            if item is None or item.user_id != user_id:
+                return FinalizeOutcome.GONE
+            if item.status not in _RESUMABLE_STATUSES:
+                return FinalizeOutcome.ALREADY_FINAL
+            item.status = ItemStatus.FAILED
+        logger.info("saved_item_failure_finalized", extra={"saved_item_id": str(saved_item_id)})
+        return FinalizeOutcome.FINALIZED
 
     async def _record_retry(self, attempt: _Attempt, error: BaseException) -> None:
         logger.info("saved_item_indexing_retry", extra=attempt.log_details(error))

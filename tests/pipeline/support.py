@@ -324,6 +324,7 @@ def pipeline_settings(**overrides: object) -> PipelineSettings:
         "ffmpeg_path": "ffmpeg",
         "ffprobe_path": "ffprobe",
         "media_tool_timeout_seconds": 5,
+        "media_tool_stop_timeout_seconds": 1,
         "transcript_min_speech_characters": 4,
         "classify_is_list_min_probability": 0.5,
         "extraction_temperature": 0,

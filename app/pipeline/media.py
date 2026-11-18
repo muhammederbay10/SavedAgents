@@ -2,9 +2,13 @@
 
 The pipeline runs the two programs; no Python media package is used. Every run
 has a time limit, its arguments are passed as a list (never through a shell),
+a run that times out or is cancelled stops and reaps its own child before it
+ends,
 and its error output is never logged or raised, because it can name the file.
 
-    tools = FfmpegMediaTools(ffmpeg_path="ffmpeg", ffprobe_path="ffprobe", timeout_seconds=60)
+    tools = FfmpegMediaTools(
+        ffmpeg_path="ffmpeg", ffprobe_path="ffprobe", timeout_seconds=60, stop_timeout_seconds=5
+    )
     probe = await tools.probe(Path("clip.mp4"))
     if probe.has_audio:
         audio = await tools.extract_audio(Path("clip.mp4"))
@@ -126,17 +130,28 @@ class MediaTools(Protocol):
 class FfmpegMediaTools(MediaTools):
     """`MediaTools` on the `ffmpeg` and `ffprobe` programs."""
 
-    def __init__(self, *, ffmpeg_path: str, ffprobe_path: str, timeout_seconds: float) -> None:
+    def __init__(
+        self,
+        *,
+        ffmpeg_path: str,
+        ffprobe_path: str,
+        timeout_seconds: float,
+        stop_timeout_seconds: float,
+    ) -> None:
         """Create the tools.
 
         Args:
             ffmpeg_path: The `ffmpeg` program, a name on `PATH` or a path.
             ffprobe_path: The `ffprobe` program.
             timeout_seconds: Time limit of one run.
+            stop_timeout_seconds: How long a run that is stopped (it timed out, or
+                its task was cancelled) waits for the program to exit, first after
+                SIGTERM and then again after SIGKILL.
         """
         self._ffmpeg = ffmpeg_path
         self._ffprobe = ffprobe_path
         self._timeout_seconds = timeout_seconds
+        self._stop_timeout_seconds = stop_timeout_seconds
 
     async def probe(self, source: Path) -> MediaProbe:
         """Report the streams and length of a file.
@@ -270,12 +285,39 @@ class FfmpegMediaTools(MediaTools):
         try:
             output, _ = await asyncio.wait_for(process.communicate(), self._timeout_seconds)
         except TimeoutError as error:
-            process.kill()
-            await process.wait()
+            await self._stop(process, name)
             raise MediaToolError(f"{name} took longer than {self._timeout_seconds} s") from error
+        except asyncio.CancelledError:
+            # The run's deadline, or the worker shutting down. The program must
+            # not keep running next to the next try, so it is stopped first.
+            await self._stop(process, name)
+            raise
         if process.returncode != 0:
             raise MediaToolError(f"{name} failed with exit code {process.returncode}")
         return output
+
+    async def _stop(self, process: asyncio.subprocess.Process, name: str) -> None:
+        """Stop this exact child and reap it, within a bounded time.
+
+        SIGTERM first, so ffmpeg can exit cleanly; SIGKILL if it hasn't exited
+        within `stop_timeout_seconds`. Only this process is signalled, by its
+        own handle, never by program name. If it still hasn't exited after
+        SIGKILL, that is logged and the run goes on stopping.
+        """
+        for send_signal in (process.terminate, process.kill):
+            if process.returncode is not None:
+                return
+            try:
+                send_signal()
+            except ProcessLookupError:
+                return
+            try:
+                async with asyncio.timeout(self._stop_timeout_seconds):
+                    await process.wait()
+                return
+            except TimeoutError:
+                continue
+        logger.error("media_tool_not_reaped", extra={"program": name, "pid": process.pid})
 
 
 # `-y` overwrites a target in the job's own temporary folder; `-nostdin` keeps

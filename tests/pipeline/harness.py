@@ -45,6 +45,16 @@ RULES = VocabularyRules(
 )
 
 
+class RecordingFinalization:
+    """Records the status jobs a last try asks for, instead of queuing them."""
+
+    def __init__(self) -> None:
+        self.scheduled: list[tuple[uuid.UUID, uuid.UUID]] = []
+
+    async def schedule(self, user_id: uuid.UUID, saved_item_id: uuid.UUID) -> None:
+        self.scheduled.append((user_id, saved_item_id))
+
+
 class MemoryPayloads:
     """Capture events by item, standing in for ingestion's Redis hash."""
 
@@ -74,6 +84,7 @@ class Pipeline:
     )
     messenger: RecordingMessenger = field(default_factory=RecordingMessenger)
     payloads: MemoryPayloads = field(default_factory=MemoryPayloads)
+    finalization: RecordingFinalization = field(default_factory=RecordingFinalization)
 
     def script(
         self,
@@ -102,6 +113,7 @@ class Pipeline:
         payloads: object | None = None,
         run_deadline_seconds: float = RUN_DEADLINE_SECONDS,
         failure_recording_seconds: float = FAILURE_RECORDING_SECONDS,
+        finalization: object | None = None,
     ) -> ItemIndexer:
         """Build the indexer; tests may swap in failing sessions or payloads."""
         store = self.store
@@ -146,6 +158,7 @@ class Pipeline:
             alias_min_probability=RULES.alias_min_probability,
             run_deadline_seconds=run_deadline_seconds,
             failure_recording_seconds=failure_recording_seconds,
+            finalization=finalization or self.finalization,  # type: ignore[arg-type]
         )
 
 

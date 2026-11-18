@@ -321,6 +321,10 @@ class PipelineSettings(BaseSettings):
         ffprobe_path: The `ffprobe` program (`FFPROBE_PATH`).
         media_tool_timeout_seconds: Time limit of one ffmpeg or ffprobe run
             (`MEDIA_TOOL_TIMEOUT_SECONDS`).
+        media_tool_stop_timeout_seconds: How long a stopped ffmpeg or ffprobe run
+            (timed out, or cancelled by the run's deadline) waits for the program
+            to exit, after SIGTERM and again after SIGKILL
+            (`MEDIA_TOOL_STOP_TIMEOUT_SECONDS`).
         transcript_min_speech_characters: The near-empty rule
             (`TRANSCRIPT_MIN_SPEECH_CHARACTERS`). A final transcript with fewer
             letters and digits than this, in any script, counts as no speech.
@@ -382,6 +386,7 @@ class PipelineSettings(BaseSettings):
     ffmpeg_path: NonEmptyText
     ffprobe_path: NonEmptyText
     media_tool_timeout_seconds: float = Field(gt=0, allow_inf_nan=False)
+    media_tool_stop_timeout_seconds: float = Field(gt=0, allow_inf_nan=False)
 
     transcript_min_speech_characters: int = Field(ge=1)
 

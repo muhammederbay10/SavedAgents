@@ -5,6 +5,7 @@ Every caption, transcript and name is synthetic.
 """
 
 import logging
+import uuid
 from pathlib import Path
 
 import pytest
@@ -16,7 +17,7 @@ from app.logging_config import configure_logging
 from app.models.base import TranscriptionAttempt, YesNoAnswer
 from app.models.errors import ModelUnavailableError
 from app.pipeline.classify import NONE_OF_THESE
-from app.pipeline.indexer import IndexOutcome, RetryLaterError
+from app.pipeline.indexer import FinalizeOutcome, IndexOutcome, RetryLaterError
 from app.pipeline.media import MediaProbe
 from app.pipeline.runs import Step
 from app.types.registry import UnknownContentTypeError
@@ -417,3 +418,62 @@ async def test_an_unexpected_error_marks_the_item_failed_and_is_raised(pipeline:
         await pipeline.indexer().index(user_id, item_id, last_try=False)
 
     assert (await load(pipeline.sessions, item_id)).status == ItemStatus.FAILED
+
+
+async def test_a_last_try_failure_queues_the_durable_status_job(pipeline: Pipeline) -> None:
+    failure = ModelUnavailableError("synthetic outage", operation="transcribe", model="fake/mai")
+    pipeline.script(transcripts=[failure], fallback_transcripts=[failure])
+    user_id = await add_user(pipeline.sessions)
+    item_id = await add_item(pipeline.sessions, pipeline, capture_event(user_id))
+
+    await pipeline.indexer().index(user_id, item_id, last_try=True)
+
+    assert pipeline.finalization.scheduled == [(user_id, item_id)]
+
+
+async def test_a_retry_that_is_not_the_last_queues_no_status_job(pipeline: Pipeline) -> None:
+    failure = ModelUnavailableError("synthetic outage", operation="transcribe", model="fake/mai")
+    pipeline.script(transcripts=[failure], fallback_transcripts=[failure])
+    user_id = await add_user(pipeline.sessions)
+    item_id = await add_item(pipeline.sessions, pipeline, capture_event(user_id))
+
+    with pytest.raises(RetryLaterError):
+        await pipeline.indexer().index(user_id, item_id, last_try=False)
+
+    assert pipeline.finalization.scheduled == []
+
+
+@pytest.mark.parametrize(
+    ("status", "outcome", "final_status"),
+    [
+        (ItemStatus.PENDING, FinalizeOutcome.FINALIZED, ItemStatus.FAILED),
+        (ItemStatus.ENRICHING, FinalizeOutcome.FINALIZED, ItemStatus.FAILED),
+        (ItemStatus.DONE, FinalizeOutcome.ALREADY_FINAL, ItemStatus.DONE),
+        (ItemStatus.FAILED, FinalizeOutcome.ALREADY_FINAL, ItemStatus.FAILED),
+    ],
+)
+async def test_the_status_job_writes_failed_only_over_an_unfinished_status(
+    pipeline: Pipeline, status: ItemStatus, outcome: FinalizeOutcome, final_status: ItemStatus
+) -> None:
+    user_id = await add_user(pipeline.sessions)
+    item_id = await add_item(pipeline.sessions, pipeline, capture_event(user_id))
+    async with pipeline.sessions() as session, session.begin():
+        item = await session.get(SavedItem, item_id)
+        assert item is not None
+        item.status = status
+
+    assert await pipeline.indexer().finalize_failed(user_id, item_id) is outcome
+
+    assert (await load(pipeline.sessions, item_id)).status == final_status
+    assert pipeline.classifier.calls == [] and pipeline.text_model.requests == []
+
+
+async def test_the_status_job_ends_when_the_item_is_gone(pipeline: Pipeline) -> None:
+    user_id = await add_user(pipeline.sessions)
+
+    outcome = await pipeline.indexer().finalize_failed(user_id, uuid.uuid4())
+
+    assert outcome is FinalizeOutcome.GONE
+    assert await pipeline.indexer().finalize_failed(uuid.uuid4(), uuid.uuid4()) is (
+        FinalizeOutcome.GONE
+    )

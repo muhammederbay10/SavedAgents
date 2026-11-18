@@ -290,7 +290,7 @@ Every saved item is understood once, when it is saved (`docs/ARCHITECTURE.md` §
 5. **Normalize:** open values (category, tags, cuisine, subject…) go through the shared vocabulary: exact hit, privacy gate, then match-or-new (§3.4).
 6. **Embed** the summary and transcript, mark the item `done`, and **confirm** by DM how it was saved, in the user's language, or in English while it isn't known.
 
-Each step's result is kept in `enrichment_run`, so a job that runs again continues where it stopped. A run that can't read its payload or item, or that passes `INDEXING_RUN_DEADLINE_SECONDS`, runs again too. That deadline starts before the payload is read, so a slow start (for example, the user's row locked by "delete my data") uses the same budget as the steps. The last of `INDEXING_MAX_TRIES` runs marks the item `failed`. The worker reads only the indexing queue; chat jobs wait in theirs. Logs hold, for each item, its type, whether it was escalated, and the cost of its model calls.
+Each step's result is kept in `enrichment_run`, so a job that runs again continues where it stopped. A run that can't read its payload or item, or that passes `INDEXING_RUN_DEADLINE_SECONDS`, runs again too, and an ffmpeg or ffprobe run it was waiting for is stopped first. That deadline starts before the payload is read, so a slow start (for example, the user's row locked by "delete my data") uses the same budget as the steps. The last of `INDEXING_MAX_TRIES` runs marks the item `failed`. It also queues a small `finalize_saved_item` job (ids only) that writes that status again until it is saved, in case the database was locked or down at that moment. The worker reads only the indexing queue; chat jobs wait in theirs. Logs hold, for each item, its type, whether it was escalated, and the cost of its model calls.
 
 Run the worker on your machine (it reads `.env`, and needs ffmpeg, Postgres and Redis):
 
@@ -313,6 +313,7 @@ The worker reads `Settings`, `ModelSettings`, `MessengerSettings` and `PipelineS
 | `MEDIA_DOWNLOAD_TIMEOUT_SECONDS`, `MEDIA_MAX_DOWNLOAD_BYTES` | Time limit and largest size of one download. Larger media is skipped and the item indexed from its text |
 | `MEDIA_STORED_HEIGHT_PIXELS` | Height of the stored copies (360). Smaller media keeps its size |
 | `FFMPEG_PATH`, `FFPROBE_PATH`, `MEDIA_TOOL_TIMEOUT_SECONDS` | The two programs, and the time limit of one run |
+| `MEDIA_TOOL_STOP_TIMEOUT_SECONDS` | A run that times out, or is cancelled by the run's deadline, stops its own child: SIGTERM, then SIGKILL if it hasn't exited within this time, and it waits for the child to be reaped |
 | `TRANSCRIPT_MIN_SPEECH_CHARACTERS` | The near-empty rule above |
 | `CLASSIFY_IS_LIST_MIN_PROBABILITY` | A post counts as a list from this probability of yes |
 | `EXTRACTION_TEMPERATURE`, `EXTRACTION_MAX_OUTPUT_TOKENS` | Sampling and reply length of extraction and the escalation |

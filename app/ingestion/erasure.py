@@ -7,7 +7,7 @@ before it deletes the user's rows.
 import uuid
 from collections.abc import Sequence
 
-from app.ingestion.jobs import JobQueue, chat_job_id, index_job_id
+from app.ingestion.jobs import JobQueue, chat_job_id, finalize_job_id, index_job_id
 from app.ingestion.session_state import RedisIngestionState
 
 
@@ -25,7 +25,7 @@ class IngestionDataEraser:
         self._job_queue = job_queue
 
     async def erase_user(self, user_id: uuid.UUID, saved_item_ids: Sequence[uuid.UUID]) -> None:
-        """Remove a user's indexing and chat jobs, and everything ingestion keeps for them.
+        """Remove a user's indexing, status-finalization and chat jobs, and ingestion's state.
 
         Args:
             user_id: The user.
@@ -37,6 +37,7 @@ class IngestionDataEraser:
         chat_receipt_ids = await self._state.chat_receipt_ids(user_id)
         job_ids = [
             *(index_job_id(item_id) for item_id in saved_item_ids),
+            *(finalize_job_id(item_id) for item_id in saved_item_ids),
             *(chat_job_id(receipt_id) for receipt_id in chat_receipt_ids),
         ]
         await self._job_queue.discard(job_ids)

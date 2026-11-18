@@ -10,7 +10,13 @@ from arq.connections import ArqRedis
 from arq.jobs import Job
 
 from app.config import Settings
-from app.ingestion.jobs import INDEX_SAVED_ITEM_JOB, INDEXING_QUEUE, ArqJobQueue, index_job_id
+from app.ingestion.jobs import (
+    FINALIZE_SAVED_ITEM_JOB,
+    INDEX_SAVED_ITEM_JOB,
+    INDEXING_QUEUE,
+    ArqJobQueue,
+    index_job_id,
+)
 from app.pipeline.indexer import IndexOutcome, RetryLaterError
 from app.pipeline.runs import Step
 from app.pipeline.worker import WorkerResources, build_worker, index_saved_item
@@ -118,5 +124,5 @@ def test_the_worker_reads_only_the_indexing_queue(settings: Settings) -> None:
     worker = build_worker(settings, pipeline_settings(indexing_concurrency=7))
 
     assert worker.queue_name == INDEXING_QUEUE
-    assert set(worker.functions) == {INDEX_SAVED_ITEM_JOB}
+    assert set(worker.functions) == {INDEX_SAVED_ITEM_JOB, FINALIZE_SAVED_ITEM_JOB}
     assert worker.max_jobs == 7
