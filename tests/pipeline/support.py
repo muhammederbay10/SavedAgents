@@ -79,6 +79,8 @@ class ScriptedClassifier:
             such as a model claiming that a clip has speech.
         cost_usd: The charge reported for each call.
         stalled_calls: How many of the first calls hang, as a model that never answers.
+        cancelled_calls: How many of the first calls are cancelled, as when the
+            worker shuts down or arq cancels the job; arq then runs the job again.
         before_decide: Run once, at the next call, before it is answered.
         calls: The state and questions of every call.
     """
@@ -92,6 +94,7 @@ class ScriptedClassifier:
     extra_answers: dict[str, Answer] = field(default_factory=dict)
     cost_usd: float | None = 0.0001
     stalled_calls: int = 0
+    cancelled_calls: int = 0
     before_decide: Callable[[], Awaitable[None]] | None = None
     calls: list[tuple[tuple[ContentPart, ...], tuple[Question, ...]]] = field(default_factory=list)
 
@@ -99,6 +102,9 @@ class ScriptedClassifier:
         self, state: Sequence[ContentPart], questions: Sequence[Question]
     ) -> DecisionResult:
         self.calls.append((tuple(state), tuple(questions)))
+        if self.cancelled_calls > 0:
+            self.cancelled_calls -= 1
+            raise asyncio.CancelledError
         if self.stalled_calls > 0:
             self.stalled_calls -= 1
             await asyncio.sleep(STALL_SECONDS)

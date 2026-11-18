@@ -339,7 +339,13 @@ class ItemIndexer:
         return IndexOutcome.INDEXED
 
     async def _start(self, attempt: _Attempt) -> dict[Step, JsonObject] | IndexOutcome:
-        """Count the run against the item's tries and read the steps that already finished."""
+        """Reserve one of the item's tries, and read the steps that already finished.
+
+        The stored count is checked under the owner's row lock before a try is
+        reserved, so an item never starts more than `INDEXING_MAX_TRIES` runs,
+        whatever arq's own try count says after a requeue. An item whose tries
+        are all spent is marked `failed` here, with no step run.
+        """
         async with self._sessions() as session, session.begin():
             if not await lock_user(session, attempt.user_id):
                 return IndexOutcome.GONE
@@ -352,6 +358,18 @@ class ItemIndexer:
                     extra={"saved_item_id": str(attempt.item_id), "status": item.status},
                 )
                 return IndexOutcome.NOT_PENDING
+            if item.indexing_attempts >= self._max_tries:
+                # Every try is spent (a run reserved the last one and was then
+                # cancelled, and arq ran the job again). No step runs.
+                item.status = ItemStatus.FAILED
+                logger.warning(
+                    "saved_item_tries_spent",
+                    extra={
+                        "saved_item_id": str(attempt.item_id),
+                        "attempts": item.indexing_attempts,
+                    },
+                )
+                return IndexOutcome.FAILED
             item.status = ItemStatus.ENRICHING
             item.indexing_attempts += 1
             await mark_worked_on(session, attempt.item_id)

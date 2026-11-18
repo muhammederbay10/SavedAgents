@@ -461,3 +461,26 @@ async def test_a_run_marks_the_item_as_worked_on(pipeline: Pipeline) -> None:
             select(func.now() - SavedItem.indexing_updated_at).where(SavedItem.id == item_id)
         )
     assert age is not None and age < timedelta(minutes=1)
+
+
+async def test_an_item_whose_tries_are_spent_is_failed_without_any_step(
+    pipeline: Pipeline,
+) -> None:
+    user_id = await add_user(pipeline.sessions)
+    item_id = await add_item(pipeline.sessions, pipeline, capture_event(user_id))
+    async with pipeline.sessions() as session, session.begin():
+        await session.execute(
+            update(SavedItem)
+            .where(SavedItem.id == item_id)
+            .values(indexing_attempts=2, status=ItemStatus.ENRICHING)
+        )
+
+    outcome = await pipeline.indexer(max_tries=2).index(user_id, item_id)
+
+    item = await load(pipeline.sessions, item_id)
+    assert outcome is IndexOutcome.FAILED
+    assert (item.status, item.indexing_attempts) == (ItemStatus.FAILED, 2)
+    assert pipeline.media_server.requests == 0
+    assert pipeline.classifier.calls == []
+    assert pipeline.primary_stt.calls == []
+    assert pipeline.text_model.requests == []

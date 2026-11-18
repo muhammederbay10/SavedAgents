@@ -297,3 +297,80 @@ async def test_the_workers_cron_sweeps_at_startup_and_the_same_worker_finishes_t
 
     item = await load(pipeline.sessions, item_id)
     assert (item.status, item.indexing_attempts) == (ItemStatus.DONE, 2)
+
+
+async def test_a_run_cancelled_after_a_requeue_never_starts_a_try_past_the_cap(
+    pipeline: Pipeline,
+    settings: Settings,
+    job_queue: ArqJobQueue,
+    ingestion_redis: ArqRedis,
+) -> None:
+    # Max 2 tries, one already spent. The sweeper requeues the item, so arq's own
+    # try count starts at 1 again. Try 2 reserves its try, then is cancelled in
+    # classify (a worker shutting down); arq runs the job again. That run must
+    # find the budget spent and do no model work.
+    max_tries = 2
+    _, item_id = await new_item(pipeline, attempts=1)
+    await age(pipeline, item_id, STALE_AFTER + timedelta(minutes=1))
+    pipeline.classifier.cancelled_calls = 1
+    pipeline.script(
+        transcripts=[transcript("synthetic speech")],
+        extractions=[structured_reply(open_extraction())],
+    )
+    requeued = await pipeline.sweeper(
+        job_queue, stale_after_seconds=STALE_AFTER.total_seconds(), max_tries=max_tries
+    ).sweep()
+    assert requeued.requeued == 1
+
+    await run_burst_worker(
+        settings,
+        ingestion_redis,
+        pipeline.indexer(max_tries=max_tries),
+        max_tries=max_tries,
+        run_deadline_seconds=30,
+        recording_seconds=5,
+        cleanup_reserve_seconds=2,
+        job_timeout_seconds=60,
+    )
+
+    item = await load(pipeline.sessions, item_id)
+    assert (item.status, item.indexing_attempts) == (ItemStatus.FAILED, max_tries)
+    assert pipeline.primary_stt.calls == []
+    assert pipeline.text_model.requests == []
+
+
+async def test_a_locked_owner_filling_a_whole_batch_does_not_starve_other_users(
+    pipeline: Pipeline,
+    committed_engine: AsyncEngine,
+    job_queue: ArqJobQueue,
+    ingestion_redis: ArqRedis,
+) -> None:
+    batch_size = 3
+    locked_user = await add_user(pipeline.sessions)
+    oldest = [
+        await add_item(pipeline.sessions, pipeline, capture_event(locked_user))
+        for _ in range(batch_size)
+    ]
+    for item_id in oldest:
+        await age(pipeline, item_id, STALE_AFTER + timedelta(hours=2))
+    _, other_item = await new_item(pipeline, attempts=1)
+    await age(pipeline, other_item, STALE_AFTER + timedelta(hours=1))
+    locked = asyncio.Event()
+    lock = asyncio.create_task(hold_owner_lock(committed_engine, locked_user, 2.0, locked))
+    await locked.wait()
+
+    try:
+        report = await pipeline.sweeper(
+            job_queue,
+            stale_after_seconds=STALE_AFTER.total_seconds(),
+            max_tries=MAX_TRIES,
+            batch_size=batch_size,
+        ).sweep()
+    finally:
+        await lock
+
+    assert report.requeued == 1
+    assert report.skipped == batch_size
+    assert await queued_index_jobs(ingestion_redis, other_item) == 1
+    for item_id in oldest:
+        assert await queued_index_jobs(ingestion_redis, item_id) == 0

@@ -385,8 +385,9 @@ class PipelineSettings(BaseSettings):
             no job or sweep has worked on it for this long
             (`INDEXING_STALE_AFTER_SECONDS`). It must be longer than the longest
             a live job can stay silent: a whole run plus every retry wait.
-        indexing_sweep_batch_size: The most stuck items one sweep handles
-            (`INDEXING_SWEEP_BATCH_SIZE`); the next sweep takes the rest.
+        indexing_sweep_batch_size: The most stuck items one sweep repairs
+            (`INDEXING_SWEEP_BATCH_SIZE`); the next sweep takes the rest. Items
+            whose owner's row is locked are skipped and don't count.
     """
 
     model_config = SettingsConfigDict(

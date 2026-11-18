@@ -14,8 +14,12 @@ It runs as an arq cron in the indexing worker. Each sweep:
    retry is never touched.
 2. Handles each item in its own transaction, under the owner's row lock taken
    with `SKIP LOCKED`. A row that is locked (a job writing, "delete my data")
-   is skipped at once and comes back on the next sweep. Staleness is checked
+   is skipped at once and comes back on the next sweep; the owner's other items
+   are skipped too in this sweep, without asking again. Staleness is checked
    again under the lock, so two workers sweeping together handle an item once.
+   Candidates are read page by page, so skipped items don't count against
+   `INDEXING_SWEEP_BATCH_SIZE`: a sweep repairs up to that many items and
+   moves past locked owners to reach them.
 3. An item with tries left (`indexing_attempts` below `INDEXING_MAX_TRIES`) and
    its payload still in Redis is queued again as `index_saved_item`, with its
    usual job id: arq refuses a duplicate of a job that is still queued or
@@ -28,10 +32,11 @@ Deleted users and items are gone from Postgres, so they are never swept.
 import logging
 import uuid
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
+from enum import Enum
 from typing import Protocol
 
-from sqlalchemy import ColumnElement, func, select
+from sqlalchemy import ColumnElement, func, literal, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.db.models import ItemStatus, SavedItem, User
@@ -69,7 +74,8 @@ class SweepReport:
         requeued: Items queued again (or found still queued).
         failed: Items marked `failed`.
         skipped: Items whose owner's row was locked, or that were no longer
-            stuck when the sweep got to them.
+            stuck when the sweep got to them. They don't count against the
+            batch size.
     """
 
     requeued: int = 0
@@ -85,6 +91,13 @@ class SweepReport:
 class _Candidate:
     item_id: uuid.UUID
     user_id: uuid.UUID
+    worked_on_at: datetime
+
+
+class _Handled(Enum):
+    REPAIRED = "repaired"
+    OWNER_LOCKED = "owner_locked"
+    NOT_STUCK = "not_stuck"
 
 
 @dataclass
@@ -119,23 +132,53 @@ class StuckItemSweeper:
                 being handled is left as it was for the next sweep.
         """
         report = SweepReport()
-        for candidate in await self._candidates():
-            await self._handle(candidate, report)
+        locked_owners: set[uuid.UUID] = set()
+        after: _Candidate | None = None
+        while report.requeued + report.failed < self.batch_size:
+            page = await self._candidates(after)
+            if not page:
+                break
+            for candidate in page:
+                after = candidate
+                if candidate.user_id in locked_owners:
+                    report.skipped += 1
+                    continue
+                handled = await self._handle(candidate, report)
+                if handled is _Handled.OWNER_LOCKED:
+                    locked_owners.add(candidate.user_id)
+                if report.requeued + report.failed >= self.batch_size:
+                    break
         if report.requeued or report.failed or report.skipped:
             logger.info("stuck_items_swept", extra=report.as_log())
         return report
 
-    async def _candidates(self) -> list[_Candidate]:
-        async with self.sessions() as session:
-            rows = await session.execute(
-                select(SavedItem.id, SavedItem.user_id)
-                .where(self._is_stuck())
-                .order_by(SavedItem.indexing_updated_at)
-                .limit(self.batch_size)
-            )
-            return [_Candidate(item_id=row.id, user_id=row.user_id) for row in rows]
+    async def _candidates(self, after: _Candidate | None) -> list[_Candidate]:
+        """Read the next page of stuck items, oldest first, after the last one seen.
 
-    async def _handle(self, candidate: _Candidate, report: SweepReport) -> None:
+        Paging by `(indexing_updated_at, id)` lets a sweep move past items whose
+        owner is locked, so they can't fill every batch.
+        """
+        statement = (
+            select(SavedItem.id, SavedItem.user_id, SavedItem.indexing_updated_at)
+            .where(self._is_stuck())
+            .order_by(SavedItem.indexing_updated_at, SavedItem.id)
+            .limit(self.batch_size)
+        )
+        if after is not None:
+            statement = statement.where(
+                tuple_(SavedItem.indexing_updated_at, SavedItem.id)
+                > tuple_(literal(after.worked_on_at), literal(after.item_id))
+            )
+        async with self.sessions() as session:
+            rows = await session.execute(statement)
+            return [
+                _Candidate(
+                    item_id=row.id, user_id=row.user_id, worked_on_at=row.indexing_updated_at
+                )
+                for row in rows
+            ]
+
+    async def _handle(self, candidate: _Candidate, report: SweepReport) -> _Handled:
         async with self.sessions() as session, session.begin():
             owner = await session.execute(
                 select(User.id)
@@ -144,7 +187,7 @@ class StuckItemSweeper:
             )
             if owner.scalar_one_or_none() is None:
                 report.skipped += 1
-                return
+                return _Handled.OWNER_LOCKED
             item = (
                 await session.execute(
                     select(SavedItem).where(SavedItem.id == candidate.item_id, self._is_stuck())
@@ -152,7 +195,7 @@ class StuckItemSweeper:
             ).scalar_one_or_none()
             if item is None:
                 report.skipped += 1
-                return
+                return _Handled.NOT_STUCK
             if item.indexing_attempts < self.max_tries and await self._has_payload(candidate):
                 await self.job_queue.requeue(
                     INDEX_SAVED_ITEM_JOB,
@@ -162,13 +205,14 @@ class StuckItemSweeper:
                 await mark_worked_on(session, candidate.item_id)
                 report.requeued += 1
                 logger.info("stuck_item_requeued", extra={"saved_item_id": str(item.id)})
-                return
+                return _Handled.REPAIRED
             item.status = ItemStatus.FAILED
             report.failed += 1
             logger.warning(
                 "stuck_item_failed",
                 extra={"saved_item_id": str(item.id), "attempts": item.indexing_attempts},
             )
+            return _Handled.REPAIRED
 
     async def _has_payload(self, candidate: _Candidate) -> bool:
         event = await self.payloads.capture(candidate.user_id, candidate.item_id)
