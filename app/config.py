@@ -292,3 +292,114 @@ def get_messenger_settings() -> MessengerSettings:
         pydantic.ValidationError: If a required variable is missing or invalid.
     """
     return MessengerSettings()
+
+
+# A probability from a decision model, as a threshold.
+Probability = Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
+
+
+class PipelineSettings(BaseSettings):
+    """Configuration of the indexing pipeline and its worker in `app/pipeline/`.
+
+    It is separate from `Settings` so that the API, which indexes nothing, does
+    not need it. Like `Settings`, values come from environment variables with
+    `.env` as a fallback, no field has a default, and a validation error names
+    the field but never repeats its value.
+
+    Attributes:
+        media_storage_dir: The folder that stands in for object storage in
+            development (`MEDIA_STORAGE_DIR`). Each saved item's media goes into
+            `<folder>/<user id>/<saved item id>/`, and "delete my data" removes
+            the user's folder.
+        media_download_timeout_seconds: Time limit of one media download
+            (`MEDIA_DOWNLOAD_TIMEOUT_SECONDS`).
+        media_max_download_bytes: The largest media file that is downloaded
+            (`MEDIA_MAX_DOWNLOAD_BYTES`). A larger one is treated as unavailable.
+        media_stored_height_pixels: The height of the stored video copy and
+            images (`MEDIA_STORED_HEIGHT_PIXELS`). Smaller media is not enlarged.
+        ffmpeg_path: The `ffmpeg` program (`FFMPEG_PATH`), a name on `PATH` or a path.
+        ffprobe_path: The `ffprobe` program (`FFPROBE_PATH`).
+        media_tool_timeout_seconds: Time limit of one ffmpeg or ffprobe run
+            (`MEDIA_TOOL_TIMEOUT_SECONDS`).
+        transcript_min_speech_characters: The near-empty rule
+            (`TRANSCRIPT_MIN_SPEECH_CHARACTERS`). A final transcript with fewer
+            letters and digits than this, in any script, counts as no speech.
+            Punctuation, symbols and spaces are not counted, so the rule works
+            the same in every language.
+        classify_is_list_min_probability: A post counts as a list of several
+            things from this probability of yes (`CLASSIFY_IS_LIST_MIN_PROBABILITY`).
+        extraction_temperature: Sampling temperature of extraction and of the
+            escalation (`EXTRACTION_TEMPERATURE`).
+        extraction_max_output_tokens: Upper limit on the length of their replies
+            (`EXTRACTION_MAX_OUTPUT_TOKENS`).
+        vocab_privacy_min_probability: The privacy gate passes wording only when
+            the decision model's "generic" probability is at least this
+            (`VOCAB_PRIVACY_MIN_PROBABILITY`). Anything below counts as no.
+        vocab_alias_min_probability: A match counts towards verifying its alias
+            only with at least this probability (`VOCAB_ALIAS_MIN_PROBABILITY`).
+        vocab_alias_min_users: A candidate alias becomes verified once this many
+            different users had a confident match through it (`VOCAB_ALIAS_MIN_USERS`).
+        vocab_max_value_length: Longer wording never enters the shared
+            vocabulary (`VOCAB_MAX_VALUE_LENGTH`), in characters.
+        vocab_phone_min_digits: Wording with a run of at least this many digits,
+            allowing spaces, dots, dashes, slashes, brackets and a leading plus
+            between them, looks like a phone number and never enters the shared
+            vocabulary (`VOCAB_PHONE_MIN_DIGITS`).
+        vocab_match_candidates: How many of the nearest existing values of the
+            same field the decision model chooses from (`VOCAB_MATCH_CANDIDATES`).
+        indexing_concurrency: How many items one worker indexes at the same
+            time (`INDEXING_CONCURRENCY`). A bulk import's jobs fan out over this
+            many slots per worker; more workers add more.
+        indexing_max_tries: How often one item's indexing job runs before the
+            item is marked failed, including the first run (`INDEXING_MAX_TRIES`).
+        indexing_retry_delay_seconds: The wait before a failed job runs again.
+            It grows with each try (`INDEXING_RETRY_DELAY_SECONDS`).
+        indexing_job_timeout_seconds: Time limit of one run of one job
+            (`INDEXING_JOB_TIMEOUT_SECONDS`).
+    """
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        extra="ignore",
+        hide_input_in_errors=True,
+    )
+
+    media_storage_dir: NonEmptyText
+    media_download_timeout_seconds: float = Field(gt=0, allow_inf_nan=False)
+    media_max_download_bytes: int = Field(gt=0)
+    media_stored_height_pixels: int = Field(gt=0)
+    ffmpeg_path: NonEmptyText
+    ffprobe_path: NonEmptyText
+    media_tool_timeout_seconds: float = Field(gt=0, allow_inf_nan=False)
+
+    transcript_min_speech_characters: int = Field(ge=1)
+
+    classify_is_list_min_probability: Probability
+
+    extraction_temperature: float = Field(ge=0, allow_inf_nan=False)
+    extraction_max_output_tokens: int = Field(gt=0)
+
+    vocab_privacy_min_probability: Probability
+    vocab_alias_min_probability: Probability
+    vocab_alias_min_users: int = Field(ge=1)
+    vocab_max_value_length: int = Field(gt=0)
+    vocab_phone_min_digits: int = Field(ge=1)
+    vocab_match_candidates: int = Field(ge=1)
+
+    indexing_concurrency: int = Field(ge=1)
+    indexing_max_tries: int = Field(ge=1)
+    indexing_retry_delay_seconds: float = Field(gt=0, allow_inf_nan=False)
+    indexing_job_timeout_seconds: float = Field(gt=0, allow_inf_nan=False)
+
+
+@lru_cache
+def get_pipeline_settings() -> PipelineSettings:
+    """Return the process-wide pipeline settings, read once from the environment.
+
+    Returns:
+        The cached `PipelineSettings` instance.
+
+    Raises:
+        pydantic.ValidationError: If a required variable is missing or invalid.
+    """
+    return PipelineSettings()

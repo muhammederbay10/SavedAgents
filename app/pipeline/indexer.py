@@ -1,0 +1,557 @@
+"""Indexes one saved item: runs the steps in order, keeps each result, and resumes after a failure.
+
+The steps (`docs/ARCHITECTURE.md` §3.3): fetch → classify → speech-to-text →
+extract (with the escalation) → normalize → embed, then the item is `done` and
+the save confirmation is sent. Resolving entities (SAV-15) will go between
+normalize and embed.
+
+**Status:** `pending → enriching → done | failed`. `needs_user` is set by the
+resolver's "which one?" question (SAV-15).
+
+**Resuming.** Each step writes its result to `enrichment_run` when it finishes,
+in the same transaction as its changes to the item. A job that is tried again
+reads the finished steps and continues after them. A failure that may pass
+later (a model or network error, a busy database) is recorded on the step and
+raised as `RetryLaterError`; the worker tries the job again until its last try,
+which marks the item `failed`.
+
+**"Delete my data" while a job runs.** Every write first locks the user's row,
+as ingestion does, and stops if the user or the item is gone. Media the fetch
+step stored for a user who was deleted meanwhile is erased again.
+
+**Logs** hold ids, the type, outcomes and costs, never content. Each indexed
+item logs whether it was escalated and what its model calls cost, which gives
+the escalation rate and the cost per item.
+"""
+
+import copy
+import logging
+import uuid
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from enum import StrEnum
+from typing import Final
+
+from redis.exceptions import RedisError
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from app.adapters.base import CaptureEvent
+from app.db.models import ItemStatus, SavedItem
+from app.ingestion.repository import lock_user
+from app.models.base import ContentPart, Image, Video
+from app.models.errors import ModelError
+from app.pipeline.classify import Classification, PostClassifier
+from app.pipeline.confirm import ConfirmationStatus, SaveConfirmer
+from app.pipeline.costs import CallCosts
+from app.pipeline.embed import ItemEmbedder
+from app.pipeline.extract import ExtractionResult, Extractor, PostText
+from app.pipeline.fetch import MediaDownloadError, MediaFetcher, MediaKind, StoredMedia
+from app.pipeline.media import MediaToolError
+from app.pipeline.normalize import PROVENANCE_VALUES, Normalizer, raw_values_of
+from app.pipeline.open_values import find_open_values, item_values, set_value
+from app.pipeline.payloads import CaptureSource
+from app.pipeline.prompts import PipelinePrompts
+from app.pipeline.runs import (
+    JsonObject,
+    RunStatus,
+    Step,
+    finished_steps,
+    language_of,
+    load_item,
+    recipient_of,
+    record_step,
+)
+from app.pipeline.storage import MediaNotFoundError, MediaStore
+from app.pipeline.transcribe import SpeechOutcome, SpeechToText
+from app.pipeline.vocabulary import apply_item_values
+from app.types.registry import ContentTypeRegistry
+
+logger = logging.getLogger(__name__)
+
+# Failures that may pass when the job runs again: model and network errors,
+# ffmpeg under load, and a database or Redis that is briefly unreachable.
+RETRYABLE_ERRORS: Final = (
+    ModelError,
+    MediaDownloadError,
+    MediaToolError,
+    MediaNotFoundError,
+    OSError,
+    SQLAlchemyError,
+    RedisError,
+)
+# Errors whose message is written to carry no content, so it can be stored.
+_DESCRIBED_ERRORS: Final = (ModelError, MediaDownloadError, MediaToolError)
+_RESUMABLE_STATUSES: Final = frozenset({ItemStatus.PENDING, ItemStatus.ENRICHING})
+_CONFIRMATION_RUN_STATUS: Final = {
+    ConfirmationStatus.SENT: RunStatus.DONE,
+    ConfirmationStatus.OUTSIDE_REPLY_WINDOW: RunStatus.SKIPPED,
+    ConfirmationStatus.SKIPPED: RunStatus.SKIPPED,
+    ConfirmationStatus.FAILED: RunStatus.FAILED,
+}
+
+
+class IndexOutcome(StrEnum):
+    """How one run of an indexing job ended."""
+
+    INDEXED = "indexed"
+    GONE = "gone"
+    NOT_PENDING = "not_pending"
+    FAILED = "failed"
+
+
+class RetryLaterError(Exception):
+    """A step failed in a way that may pass when the job runs again.
+
+    Attributes:
+        step: The step that failed.
+    """
+
+    def __init__(self, step: Step, cause: BaseException) -> None:
+        """Create the error.
+
+        Args:
+            step: The step that failed.
+            cause: What went wrong.
+        """
+        super().__init__(f"indexing step {step} failed and can be tried again: {describe(cause)}")
+        self.step = step
+
+
+class NothingToIndexError(Exception):
+    """The item has no media and no caption, so there is nothing to understand."""
+
+
+class _ItemGoneError(Exception):
+    """The user or the item was deleted while the job ran."""
+
+
+@dataclass(frozen=True)
+class PipelineSteps:
+    """The steps the indexer runs, each with its models and settings.
+
+    Attributes:
+        fetcher: Step 1.
+        classifier: Step 2.
+        speech: Step 3.
+        extractor: Step 4, with the escalation.
+        normalizer: Step 5.
+        embedder: Step 6.
+        confirmer: Step 7.
+        store: Where the media is kept.
+    """
+
+    fetcher: MediaFetcher
+    classifier: PostClassifier
+    speech: SpeechToText
+    extractor: Extractor
+    normalizer: Normalizer
+    embedder: ItemEmbedder
+    confirmer: SaveConfirmer
+    store: MediaStore
+
+
+@dataclass
+class _Run:
+    """The state of one run of one job."""
+
+    user_id: uuid.UUID
+    item_id: uuid.UUID
+    finished: dict[Step, JsonObject]
+    current: Step = Step.FETCH
+    costs: CallCosts = field(default_factory=CallCosts)
+
+    def resume(self, step: Step) -> JsonObject | None:
+        """Make `step` the current one, and return its output if it already finished."""
+        self.current = step
+        output = self.finished.get(step)
+        if output is not None:
+            self.costs = self.costs + CallCosts.from_output(output.get("costs"))
+        return output
+
+    def count(self, costs: CallCosts) -> None:
+        """Add the charges of a step that just ran."""
+        self.costs = self.costs + costs
+
+
+def describe(error: BaseException) -> str:
+    """Describe an error for `enrichment_run.error` and logs, without any content.
+
+    Args:
+        error: The error.
+
+    Returns:
+        The class name, plus the message for errors whose messages are written
+        to carry no content.
+    """
+    if isinstance(error, _DESCRIBED_ERRORS):
+        return f"{type(error).__name__}: {error}"
+    return type(error).__name__
+
+
+class ItemIndexer:
+    """Indexes one saved item at a time."""
+
+    def __init__(
+        self,
+        sessions: async_sessionmaker[AsyncSession],
+        payloads: CaptureSource,
+        steps: PipelineSteps,
+        registry: ContentTypeRegistry,
+        prompts: PipelinePrompts,
+        *,
+        alias_min_probability: float,
+    ) -> None:
+        """Create the indexer.
+
+        Args:
+            sessions: Opens a database session.
+            payloads: Reads the capture event of an item.
+            steps: The steps.
+            registry: The built-in types.
+            prompts: The wording; its version is recorded with each step.
+            alias_min_probability: `VOCAB_ALIAS_MIN_PROBABILITY`.
+        """
+        self._sessions = sessions
+        self._payloads = payloads
+        self._steps = steps
+        self._registry = registry
+        self._prompts = prompts
+        self._alias_min_probability = alias_min_probability
+
+    async def index(
+        self, user_id: uuid.UUID, saved_item_id: uuid.UUID, *, last_try: bool
+    ) -> IndexOutcome:
+        """Index one item, continuing after the steps an earlier try finished.
+
+        Args:
+            user_id: The item's owner, from the job.
+            saved_item_id: The item, from the job.
+            last_try: Whether this is the job's last try. A failure then marks
+                the item `failed` instead of asking for another try.
+
+        Returns:
+            How the run ended.
+
+        Raises:
+            RetryLaterError: If a step failed in a way that may pass later,
+                and this is not the last try.
+            Exception: Any other error, after the item is marked `failed`.
+        """
+        event = await self._payloads.capture(user_id, saved_item_id)
+        if event is None:
+            logger.info("indexing_payload_missing", extra={"saved_item_id": str(saved_item_id)})
+            return IndexOutcome.GONE
+        started = await self._start(user_id, saved_item_id)
+        if isinstance(started, IndexOutcome):
+            return started
+        run = _Run(user_id=user_id, item_id=saved_item_id, finished=started)
+        try:
+            await self._run_steps(run, event)
+        except _ItemGoneError:
+            logger.info("indexing_item_gone", extra={"saved_item_id": str(saved_item_id)})
+            return IndexOutcome.GONE
+        except NothingToIndexError as error:
+            await self._fail(run, error)
+            return IndexOutcome.FAILED
+        except RETRYABLE_ERRORS as error:
+            if last_try:
+                await self._fail(run, error)
+                return IndexOutcome.FAILED
+            await self._record_retry(run, error)
+            raise RetryLaterError(run.current, error) from error
+        except Exception as error:
+            # A bug, not a passing failure: trying again would fail the same way.
+            await self._fail(run, error)
+            raise
+        return IndexOutcome.INDEXED
+
+    async def _start(
+        self, user_id: uuid.UUID, saved_item_id: uuid.UUID
+    ) -> dict[Step, JsonObject] | IndexOutcome:
+        async with self._sessions() as session, session.begin():
+            if not await lock_user(session, user_id):
+                return IndexOutcome.GONE
+            item = await load_item(session, saved_item_id)
+            if item is None or item.user_id != user_id:
+                return IndexOutcome.GONE
+            if item.status not in _RESUMABLE_STATUSES:
+                logger.info(
+                    "indexing_skipped",
+                    extra={"saved_item_id": str(saved_item_id), "status": item.status},
+                )
+                return IndexOutcome.NOT_PENDING
+            item.status = ItemStatus.ENRICHING
+            return await finished_steps(session, saved_item_id)
+
+    async def _run_steps(self, run: _Run, event: CaptureEvent) -> None:
+        media = await self._fetch(run, event)
+        caption, collection = await self._post_text(run)
+        if media.kind is None and caption is None:
+            raise NothingToIndexError("the item has no media and no caption")
+        classification = await self._classify(run, media, caption, collection)
+        transcript = await self._transcribe(run, media)
+        post = PostText(caption, collection, transcript)
+        extraction = await self._extract(run, classification, post, media)
+        summary, category = await self._normalize(run, classification, extraction)
+        await self._embed(run, summary, transcript)
+        await self._finish(
+            run, media, classification, extraction, has_speech=transcript is not None
+        )
+        await self._confirm(run, event, category)
+
+    async def _fetch(self, run: _Run, event: CaptureEvent) -> StoredMedia:
+        output = run.resume(Step.FETCH)
+        if output is not None:
+            return StoredMedia.from_output(output)
+        media = await self._steps.fetcher.fetch(run.user_id, run.item_id, event.media_url)
+        try:
+            async with self._locked(run) as (session, _):
+                await record_step(
+                    session, run.item_id, Step.FETCH, RunStatus.DONE, output=media.to_output()
+                )
+        except _ItemGoneError:
+            await self._steps.store.erase_item(run.user_id, run.item_id)
+            raise
+        return media
+
+    async def _post_text(self, run: _Run) -> tuple[str | None, str | None]:
+        async with self._sessions() as session:
+            item = await load_item(session, run.item_id)
+        if item is None:
+            raise _ItemGoneError
+        caption = item.caption if item.caption and item.caption.strip() else None
+        return caption, item.collection
+
+    async def _classify(
+        self, run: _Run, media: StoredMedia, caption: str | None, collection: str | None
+    ) -> Classification:
+        output = run.resume(Step.CLASSIFY)
+        if output is not None:
+            return Classification.from_output(output)
+        parts = await self._media_parts(media)
+        classification = await self._steps.classifier.classify(parts, caption, collection)
+        run.count(classification.costs)
+        async with self._locked(run) as (session, item):
+            item.type = classification.type_name
+            await record_step(
+                session,
+                run.item_id,
+                Step.CLASSIFY,
+                RunStatus.DONE,
+                output=classification.to_output(self._prompts.version),
+            )
+        return classification
+
+    async def _transcribe(self, run: _Run, media: StoredMedia) -> str | None:
+        output = run.resume(Step.TRANSCRIBE)
+        if output is not None:
+            async with self._sessions() as session:
+                item = await load_item(session, run.item_id)
+            return item.transcript if item is not None and output.get("has_speech") else None
+        speech = await self._steps.speech.transcribe(media)
+        run.count(speech.costs)
+        async with self._locked(run) as (session, item):
+            item.transcript = speech.speech_text
+            await record_step(
+                session, run.item_id, Step.TRANSCRIBE, RunStatus.DONE, output=speech.to_output()
+            )
+        if speech.outcome is SpeechOutcome.NO_SPEECH:
+            logger.info("transcript_has_no_speech", extra={"saved_item_id": str(run.item_id)})
+        return speech.speech_text
+
+    async def _extract(
+        self, run: _Run, classification: Classification, post: PostText, media: StoredMedia
+    ) -> ExtractionResult:
+        output = run.resume(Step.EXTRACT)
+        if output is not None:
+            return ExtractionResult.from_output(output)
+        extraction = await self._steps.extractor.extract(classification.type_name, post, media)
+        run.count(extraction.costs)
+        async with self._locked(run) as (session, _):
+            await record_step(
+                session,
+                run.item_id,
+                Step.EXTRACT,
+                RunStatus.DONE,
+                output=extraction.to_output(self._prompts.version),
+            )
+        return extraction
+
+    async def _normalize(
+        self, run: _Run, classification: Classification, extraction: ExtractionResult
+    ) -> tuple[str, str]:
+        output = run.resume(Step.NORMALIZE)
+        if output is not None:
+            async with self._sessions() as session:
+                item = await load_item(session, run.item_id)
+            if item is None or item.summary is None or item.category is None:
+                raise _ItemGoneError
+            return item.summary, item.category
+        schema = self._registry.extraction_schema(classification.type_name)
+        document = copy.deepcopy(extraction.document)
+        open_values = find_open_values(schema, document)
+        normalization = await self._steps.normalizer.normalize(open_values)
+        run.count(normalization.costs)
+        for path, normalized in normalization.values.items():
+            set_value(document, path, normalized.value)
+        values = item_values(schema, document)
+        provenance = {
+            open_value.path: normalization.values[open_value.path].provenance(open_value.field)
+            for open_value in open_values
+        }
+        async with self._locked(run) as (session, item):
+            await apply_item_values(session, item, values, raw_values=raw_values_of(open_values))
+            await record_step(
+                session,
+                run.item_id,
+                Step.NORMALIZE,
+                RunStatus.DONE,
+                output={
+                    PROVENANCE_VALUES: provenance,
+                    "costs": normalization.costs.to_output(),
+                    "prompts_version": self._prompts.version,
+                },
+            )
+        await self._steps.normalizer.verify_aliases(
+            normalization.confident_alias_ids(self._alias_min_probability)
+        )
+        return values.summary, values.category
+
+    async def _embed(self, run: _Run, summary: str, transcript: str | None) -> None:
+        if run.resume(Step.EMBED) is not None:
+            return
+        embedding = await self._steps.embedder.embed(summary, transcript)
+        run.count(embedding.costs)
+        async with self._locked(run) as (session, item):
+            item.embedding = embedding.vector
+            await record_step(
+                session,
+                run.item_id,
+                Step.EMBED,
+                RunStatus.DONE,
+                output={"model": embedding.model, "costs": embedding.costs.to_output()},
+            )
+
+    async def _finish(
+        self,
+        run: _Run,
+        media: StoredMedia,
+        classification: Classification,
+        extraction: ExtractionResult,
+        *,
+        has_speech: bool,
+    ) -> None:
+        async with self._locked(run) as (_, item):
+            item.status = ItemStatus.DONE
+        logger.info(
+            "saved_item_indexed",
+            extra={
+                "saved_item_id": str(run.item_id),
+                "type": classification.type_name,
+                "media": media.kind,
+                "has_speech": has_speech,
+                "escalation": extraction.escalation,
+                "escalated": extraction.escalation.was_called,
+                "cost_usd": run.costs.cost_usd,
+                "model_calls": run.costs.calls,
+                "unpriced_model_calls": run.costs.unpriced_calls,
+                "prompts_version": self._prompts.version,
+            },
+        )
+
+    async def _confirm(self, run: _Run, event: CaptureEvent, category: str) -> None:
+        if run.resume(Step.CONFIRM) is not None:
+            return
+        async with self._sessions() as session:
+            recipient = await recipient_of(session, run.user_id, event.platform)
+            language = await language_of(session, run.user_id)
+        confirmation = await self._steps.confirmer.confirm(
+            recipient_id=recipient,
+            language=language,
+            category=category,
+            last_user_message_at=event.received_at,
+        )
+        try:
+            async with self._locked(run) as (session, _):
+                await record_step(
+                    session,
+                    run.item_id,
+                    Step.CONFIRM,
+                    _CONFIRMATION_RUN_STATUS[confirmation.status],
+                    output=confirmation.to_output(),
+                )
+        except _ItemGoneError:
+            return
+        logger.info(
+            "save_confirmation_finished",
+            extra={
+                "saved_item_id": str(run.item_id),
+                "status": confirmation.status,
+                "reason": confirmation.reason,
+            },
+        )
+
+    async def _media_parts(self, media: StoredMedia) -> Sequence[ContentPart]:
+        if media.media_key is None or media.mime_type is None:
+            return []
+        data = await self._steps.store.get(media.media_key)
+        if media.kind is MediaKind.VIDEO:
+            return [Video(data=data, mime_type=media.mime_type)]
+        return [Image(data=data, mime_type=media.mime_type)]
+
+    @asynccontextmanager
+    async def _locked(self, run: _Run) -> AsyncIterator[tuple[AsyncSession, SavedItem]]:
+        """Open a transaction that holds the user's row lock, with the item loaded.
+
+        Raises:
+            _ItemGoneError: If the user or the item was deleted.
+        """
+        async with self._sessions() as session, session.begin():
+            if not await lock_user(session, run.user_id):
+                raise _ItemGoneError
+            item = await load_item(session, run.item_id)
+            if item is None:
+                raise _ItemGoneError
+            yield session, item
+
+    async def _fail(self, run: _Run, error: BaseException) -> None:
+        logger.warning(
+            "saved_item_indexing_failed",
+            extra={
+                "saved_item_id": str(run.item_id),
+                "step": run.current,
+                "error": describe(error),
+            },
+        )
+        await self._record_failure(run, error, ItemStatus.FAILED)
+
+    async def _record_retry(self, run: _Run, error: BaseException) -> None:
+        logger.info(
+            "saved_item_indexing_retry",
+            extra={
+                "saved_item_id": str(run.item_id),
+                "step": run.current,
+                "error": describe(error),
+            },
+        )
+        await self._record_failure(run, error, ItemStatus.ENRICHING)
+
+    async def _record_failure(
+        self, run: _Run, error: BaseException, item_status: ItemStatus
+    ) -> None:
+        try:
+            async with self._locked(run) as (session, item):
+                item.status = item_status
+                await record_step(
+                    session, run.item_id, run.current, RunStatus.FAILED, error=describe(error)
+                )
+        except _ItemGoneError:
+            return
+        except SQLAlchemyError as record_error:
+            # The database is what failed; the job's own outcome still stands.
+            logger.error(
+                "indexing_failure_not_recorded",
+                extra={"saved_item_id": str(run.item_id), "error": describe(record_error)},
+            )
