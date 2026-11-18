@@ -70,3 +70,18 @@ def _placeholders(field_name: str, template: str) -> frozenset[str]:
             raise ValueError(f"prompt {field_name} may only use bare named placeholders")
         names.add(name)
     return frozenset(names)
+
+
+# Approved by Muhammed on SAV-16 on 18 Nov 2026 (P1; owner comment
+# 01a1efd3-a638-7119-b6ed-616d0f2c9576). Change the version with any change to
+# the wording, and score the change on the eval set.
+RETRIEVAL_PROMPTS: Final = RetrievalPrompts(
+    version="2026-11-18.1",
+    normalization_question=(
+        "The user is searching their own saved posts and wrote this {filter} as a filter, in "
+        "their own words, maybe with a typo, another spelling or another language. Which of "
+        "the saved values names the same thing? Pick 'none of these' unless one clearly does."
+    ),
+    normalization_no_match_option="None of these values names what the user wrote.",
+    normalization_input="Filter: {filter}\nThe user wrote: {wording}",
+)

@@ -32,7 +32,7 @@ from sqlalchemy import (
     select,
     true,
 )
-from sqlalchemy.dialects.postgresql import JSONB, JSONPATH, TSQUERY
+from sqlalchemy.dialects.postgresql import JSONB, TSQUERY
 from sqlalchemy.orm import QueryableAttribute
 
 from app.agent.search_query import FilterValue, Near
@@ -65,8 +65,11 @@ WIDENED_LEVELS: Final = (Entity.district, Entity.neighbourhood)
 # The key of a post's mentions in `saved_item.fields`: `EntityExtraction.entities`.
 MENTIONS_KEY: Final = "entities"
 
-# Matches a provider name in any list of a providers object, e.g. {"flatrate": ["Netflix"]}.
-_PROVIDER_NAME_PATH: Final = "lax $.*[*] ? (@ == $name)"
+# The offer kinds of a providers object (`{"<offer kind>": ["<provider name>", …]}`, TMDB's
+# watch-provider kinds) under which a title counts as "on" a platform: watchable without
+# paying extra. Rent and buy offers stay stored for replies but never satisfy a platform
+# filter. Owner decision on SAV-16, 18 Nov 2026 (comment 01a1efd3-a638-7119-b6ed-616d0f2c9576).
+WATCHABLE_OFFER_KINDS: Final = ("flatrate", "free", "ads")
 _LIKE_ESCAPE: Final = "\\"
 
 
@@ -334,15 +337,22 @@ def _own_mention() -> ColumnElement[Any]:
 
 
 def _available_in_country(provider: str, country: str | None) -> ColumnElement[bool]:
-    """The entity is offered by the provider in the country; another country's row never counts."""
-    path = cast(literal(_PROVIDER_NAME_PATH), JSONPATH)
-    variables = func.jsonb_build_object("name", provider)
+    """The entity is watchable on the provider in the country without paying extra.
+
+    Only the country's own row counts, and only its `WATCHABLE_OFFER_KINDS`.
+    """
+    watchable = or_(
+        *(
+            EntityAvailability.providers.contains({offer_kind: [provider]})
+            for offer_kind in WATCHABLE_OFFER_KINDS
+        )
+    )
     return (
         select(EntityAvailability.entity_id)
         .where(
             EntityAvailability.entity_id == Entity.id,
             EntityAvailability.country == country,
-            func.jsonb_path_exists(EntityAvailability.providers, path, variables),
+            watchable,
         )
         .exists()
     )

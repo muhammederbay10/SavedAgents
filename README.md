@@ -507,7 +507,7 @@ A filter also declares its **source**, where search reads what it is checked aga
 | Source | Search reads | Used by |
 |---|---|---|
 | `saved_values` (the default) | The key named after the filter: in the item's `fields` when the type's schema has it as a top-level field (study `subject`), otherwise in the linked entity's `data` or in that entity's own mention in `fields.entities` (place `cuisine`); for `area` the entities' address levels, for `location` their coordinates | most filters |
-| `country_availability` | `entity_availability` for the asking user's country. Only for `value` filters | `streaming` |
+| `country_availability` | `entity_availability` for the asking user's country, offer kinds `flatrate`, `free` and `ads` only. Only for `value` filters | `streaming` |
 | `user_status` | Whether the asking user marked the item's entity as done. Only for `boolean` filters | `watched` |
 | `opening_hours` | The entity's opening hours. Only for `boolean` filters. Search rejects it until the place resolver stores hours | `open_now` |
 
@@ -536,7 +536,9 @@ result.availability_gaps   # (movie, country) rows to fetch or refresh (SAV-15)
 
 Every step up the ladder is logged as `search_fallback` with its level and reason, never with the query's text. The whole search runs within `SEARCH_TIME_BUDGET_SECONDS`; when it runs out, the result has what was found and `incomplete=True`.
 
-The wording sent to the decision model is a `RetrievalPrompts` object in [`app/agent/prompts.py`](app/agent/prompts.py), versioned like the pipeline's prompts.
+The wording sent to the decision model is `RETRIEVAL_PROMPTS` in [`app/agent/prompts.py`](app/agent/prompts.py), version `2026-11-18.1`, approved by the owner. Any change to it bumps the version and is scored on the evaluation set.
+
+A streaming filter matches a title only when it's watchable on that platform in the user's country without paying extra: listed under the offer kind `flatrate`, `free` or `ads` in `entity_availability.providers` (`{"<offer kind>": ["<provider name>", …]}`). `rent` and `buy` offers are stored for replies but never match.
 
 | Variable | Meaning |
 |---|---|

@@ -17,6 +17,7 @@ from typing import Final
 from sqlalchemy import Float, TextClause, bindparam, literal, select, text, union_all
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agent.search_conditions import WATCHABLE_OFFER_KINDS
 from app.agent.search_query import CATEGORY_SLOT, COLLECTION_SLOT, Wording
 from app.db.models import AliasStatus, Vocabulary, VocabularyAlias
 from app.db.types import Vector
@@ -25,8 +26,6 @@ from app.types.base import FilterKind, FilterSource
 # A JSON value, or each element of a JSON array, that is text. Lax mode treats a
 # single value as an array of one, so one path covers both shapes.
 _TEXT_ELEMENTS_PATH: Final = 'lax $[*] ? (@.type() == "string")'
-# Each text in each list of a providers object, e.g. {"flatrate": ["Netflix"]}.
-_PROVIDER_NAMES_PATH: Final = 'lax $.*[*] ? (@.type() == "string")'
 
 _USER_COLLECTIONS: Final = text(
     """
@@ -83,13 +82,14 @@ _USER_AREAS: Final = text(
 _USER_PROVIDERS_IN_COUNTRY: Final = text(
     f"""
     SELECT DISTINCT
-        jsonb_path_query(entity_availability.providers, '{_PROVIDER_NAMES_PATH}') #>> '{{}}'
-            AS value
+        jsonb_path_query(entity_availability.providers -> offer.kind, '{_TEXT_ELEMENTS_PATH}')
+            #>> '{{}}' AS value
     FROM saved_item
     JOIN item_entity ON item_entity.saved_item_id = saved_item.id
     JOIN entity_availability
         ON entity_availability.entity_id = item_entity.entity_id
         AND entity_availability.country = :country
+    CROSS JOIN unnest(CAST(:offer_kinds AS text[])) AS offer(kind)
     WHERE saved_item.user_id = :user_id AND saved_item.type = :type
     """
 )
@@ -152,7 +152,11 @@ def _values_statement(scope: ValueScope, wording: Wording) -> tuple[TextClause, 
         return _USER_TAGS, parameters
     parameters["type"] = scope.type
     if search_filter.source is FilterSource.COUNTRY_AVAILABILITY:
-        return _USER_PROVIDERS_IN_COUNTRY, {**parameters, "country": scope.country}
+        return _USER_PROVIDERS_IN_COUNTRY, {
+            **parameters,
+            "country": scope.country,
+            "offer_kinds": list(WATCHABLE_OFFER_KINDS),
+        }
     if search_filter.kind is FilterKind.AREA:
         return _USER_AREAS, parameters
     return _USER_FIELD_VALUES, {**parameters, "key": search_filter.name}

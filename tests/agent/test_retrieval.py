@@ -15,7 +15,7 @@ from app.agent.fallback import FallbackLevel, FallbackReason
 from app.agent.filter_normalization import NormalizationMethod
 from app.agent.retrieval import AvailabilityGapReason, SearchResult
 from app.agent.search_query import CountryRequiredError, Near, SearchQuery
-from app.db.models import EntityAvailability, ItemEntity, ItemStatus, SavedItem
+from app.db.models import Entity, EntityAvailability, ItemEntity, ItemStatus, SavedItem
 from app.db.types import GeoPoint
 from app.models.errors import ModelUnavailableError
 from tests.agent.retrieval_support import (
@@ -763,3 +763,184 @@ async def test_item_wide_study_fields_still_filter_items_without_entities(
 
     assert result.level is FallbackLevel.NORMAL
     assert ids(result) == saves.ids("integrals")
+
+
+# A synthetic provider, so no seeded title offers it by accident.
+STREAMLY = "Streamly"
+
+
+def strict_ids(result: SearchResult) -> list[object]:
+    """The items that met every filter; relaxed L2 results are left out."""
+    return [hit.item_id for hit in result.hits if hit.level is not FallbackLevel.RELAXED]
+
+
+async def add_title_with_offers(
+    session: AsyncSession,
+    saves: Saves,
+    name: str,
+    offers_by_country: dict[str, dict[str, list[str]]],
+    *,
+    genre: str = "drama",
+    link: bool = True,
+) -> tuple[Entity, SavedItem | None]:
+    """A title with providers per country, saved by the asking user unless `link` is false."""
+    title = Entity(
+        type="movie",
+        source="tmdb",
+        external_id=f"synthetic-offers-{name}",
+        name=name,
+        data={"genre": [genre]},
+    )
+    session.add(title)
+    await session.flush()
+    session.add_all(
+        EntityAvailability(entity_id=title.id, country=country, providers=offers, refreshed_at=NOW)
+        for country, offers in offers_by_country.items()
+    )
+    item = None
+    if link:
+        item = SavedItem(
+            user_id=saves.user.id,
+            platform="instagram",
+            platform_post_id=f"synthetic-offers-{name}",
+            type="movie",
+            category="movie",
+            status=ItemStatus.DONE,
+            saved_at=NOW,
+        )
+        session.add(item)
+        await session.flush()
+        session.add(ItemEntity(saved_item_id=item.id, entity_id=title.id))
+    await session.flush()
+    return title, item
+
+
+def on_streamly(saves: Saves, country: str, **filters: str) -> SearchQuery:
+    return SearchQuery(
+        user_id=saves.user.id,
+        country=country,
+        type="movie",
+        filters={"streaming": STREAMLY, **filters},
+    )
+
+
+@pytest.mark.parametrize("offer_kind", ["flatrate", "free", "ads"])
+async def test_a_platform_filter_counts_titles_watchable_without_paying_extra(
+    db_session: AsyncSession, saves: Saves, offer_kind: str
+) -> None:
+    _, item = await add_title_with_offers(
+        db_session, saves, offer_kind, {"US": {offer_kind: [STREAMLY]}}
+    )
+
+    result = await build_retriever().search(db_session, on_streamly(saves, "US"))
+
+    assert result.level is FallbackLevel.NORMAL
+    assert strict_ids(result) == [item.id]  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize("offer_kind", ["rent", "buy"])
+async def test_renting_or_buying_never_satisfies_a_platform_filter(
+    db_session: AsyncSession, saves: Saves, offer_kind: str
+) -> None:
+    _, item = await add_title_with_offers(
+        db_session, saves, offer_kind, {"US": {offer_kind: [STREAMLY]}}
+    )
+
+    result = await build_retriever().search(db_session, on_streamly(saves, "US"))
+
+    assert strict_ids(result) == []
+    assert result.level is FallbackLevel.RELAXED
+    assert "filters.streaming" in result.relaxed
+    # L2 may still show the title, but only as a relaxed result, never as a match.
+    assert {hit.level for hit in result.hits if hit.item_id == item.id} <= {  # type: ignore[union-attr]
+        FallbackLevel.RELAXED
+    }
+
+
+async def test_with_mixed_offers_only_the_watchable_provider_matches(
+    db_session: AsyncSession, saves: Saves
+) -> None:
+    offers = {"flatrate": [STREAMLY], "rent": ["Rently"], "buy": ["Rently", STREAMLY]}
+    _, item = await add_title_with_offers(db_session, saves, "mixed", {"US": offers})
+    retriever = build_retriever()
+
+    watchable = await retriever.search(db_session, on_streamly(saves, "US"))
+    rent_only = await retriever.search(
+        db_session,
+        SearchQuery(
+            user_id=saves.user.id, country="US", type="movie", filters={"streaming": "Rently"}
+        ),
+    )
+    apple_rent = await retriever.search(
+        db_session,
+        SearchQuery(
+            user_id=saves.user.id, country="US", type="movie", filters={"streaming": "Apple TV"}
+        ),
+    )
+
+    assert strict_ids(watchable) == [item.id]  # type: ignore[union-attr]
+    assert strict_ids(rent_only) == []
+    # Hereditary is only for rent on Apple TV in the US.
+    assert strict_ids(apple_rent) == []
+
+
+async def test_offer_kinds_are_judged_per_country(db_session: AsyncSession, saves: Saves) -> None:
+    offers = {"US": {"rent": [STREAMLY]}, "JP": {"ads": [STREAMLY]}}
+    _, item = await add_title_with_offers(db_session, saves, "split-country", offers)
+    retriever = build_retriever()
+
+    in_us = await retriever.search(db_session, on_streamly(saves, "US"))
+    in_japan = await retriever.search(db_session, on_streamly(saves, "JP"))
+
+    assert strict_ids(in_us) == []
+    assert strict_ids(in_japan) == [item.id]  # type: ignore[union-attr]
+
+
+async def test_a_rented_title_and_a_watchable_one_cannot_split_a_list_posts_filters(
+    db_session: AsyncSession, saves: Saves
+) -> None:
+    rented, _ = await add_title_with_offers(
+        db_session, saves, "rented-horror", {"US": {"rent": [STREAMLY]}}, genre="horror", link=False
+    )
+    free, _ = await add_title_with_offers(
+        db_session, saves, "free-drama", {"US": {"free": [STREAMLY]}}, genre="drama", link=False
+    )
+    listing = SavedItem(
+        user_id=saves.user.id,
+        platform="instagram",
+        platform_post_id="synthetic-offers-list",
+        type="movie",
+        category="movie list",
+        status=ItemStatus.DONE,
+        saved_at=NOW,
+    )
+    db_session.add(listing)
+    await db_session.flush()
+    db_session.add_all(
+        ItemEntity(saved_item_id=listing.id, entity_id=title.id, position=position)
+        for position, title in enumerate((rented, free))
+    )
+    await db_session.flush()
+    retriever = build_retriever()
+
+    horror = await retriever.search(db_session, on_streamly(saves, "US", genre="horror"))
+    drama = await retriever.search(db_session, on_streamly(saves, "US", genre="drama"))
+
+    assert listing.id not in strict_ids(horror)
+    assert strict_ids(drama) == [listing.id]
+
+
+async def test_providers_offered_to_normalization_are_only_the_watchable_ones(
+    db_session: AsyncSession, saves: Saves
+) -> None:
+    offers = {"US": {"flatrate": [STREAMLY], "rent": ["Rently"], "buy": ["Buyly"]}}
+    await add_title_with_offers(db_session, saves, "options", offers)
+    classifier = PickingClassifier()
+    query = SearchQuery(
+        user_id=saves.user.id, country="US", type="movie", filters={"streaming": "strealy"}
+    )
+
+    await build_retriever(classifier=classifier).search(db_session, query)
+
+    assert STREAMLY in classifier.offered_values
+    assert {"Rently", "Buyly", "Apple TV"}.isdisjoint(classifier.offered_values)
