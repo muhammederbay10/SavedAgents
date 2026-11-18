@@ -373,7 +373,7 @@ erDiagram
 ## 6. Repository layout
 
 ```
-SavedAgents/
+Savely/
   app/
     main.py                 # FastAPI app
     config.py
