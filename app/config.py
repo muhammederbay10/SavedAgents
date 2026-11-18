@@ -354,8 +354,13 @@ class PipelineSettings(BaseSettings):
             item is marked failed, including the first run (`INDEXING_MAX_TRIES`).
         indexing_retry_delay_seconds: The wait before a failed job runs again.
             It grows with each try (`INDEXING_RETRY_DELAY_SECONDS`).
-        indexing_job_timeout_seconds: Time limit of one run of one job
-            (`INDEXING_JOB_TIMEOUT_SECONDS`).
+        indexing_run_deadline_seconds: How long the steps of one run may take
+            (`INDEXING_RUN_DEADLINE_SECONDS`). A run that passes it stops itself,
+            records the step it was in, and is tried again; the last try marks
+            the item failed.
+        indexing_job_timeout_seconds: arq's own limit on one run of one job
+            (`INDEXING_JOB_TIMEOUT_SECONDS`), a backstop. It must be longer than
+            the run deadline, so a stopped run has time to record its step.
     """
 
     model_config = SettingsConfigDict(
@@ -389,7 +394,16 @@ class PipelineSettings(BaseSettings):
     indexing_concurrency: int = Field(ge=1)
     indexing_max_tries: int = Field(ge=1)
     indexing_retry_delay_seconds: float = Field(gt=0, allow_inf_nan=False)
+    indexing_run_deadline_seconds: float = Field(gt=0, allow_inf_nan=False)
     indexing_job_timeout_seconds: float = Field(gt=0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def _the_run_stops_itself_before_arq_does(self) -> Self:
+        if self.indexing_job_timeout_seconds <= self.indexing_run_deadline_seconds:
+            raise ValueError(
+                "indexing_job_timeout_seconds must be longer than indexing_run_deadline_seconds"
+            )
+        return self
 
 
 @lru_cache

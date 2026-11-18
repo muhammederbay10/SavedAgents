@@ -153,7 +153,7 @@ What happens to a message ([`app/adapters/instagram.py`](app/adapters/instagram.
 - **First contact:** the first message from an Instagram account creates its `user` and `platform_account` rows.
 - **Message id:** every saved item keeps the id of the message it came in with (`source_message_id`), so answers can reply to it (decision record 0004).
 - **One item per post and per message:** sharing the same post twice, or a webhook that Meta delivers twice, creates one saved item. Two reels saved into the collection have no post id, so they stay two items (decision record 0007).
-- **Jobs:** new items are queued as `index_saved_item` and texts as `answer_chat_message` on Redis, through `arq` ([`app/ingestion/jobs.py`](app/ingestion/jobs.py)). A job holds only ids; the caption, text and media link it works on are in a per-user payload hash ([`app/ingestion/session_state.py`](app/ingestion/session_state.py)). The indexing worker runs `index_saved_item` (see [Indexing pipeline](#indexing-pipeline)). The chat worker comes with the response agent (SAV-17); until then chat jobs wait in Redis and expire after a day.
+- **Jobs:** new items are queued as `index_saved_item` and texts as `answer_chat_message` on Redis, through `arq` ([`app/ingestion/jobs.py`](app/ingestion/jobs.py)). A job holds only ids; the caption, text and media link it works on are in a per-user payload hash ([`app/ingestion/session_state.py`](app/ingestion/session_state.py)). Each job name has its own arq queue (`arq:queue:indexing`, `arq:queue:chat`), so a worker only takes the jobs it can run. The indexing worker runs `index_saved_item` (see [Indexing pipeline](#indexing-pipeline)). The chat worker comes with the response agent (SAV-17); until then chat jobs wait in their queue and expire after a day.
 - **Routing is decided once:** each text's route is kept as a receipt by its message id before anything changes, so a repeated delivery is routed the same way, also when a delayed share arrived in between.
 - **Ingestion state:** payloads, text receipts and each user's recent shares stay in Redis for `INGESTION_STATE_TTL_SECONDS`, and "delete my data" erases them.
 - **Errors:** if Postgres or Redis is down, the endpoint answers 500 and Meta delivers the webhook again. Handling a webhook twice is safe.
@@ -290,7 +290,7 @@ Every saved item is understood once, when it is saved (`docs/ARCHITECTURE.md` §
 5. **Normalize:** open values (category, tags, cuisine, subject…) go through the shared vocabulary: exact hit, privacy gate, then match-or-new (§3.4).
 6. **Embed** the summary and transcript, mark the item `done`, and **confirm** by DM how it was saved, in the user's language, or in English while it isn't known.
 
-Each step's result is kept in `enrichment_run`, so a job that runs again continues where it stopped. The last of `INDEXING_MAX_TRIES` runs marks the item `failed`. Logs hold, for each item, its type, whether it was escalated, and the cost of its model calls.
+Each step's result is kept in `enrichment_run`, so a job that runs again continues where it stopped. A run that can't read its payload or item, or that passes `INDEXING_RUN_DEADLINE_SECONDS`, runs again too. The last of `INDEXING_MAX_TRIES` runs marks the item `failed`. The worker reads only the indexing queue; chat jobs wait in theirs. Logs hold, for each item, its type, whether it was escalated, and the cost of its model calls.
 
 Run the worker on your machine (it reads `.env`, and needs ffmpeg, Postgres and Redis):
 
@@ -322,7 +322,8 @@ The worker reads `Settings`, `ModelSettings`, `MessengerSettings` and `PipelineS
 | `VOCAB_MATCH_CANDIDATES` | How many nearby values the decision model chooses from |
 | `INDEXING_CONCURRENCY` | Jobs one worker runs at once; a bulk import fans out over every slot of every worker |
 | `INDEXING_MAX_TRIES`, `INDEXING_RETRY_DELAY_SECONDS` | Runs of one job, and the wait before the next run, multiplied by the run's number |
-| `INDEXING_JOB_TIMEOUT_SECONDS` | Time limit of one run. arq does not run a job again after a timeout, and its item stays `enriching` |
+| `INDEXING_RUN_DEADLINE_SECONDS` | How long the steps of one run may take. A run that passes it stops itself, records the step it was in, and runs again; the last try marks the item `failed` |
+| `INDEXING_JOB_TIMEOUT_SECONDS` | arq's own limit on one run, a backstop. Must be longer than the run deadline, so a stopped run has time to record its step |
 
 ## Models
 
@@ -512,7 +513,7 @@ app/
   ingestion/
     service.py        # stores captures, routes texts, queues jobs
     repository.py     # users on first contact, saved items, collection hints
-    jobs.py           # job names and ids, the arq queue
+    jobs.py           # job names, ids and queues (one arq queue per job name)
     session_state.py  # per-user state in Redis: payloads, text receipts, recent shares
     erasure.py        # erases a user's Redis state and jobs for "delete my data"
   pipeline/           # indexing: steps, prompts, vocabulary, the arq worker (see "Indexing pipeline")

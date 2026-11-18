@@ -13,6 +13,11 @@ The arguments are ids only, as text. Captions, texts and media links stay in
 the payloads hash (`app/ingestion/session_state.py`), which "delete my data"
 erases. A worker that finds no payload stops: the user was deleted.
 
+**Each job name has its own queue** (`INDEXING_QUEUE`, `CHAT_QUEUE`). A worker
+reads only the queue of the jobs it runs, so the indexing worker never takes a
+chat job it has no function for: that job would fail for good and be lost.
+Chat jobs wait in their queue until the response agent's worker (SAV-17) runs.
+
 Every job has an id made from what it works on. arq refuses a second job with
 an id it still knows, which is how a webhook that Meta delivers twice ends up
 as one job. arq knows an id while the job is queued or running, and afterwards
@@ -33,6 +38,34 @@ JobArguments = Mapping[str, Any]
 
 INDEX_SAVED_ITEM_JOB = "index_saved_item"
 ANSWER_CHAT_MESSAGE_JOB = "answer_chat_message"
+
+# arq's queues are sorted sets named like its own default queue (`arq:queue`).
+INDEXING_QUEUE = f"{default_queue_name}:indexing"
+CHAT_QUEUE = f"{default_queue_name}:chat"
+_QUEUE_OF_JOB = {INDEX_SAVED_ITEM_JOB: INDEXING_QUEUE, ANSWER_CHAT_MESSAGE_JOB: CHAT_QUEUE}
+# Every queue a job of ours can be in. arq's default queue is included because
+# jobs queued before the queues were split are still there, and "delete my data"
+# must remove them too.
+_ALL_QUEUES = (INDEXING_QUEUE, CHAT_QUEUE, default_queue_name)
+
+
+def queue_of(job_name: str) -> str:
+    """Return the queue that jobs of one name go to.
+
+    Args:
+        job_name: `INDEX_SAVED_ITEM_JOB` or `ANSWER_CHAT_MESSAGE_JOB`.
+
+    Returns:
+        The queue's Redis key.
+
+    Raises:
+        ValueError: If no queue is set for the job name.
+    """
+    try:
+        return _QUEUE_OF_JOB[job_name]
+    except KeyError as error:
+        raise ValueError(f"no queue is set for job {job_name!r}") from error
+
 
 # What arq keeps under a job id once the job is queued, retried or finished.
 _JOB_KEY_PREFIXES = (job_key_prefix, retry_key_prefix, result_key_prefix)
@@ -110,13 +143,16 @@ class ArqJobQueue:
             Whether the job was queued.
 
         Raises:
+            ValueError: If no queue is set for the job name.
             redis.exceptions.RedisError: If Redis cannot be reached.
         """
-        job = await self._redis.enqueue_job(job_name, _job_id=job_id, **arguments)
+        job = await self._redis.enqueue_job(
+            job_name, _job_id=job_id, _queue_name=queue_of(job_name), **arguments
+        )
         return job is not None
 
     async def discard(self, job_ids: Sequence[str]) -> None:
-        """Remove jobs from arq's queue, with their retry state and kept results.
+        """Remove jobs from every queue, with their retry state and kept results.
 
         A job a worker is running at this moment finishes. arq then keeps its
         result, which holds only the job's ids.
@@ -130,7 +166,8 @@ class ArqJobQueue:
         if not job_ids:
             return
         async with self._redis.pipeline(transaction=True) as pipeline:
-            pipeline.zrem(default_queue_name, *job_ids)
+            for queue_name in _ALL_QUEUES:
+                pipeline.zrem(queue_name, *job_ids)
             pipeline.delete(
                 *(prefix + job_id for job_id in job_ids for prefix in _JOB_KEY_PREFIXES)
             )

@@ -33,6 +33,7 @@ from tests.pipeline.support import (
 )
 
 SENDER_ID = "1000000000000141"
+RUN_DEADLINE_SECONDS = 30.0
 RULES = VocabularyRules(
     privacy_min_probability=0.9,
     alias_min_probability=0.9,
@@ -93,7 +94,14 @@ class Pipeline:
     def normalizer(self) -> Normalizer:
         return Normalizer(self.sessions, self.classifier, self.embedder, TEST_PROMPTS, RULES)
 
-    def indexer(self) -> ItemIndexer:
+    def indexer(
+        self,
+        *,
+        sessions: object | None = None,
+        payloads: object | None = None,
+        run_deadline_seconds: float = RUN_DEADLINE_SECONDS,
+    ) -> ItemIndexer:
+        """Build the indexer; tests may swap in failing sessions or payloads."""
         store = self.store
         steps = PipelineSteps(
             fetcher=MediaFetcher(
@@ -128,12 +136,13 @@ class Pipeline:
             store=store,
         )
         return ItemIndexer(
-            self.sessions,
-            self.payloads,
+            sessions or self.sessions,  # type: ignore[arg-type]
+            payloads or self.payloads,  # type: ignore[arg-type]
             steps,
             CONTENT_TYPES,
             TEST_PROMPTS,
             alias_min_probability=RULES.alias_min_probability,
+            run_deadline_seconds=run_deadline_seconds,
         )
 
 

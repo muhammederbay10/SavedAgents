@@ -5,7 +5,7 @@ All captions, transcripts, names and links are synthetic.
 
 import asyncio
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -14,6 +14,7 @@ import httpx
 
 from app.adapters.base import CaptureEvent
 from app.agent.messenger import OutgoingMessage, SendResult, SendStatus
+from app.config import PipelineSettings
 from app.models.base import (
     Answer,
     ChoiceAnswer,
@@ -58,6 +59,8 @@ MEDIA_URL = (
 )
 SHARED_AT = datetime(2026, 1, 15, 12, 0, 0, tzinfo=UTC)
 VIDEO_BYTES = b"synthetic original video"
+# Longer than any deadline a test sets: a stalled model call never finishes by itself.
+STALL_SECONDS = 3600
 IMAGE_BYTES = b"synthetic original image"
 
 
@@ -75,6 +78,8 @@ class ScriptedClassifier:
         extra_answers: Answers to questions the pipeline should never ask,
             such as a model claiming that a clip has speech.
         cost_usd: The charge reported for each call.
+        stalled_calls: How many of the first calls hang, as a model that never answers.
+        before_decide: Run once, at the next call, before it is answered.
         calls: The state and questions of every call.
     """
 
@@ -86,12 +91,20 @@ class ScriptedClassifier:
     unanswered: set[str] = field(default_factory=set)
     extra_answers: dict[str, Answer] = field(default_factory=dict)
     cost_usd: float | None = 0.0001
+    stalled_calls: int = 0
+    before_decide: Callable[[], Awaitable[None]] | None = None
     calls: list[tuple[tuple[ContentPart, ...], tuple[Question, ...]]] = field(default_factory=list)
 
     async def decide(
         self, state: Sequence[ContentPart], questions: Sequence[Question]
     ) -> DecisionResult:
         self.calls.append((tuple(state), tuple(questions)))
+        if self.stalled_calls > 0:
+            self.stalled_calls -= 1
+            await asyncio.sleep(STALL_SECONDS)
+        if self.before_decide is not None:
+            hook, self.before_decide = self.before_decide, None
+            await hook()
         return DecisionResult(
             answers={question.key: self._answer(state, question) for question in questions},
             model=DECISION_MODEL,
@@ -299,3 +312,32 @@ def open_extraction(
         "category": category,
         "tags": list(tags),
     }
+
+
+def pipeline_settings(**overrides: object) -> PipelineSettings:
+    """Pipeline settings for tests, never read from the environment or `.env`."""
+    values: dict[str, object] = {
+        "media_storage_dir": "./unused-media",
+        "media_download_timeout_seconds": 5,
+        "media_max_download_bytes": 10_000,
+        "media_stored_height_pixels": 360,
+        "ffmpeg_path": "ffmpeg",
+        "ffprobe_path": "ffprobe",
+        "media_tool_timeout_seconds": 5,
+        "transcript_min_speech_characters": 4,
+        "classify_is_list_min_probability": 0.5,
+        "extraction_temperature": 0,
+        "extraction_max_output_tokens": 800,
+        "vocab_privacy_min_probability": 0.9,
+        "vocab_alias_min_probability": 0.9,
+        "vocab_alias_min_users": 2,
+        "vocab_max_value_length": 40,
+        "vocab_phone_min_digits": 7,
+        "vocab_match_candidates": 3,
+        "indexing_concurrency": 1,
+        "indexing_max_tries": 3,
+        "indexing_retry_delay_seconds": 0.01,
+        "indexing_run_deadline_seconds": 30,
+        "indexing_job_timeout_seconds": 60,
+    }
+    return PipelineSettings(_env_file=None, **{**values, **overrides})  # type: ignore[arg-type]

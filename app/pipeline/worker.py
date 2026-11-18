@@ -1,6 +1,7 @@
 """The indexing worker: runs `index_saved_item` jobs from the arq queue.
 
-Run it with `python -m app.pipeline.worker`. It reads `Settings`,
+Run it with `python -m app.pipeline.worker`. It reads only the indexing queue
+(`app.ingestion.jobs.INDEXING_QUEUE`), so chat jobs wait for their own worker. It reads `Settings`,
 `ModelSettings`, `PipelineSettings` and `MessengerSettings` from the
 environment, and needs `ffmpeg` and `ffprobe` on the machine.
 
@@ -13,6 +14,10 @@ more slots. The providers' rate limits set the real ceiling.
 `RetryLaterError`; the job is tried again after a growing wait, up to
 `INDEXING_MAX_TRIES` runs. The last run marks the item `failed`. Each run
 continues after the steps that already finished (`app.pipeline.indexer`).
+Reading the payload and the item at the start is retried the same way, and so
+is a run that passes `INDEXING_RUN_DEADLINE_SECONDS`: the run stops itself,
+records the step it was in, and is tried again. arq's own limit,
+`INDEXING_JOB_TIMEOUT_SECONDS`, is longer and only a backstop.
 
 The job's arguments are ids, and its result is the outcome's name, so neither
 holds a caption, a link or any other content.
@@ -20,25 +25,30 @@ holds a caption, a link or any other content.
 
 import asyncio
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any, Final
 
 import httpx
 from arq import Retry
-from arq.connections import RedisSettings
+from arq.connections import ArqRedis, RedisSettings
+from arq.typing import StartupShutdown
 from arq.worker import Worker, func
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.agent.messenger import InstagramMessenger
 from app.config import (
+    PipelineSettings,
+    Settings,
     get_messenger_settings,
     get_model_settings,
     get_pipeline_settings,
     get_settings,
 )
 from app.db.session import create_engine, create_session_factory
-from app.ingestion.jobs import INDEX_SAVED_ITEM_JOB
+from app.ingestion.jobs import INDEX_SAVED_ITEM_JOB, INDEXING_QUEUE
 from app.logging_config import configure_logging
 from app.models.factory import build_model_clients, open_http_client
 from app.pipeline.classify import PostClassifier
@@ -75,15 +85,13 @@ class WorkerResources:
         indexer: Indexes one item.
         max_tries: `INDEXING_MAX_TRIES`.
         retry_delay_seconds: `INDEXING_RETRY_DELAY_SECONDS`.
-        engine: The database engine.
-        http_clients: The HTTP clients for the models, media downloads and DMs.
+        close: Closes the HTTP clients and the database engine.
     """
 
     indexer: ItemIndexer
     max_tries: int
     retry_delay_seconds: float
-    engine: AsyncEngine
-    http_clients: tuple[httpx.AsyncClient, ...]
+    close: Callable[[], Awaitable[None]]
 
 
 async def index_saved_item(ctx: JobContext, *, user_id: str, saved_item_id: str) -> str:
@@ -194,12 +202,17 @@ async def start_worker(ctx: JobContext) -> None:
             CONTENT_TYPES,
             PIPELINE_PROMPTS,
             alias_min_probability=rules.alias_min_probability,
+            run_deadline_seconds=pipeline_settings.indexing_run_deadline_seconds,
         ),
         max_tries=pipeline_settings.indexing_max_tries,
         retry_delay_seconds=pipeline_settings.indexing_retry_delay_seconds,
-        engine=engine,
-        http_clients=(model_http, media_http, messenger_http),
+        close=partial(_close, engine, (model_http, media_http, messenger_http)),
     )
+
+
+async def _close(engine: AsyncEngine, http_clients: tuple[httpx.AsyncClient, ...]) -> None:
+    await asyncio.gather(*(client.aclose() for client in http_clients))
+    await engine.dispose()
 
 
 async def stop_worker(ctx: JobContext) -> None:
@@ -209,23 +222,32 @@ async def stop_worker(ctx: JobContext) -> None:
         ctx: arq's worker context.
     """
     resources: WorkerResources | None = ctx.get(_RESOURCES)
-    if resources is None:
-        return
-    await asyncio.gather(*(client.aclose() for client in resources.http_clients))
-    await resources.engine.dispose()
+    if resources is not None:
+        await resources.close()
 
 
-def build_worker() -> Worker:
-    """Create the arq worker for indexing jobs, from the settings.
+def build_worker(
+    settings: Settings,
+    pipeline_settings: PipelineSettings,
+    *,
+    on_startup: StartupShutdown = start_worker,
+    redis_pool: ArqRedis | None = None,
+    burst: bool = False,
+) -> Worker:
+    """Create the arq worker for indexing jobs.
+
+    It reads only `INDEXING_QUEUE`, so it never takes a chat job.
+
+    Args:
+        settings: The app's settings, for the Redis URL.
+        pipeline_settings: The pipeline's settings: tries, concurrency, timeouts.
+        on_startup: Builds the job resources; tests pass their own.
+        redis_pool: A Redis client to use instead of one from the URL; tests pass one.
+        burst: Stop once the queue is empty, instead of waiting for more jobs.
 
     Returns:
         The worker. `run()` starts it.
-
-    Raises:
-        pydantic.ValidationError: If a required setting is missing or invalid.
     """
-    settings = get_settings()
-    pipeline_settings = get_pipeline_settings()
     return Worker(
         functions=[
             func(
@@ -234,14 +256,28 @@ def build_worker() -> Worker:
                 max_tries=pipeline_settings.indexing_max_tries,
             )
         ],
+        queue_name=INDEXING_QUEUE,
         redis_settings=RedisSettings.from_dsn(str(settings.redis_url)),
-        on_startup=start_worker,
+        redis_pool=redis_pool,
+        burst=burst,
+        on_startup=on_startup,
         on_shutdown=stop_worker,
         max_jobs=pipeline_settings.indexing_concurrency,
+        # The run stops itself at INDEXING_RUN_DEADLINE_SECONDS and records where;
+        # this outer limit is only a backstop, after the time that takes.
         job_timeout=pipeline_settings.indexing_job_timeout_seconds,
         max_tries=pipeline_settings.indexing_max_tries,
     )
 
 
+def main() -> None:
+    """Run the indexing worker until it is stopped.
+
+    Raises:
+        pydantic.ValidationError: If a required setting is missing or invalid.
+    """
+    build_worker(get_settings(), get_pipeline_settings()).run()
+
+
 if __name__ == "__main__":
-    build_worker().run()
+    main()

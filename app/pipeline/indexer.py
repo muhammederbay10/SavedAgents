@@ -24,6 +24,7 @@ item logs whether it was escalated and what its model calls cost, which gives
 the escalation rate and the cost per item.
 """
 
+import asyncio
 import copy
 import logging
 import uuid
@@ -70,9 +71,18 @@ from app.types.registry import ContentTypeRegistry
 
 logger = logging.getLogger(__name__)
 
+
 # Failures that may pass when the job runs again: model and network errors,
 # ffmpeg under load, and a database or Redis that is briefly unreachable.
+class IndexingDeadlineError(Exception):
+    """A run of the job passed `INDEXING_RUN_DEADLINE_SECONDS` and was stopped.
+
+    The step it was in is recorded as failed, and the job runs again from there.
+    """
+
+
 RETRYABLE_ERRORS: Final = (
+    IndexingDeadlineError,
     ModelError,
     MediaDownloadError,
     MediaToolError,
@@ -82,7 +92,14 @@ RETRYABLE_ERRORS: Final = (
     RedisError,
 )
 # Errors whose message is written to carry no content, so it can be stored.
-_DESCRIBED_ERRORS: Final = (ModelError, MediaDownloadError, MediaToolError)
+_DESCRIBED_ERRORS: Final = (
+    IndexingDeadlineError,
+    ModelError,
+    MediaDownloadError,
+    MediaToolError,
+)
+# The name of the work before the first step, in logs: reading the payload and the item.
+_START: Final = "start"
 _RESUMABLE_STATUSES: Final = frozenset({ItemStatus.PENDING, ItemStatus.ENRICHING})
 _CONFIRMATION_RUN_STATUS: Final = {
     ConfirmationStatus.SENT: RunStatus.DONE,
@@ -105,17 +122,20 @@ class RetryLaterError(Exception):
     """A step failed in a way that may pass when the job runs again.
 
     Attributes:
-        step: The step that failed.
+        step: The step that failed; `None` when the run failed before its first
+            step, while reading the payload or the item.
     """
 
-    def __init__(self, step: Step, cause: BaseException) -> None:
+    def __init__(self, step: Step | None, cause: BaseException) -> None:
         """Create the error.
 
         Args:
-            step: The step that failed.
+            step: The step that failed, or `None` before the first step.
             cause: What went wrong.
         """
-        super().__init__(f"indexing step {step} failed and can be tried again: {describe(cause)}")
+        super().__init__(
+            f"indexing step {step or _START} failed and can be tried again: {describe(cause)}"
+        )
         self.step = step
 
 
@@ -202,6 +222,7 @@ class ItemIndexer:
         prompts: PipelinePrompts,
         *,
         alias_min_probability: float,
+        run_deadline_seconds: float,
     ) -> None:
         """Create the indexer.
 
@@ -212,6 +233,8 @@ class ItemIndexer:
             registry: The built-in types.
             prompts: The wording; its version is recorded with each step.
             alias_min_probability: `VOCAB_ALIAS_MIN_PROBABILITY`.
+            run_deadline_seconds: `INDEXING_RUN_DEADLINE_SECONDS`: how long the
+                steps of one run may take before the run is stopped and retried.
         """
         self._sessions = sessions
         self._payloads = payloads
@@ -219,6 +242,7 @@ class ItemIndexer:
         self._registry = registry
         self._prompts = prompts
         self._alias_min_probability = alias_min_probability
+        self._run_deadline_seconds = run_deadline_seconds
 
     async def index(
         self, user_id: uuid.UUID, saved_item_id: uuid.UUID, *, last_try: bool
@@ -239,16 +263,19 @@ class ItemIndexer:
                 and this is not the last try.
             Exception: Any other error, after the item is marked `failed`.
         """
-        event = await self._payloads.capture(user_id, saved_item_id)
-        if event is None:
-            logger.info("indexing_payload_missing", extra={"saved_item_id": str(saved_item_id)})
-            return IndexOutcome.GONE
-        started = await self._start(user_id, saved_item_id)
+        try:
+            event = await self._payloads.capture(user_id, saved_item_id)
+            if event is None:
+                logger.info("indexing_payload_missing", extra={"saved_item_id": str(saved_item_id)})
+                return IndexOutcome.GONE
+            started = await self._start(user_id, saved_item_id)
+        except RETRYABLE_ERRORS as error:
+            return await self._start_failed(user_id, saved_item_id, error, last_try=last_try)
         if isinstance(started, IndexOutcome):
             return started
         run = _Run(user_id=user_id, item_id=saved_item_id, finished=started)
         try:
-            await self._run_steps(run, event)
+            await self._run_steps_before_deadline(run, event)
         except _ItemGoneError:
             logger.info("indexing_item_gone", extra={"saved_item_id": str(saved_item_id)})
             return IndexOutcome.GONE
@@ -266,6 +293,53 @@ class ItemIndexer:
             await self._fail(run, error)
             raise
         return IndexOutcome.INDEXED
+
+    async def _start_failed(
+        self, user_id: uuid.UUID, saved_item_id: uuid.UUID, error: BaseException, *, last_try: bool
+    ) -> IndexOutcome:
+        """Handle a failure before the first step: try again, or mark the item failed.
+
+        No step is recorded, so every step that already finished stays finished.
+
+        Raises:
+            RetryLaterError: If this is not the last try.
+        """
+        details = {"saved_item_id": str(saved_item_id), "step": _START, "error": describe(error)}
+        if not last_try:
+            logger.info("saved_item_indexing_retry", extra=details)
+            raise RetryLaterError(None, error) from error
+        logger.warning("saved_item_indexing_failed", extra=details)
+        try:
+            async with self._sessions() as session, session.begin():
+                if not await lock_user(session, user_id):
+                    return IndexOutcome.FAILED
+                item = await load_item(session, saved_item_id)
+                if item is not None and item.status in _RESUMABLE_STATUSES:
+                    item.status = ItemStatus.FAILED
+        except (SQLAlchemyError, OSError) as record_error:
+            logger.error(
+                "indexing_failure_not_recorded",
+                extra={"saved_item_id": str(saved_item_id), "error": describe(record_error)},
+            )
+        return IndexOutcome.FAILED
+
+    async def _run_steps_before_deadline(self, run: _Run, event: CaptureEvent) -> None:
+        """Run the steps, but stop them at the run's deadline, before arq's own timeout.
+
+        Raises:
+            IndexingDeadlineError: If the deadline passed; `run.current` is the
+                step that was interrupted.
+        """
+        deadline = asyncio.timeout(self._run_deadline_seconds)
+        try:
+            async with deadline:
+                await self._run_steps(run, event)
+        except TimeoutError as error:
+            if not deadline.expired():
+                raise
+            raise IndexingDeadlineError(
+                f"indexing ran past its deadline of {self._run_deadline_seconds} s"
+            ) from error
 
     async def _start(
         self, user_id: uuid.UUID, saved_item_id: uuid.UUID
@@ -543,7 +617,9 @@ class ItemIndexer:
     ) -> None:
         try:
             async with self._locked(run) as (session, item):
-                item.status = item_status
+                # A run stopped after the item was done (while confirming) leaves it done.
+                if item.status in _RESUMABLE_STATUSES:
+                    item.status = item_status
                 await record_step(
                     session, run.item_id, run.current, RunStatus.FAILED, error=describe(error)
                 )

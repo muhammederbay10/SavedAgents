@@ -128,3 +128,34 @@ async def test_rejecting_an_unknown_alias_fails(pipeline: Pipeline) -> None:
 
     with pytest.raises(UnknownAliasError):
         await rejection.reject(uuid.uuid4())
+
+
+async def test_a_correction_made_while_the_models_work_is_kept(pipeline: Pipeline) -> None:
+    vector = list((await pipeline.embedder.embed(["korean"])).vectors[0])
+    async with pipeline.sessions() as session, session.begin():
+        await vocabulary.add_value(session, "cuisine", "korean", vector)
+    user_id, other_user_id = await add_user(pipeline.sessions), await add_user(pipeline.sessions)
+    corrected_meanwhile = await index_place(pipeline, user_id, WORDING)
+    renormalized = await index_place(pipeline, other_user_id, WORDING)
+    alias = await the_alias(pipeline)
+
+    async def correct_during_model_work() -> None:
+        await correct_by_hand(pipeline, corrected_meanwhile, "turkish")
+
+    # The privacy gate is the first model call of the re-normalization; the
+    # user corrects the item while it waits for the answer.
+    pipeline.classifier.before_decide = correct_during_model_work
+    rejection = AliasRejection(
+        pipeline.sessions, pipeline.normalizer(), CONTENT_TYPES, alias_min_probability=0.9
+    )
+    await rejection.reject(alias.id)
+
+    kept = await load(pipeline.sessions, corrected_meanwhile)
+    assert kept.fields["cuisine"] == ["turkish"]
+    assert kept.fields["entities"][0]["cuisine"] == "turkish"
+    assert kept.raw_values["entities.0.cuisine"] == {
+        "field": "cuisine",
+        "wording": "turkish",
+        "user_set": True,
+    }
+    assert (await load(pipeline.sessions, renormalized)).fields["cuisine"] == ["kore mutfağı"]

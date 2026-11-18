@@ -102,14 +102,50 @@ class AliasRejection:
             affected = _values_through(alias_id, run.output or {}, item.raw_values)
         if not affected:
             return
+        # The models are asked without any lock, so the user may change the item
+        # meanwhile. What they changed is read again under the lock and kept.
         normalization = await self._normalizer.normalize(affected)
+        applied = await self._apply_unchanged(item_id, alias_id, affected, normalization)
+        await self._normalizer.verify_aliases(
+            Normalization(
+                values={value.path: normalization.values[value.path] for value in applied},
+                costs=normalization.costs,
+            ).confident_alias_ids(self._alias_min_probability)
+        )
+        logger.info(
+            "saved_item_normalized_again",
+            extra={
+                "saved_item_id": str(item_id),
+                "values": len(applied),
+                "changed_meanwhile": len(affected) - len(applied),
+            },
+        )
+
+    async def _apply_unchanged(
+        self,
+        item_id: uuid.UUID,
+        alias_id: uuid.UUID,
+        affected: Sequence[OpenValue],
+        normalization: Normalization,
+    ) -> list[OpenValue]:
+        """Apply the new values whose wording and provenance did not change meanwhile.
+
+        The owner's row is locked before the item is read again, as every other
+        writer of the item does. A value the user set by hand, or whose wording
+        or provenance changed since the snapshot, stays as it is now.
+
+        Returns:
+            The values that were applied.
+        """
         async with self._sessions() as session, session.begin():
-            item = await session.get(SavedItem, item_id)
-            if item is None or not await lock_user(session, item.user_id):
-                return
+            owner_id = await vocabulary.owner_of(session, item_id)
+            if owner_id is None or not await lock_user(session, owner_id):
+                return []
+            item = await session.get(SavedItem, item_id, populate_existing=True)
             run = await vocabulary.normalize_run(session, item_id)
-            if run is None:
-                return
+            if item is None or run is None:
+                return []
+            current = set(_values_through(alias_id, run.output or {}, item.raw_values))
             schema = self._registry.extraction_schema(item.type)
             document = document_of_item(
                 schema,
@@ -118,17 +154,17 @@ class AliasRejection:
                 tags=item.tags,
                 fields=item.fields,
             )
-            for path, normalized in normalization.values.items():
-                set_value(document, path, normalized.value)
+            applied: list[OpenValue] = []
+            for open_value in affected:
+                if open_value not in current:
+                    continue
+                set_value(document, open_value.path, normalization.values[open_value.path].value)
+                applied.append(open_value)
+            if not applied:
+                return []
             await vocabulary.apply_item_values(session, item, item_values(schema, document))
-            run.output = _provenance_with(run.output or {}, affected, normalization)
-        await self._normalizer.verify_aliases(
-            normalization.confident_alias_ids(self._alias_min_probability)
-        )
-        logger.info(
-            "saved_item_normalized_again",
-            extra={"saved_item_id": str(item_id), "values": len(affected)},
-        )
+            run.output = _provenance_with(run.output or {}, applied, normalization)
+            return applied
 
 
 def _values_through(

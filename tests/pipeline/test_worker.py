@@ -8,12 +8,13 @@ import pytest
 from arq import Retry
 from arq.connections import ArqRedis
 from arq.jobs import Job
-from arq.worker import Worker, func
 
-from app.ingestion.jobs import INDEX_SAVED_ITEM_JOB, index_job_id
+from app.config import Settings
+from app.ingestion.jobs import INDEX_SAVED_ITEM_JOB, INDEXING_QUEUE, ArqJobQueue, index_job_id
 from app.pipeline.indexer import IndexOutcome, RetryLaterError
 from app.pipeline.runs import Step
-from app.pipeline.worker import WorkerResources, index_saved_item
+from app.pipeline.worker import WorkerResources, build_worker, index_saved_item
+from tests.pipeline.support import pipeline_settings
 
 MAX_TRIES = 3
 RETRY_DELAY_SECONDS = 2.0
@@ -35,13 +36,16 @@ class StubIndexer:
         return IndexOutcome.FAILED if self.fail_with_retry else IndexOutcome.INDEXED
 
 
+async def no_close() -> None:
+    return None
+
+
 def context(indexer: StubIndexer, job_try: int) -> dict[str, Any]:
     resources = WorkerResources(
         indexer=indexer,  # type: ignore[arg-type]
         max_tries=MAX_TRIES,
         retry_delay_seconds=RETRY_DELAY_SECONDS,
-        engine=None,  # type: ignore[arg-type]
-        http_clients=(),
+        close=no_close,
     )
     return {"indexing_resources": resources, "job_try": job_try}
 
@@ -82,34 +86,37 @@ async def test_the_last_try_marks_the_item_failed_instead_of_retrying() -> None:
 
 
 async def test_a_job_queued_like_ingestion_queues_it_runs_on_the_worker(
-    ingestion_redis: ArqRedis,
+    ingestion_redis: ArqRedis, settings: Settings
 ) -> None:
     indexer = StubIndexer()
     user_id, item_id = uuid.uuid4(), uuid.uuid4()
-    queue = f"test-indexing-{uuid.uuid4().hex}"
 
     async def inject(ctx: dict[str, Any]) -> None:
         ctx.update(context(indexer, job_try=0))
 
-    job = await ingestion_redis.enqueue_job(
+    job_queue = ArqJobQueue(ingestion_redis)
+    await job_queue.enqueue(
         INDEX_SAVED_ITEM_JOB,
-        _job_id=index_job_id(item_id),
-        _queue_name=queue,
-        user_id=str(user_id),
-        saved_item_id=str(item_id),
+        index_job_id(item_id),
+        {"user_id": str(user_id), "saved_item_id": str(item_id)},
     )
-    assert isinstance(job, Job)
-    worker = Worker(
-        functions=[func(index_saved_item, name=INDEX_SAVED_ITEM_JOB)],
-        redis_pool=ingestion_redis,
-        queue_name=queue,
-        burst=True,
-        on_startup=inject,
-        handle_signals=False,
-        poll_delay=0.01,
+    worker = build_worker(
+        settings, pipeline_settings(), on_startup=inject, redis_pool=ingestion_redis, burst=True
     )
-    # The worker borrows the fixture's Redis client, which the fixture closes.
-    await worker.main()
+    try:
+        # The worker borrows the fixture's Redis client, which the fixture closes.
+        await worker.main()
 
-    assert indexer.calls == [(user_id, item_id, False)]
-    assert await job.result(timeout=5) == "indexed"
+        assert (user_id, item_id, False) in indexer.calls
+        job = Job(index_job_id(item_id), ingestion_redis, _queue_name=INDEXING_QUEUE)
+        assert await job.result(timeout=5) == "indexed"
+    finally:
+        await job_queue.discard([index_job_id(item_id)])
+
+
+def test_the_worker_reads_only_the_indexing_queue(settings: Settings) -> None:
+    worker = build_worker(settings, pipeline_settings(indexing_concurrency=7))
+
+    assert worker.queue_name == INDEXING_QUEUE
+    assert set(worker.functions) == {INDEX_SAVED_ITEM_JOB}
+    assert worker.max_jobs == 7

@@ -26,6 +26,7 @@ REQUIRED_VARIABLES = {
     "INDEXING_CONCURRENCY": "10",
     "INDEXING_MAX_TRIES": "5",
     "INDEXING_RETRY_DELAY_SECONDS": "30",
+    "INDEXING_RUN_DEADLINE_SECONDS": "540",
     "INDEXING_JOB_TIMEOUT_SECONDS": "600",
 }
 
@@ -85,3 +86,12 @@ def test_an_example_file_lists_every_pipeline_setting() -> None:
 
     for name in REQUIRED_VARIABLES:
         assert f"\n{name}=" in example
+
+
+def test_the_job_timeout_must_leave_time_after_the_run_deadline(
+    environment: pytest.MonkeyPatch,
+) -> None:
+    environment.setenv("INDEXING_RUN_DEADLINE_SECONDS", "600")
+
+    with pytest.raises(ValidationError, match="longer than indexing_run_deadline_seconds"):
+        load()
