@@ -9,6 +9,7 @@ from app.types.base import (
     EntityExtraction,
     EntityMention,
     FilterKind,
+    FilterSource,
     NonEmptyText,
     SearchFilter,
     Vocabulary,
@@ -76,6 +77,7 @@ PLACE = ContentType(
             name="open_now",
             kind=FilterKind.BOOLEAN,
             description="True to keep only places that are open right now.",
+            source=FilterSource.OPENING_HOURS,
         ),
         SearchFilter(
             name="cuisine",
