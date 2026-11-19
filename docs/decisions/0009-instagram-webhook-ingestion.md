@@ -25,10 +25,12 @@ The tickets that run the jobs come later: the indexing pipeline (SAV-14) and the
    - a text follows the receipt of its first delivery (point 7), and its chat job is queued again only if the receipt says it wasn't queued.
 5. **Job contract: ids in the job, data in a payload that "delete my data" can reach.** Workers register functions with these names and keyword arguments, all ids as text:
 
-   | Job | Keyword arguments | Payload, in the hash `savely:ingestion:<user_id>:payloads` |
-   |---|---|---|
-   | `index_saved_item` | `user_id`, `saved_item_id` | field `capture:<saved_item_id>`: the `CaptureEvent` as JSON |
-   | `answer_chat_message` | `user_id`, `message_receipt_id` | field `chat:<message_receipt_id>`: the `ChatMessage` as JSON |
+   | Job | Keyword arguments | arq queue | Payload, in the hash `savely:ingestion:<user_id>:payloads` |
+   |---|---|---|---|
+   | `index_saved_item` | `user_id`, `saved_item_id` | `arq:queue:indexing` | field `capture:<saved_item_id>`: the `CaptureEvent` as JSON |
+   | `answer_chat_message` | `user_id`, `message_receipt_id` | `arq:queue:chat` | field `chat:<message_receipt_id>`: the `ChatMessage` as JSON |
+
+   Each job name has its own queue (SAV-14, record 0012), so a worker reads only the jobs it can run. On one shared queue the indexing worker took chat jobs and failed them for good. The indexing worker's stuck-item sweeper may queue `index_saved_item` again, with the same job id, for an item no job is working on any more (record 0012).
 
    The indexing job needs the whole capture event because `saved_item` has no column for the media link: the signed image or video link exists only in the event, and the pipeline must download it before it expires. A share of the same pending item that was **sent** later replaces the payload, so the job gets the freshest link; an older message delivered again or late never replaces a newer payload. A worker that finds no payload stops, because the user was deleted. arq keeps a job's arguments in its queue and in the job's result; with ids only, neither holds a caption, a text or a link.
 6. **A repeated share changes nothing on the item.** The first share's message id, caption and save time stay. Answers reply to the first message.
@@ -44,7 +46,7 @@ The tickets that run the jobs come later: the indexing pipeline (SAV-14) and the
 12. **Nothing personal is logged.** Logs hold our own ids (user, saved item), the outcome and the attachment type. They never hold the sender's Instagram id, a message id, a caption, a text or a link. The API's database engine hides statement values in its errors for the same reason.
 13. **Ingestion and "delete my data" take the same lock.** Ingestion locks the user's row (`FOR NO KEY UPDATE`) for the whole transaction of one message, and `delete_user_data()` locks it `FOR UPDATE`. A deletion therefore waits for the message being handled, and a message that arrives during a deletion waits and then finds no user: it is refused with a 500 (`UnknownUserError`), and Meta's next delivery starts a new user. Nothing is written to Redis for a user who is being deleted.
 14. **Ingestion's state lives in Redis, per user, for `INGESTION_STATE_TTL_SECONDS`.** Three keys hold everything ingestion keeps about a user: the hashes `savely:ingestion:<user_id>:payloads` (point 5) and `:receipts` (field `<platform>:<message id>`), and the sorted set `:shares` (one entry per share, scored by its send time, point 7). Each write renews the key's lifetime. It must cover the time Meta keeps delivering a failed webhook again: up to 36 hours by the Graph API webhooks documentation (the Messenger Platform page says a subscription is switched off after 1 hour of failures). `.env.example` sets 36 hours. Redis is where the design keeps session state (§2, §5), so no table was added.
-15. **"Delete my data" erases the Redis state too.** `delete_user_data()` now takes an eraser for the stores outside Postgres and calls it while it holds the user's lock, before it deletes any row. The ingestion eraser (`app/ingestion/erasure.py`) removes the user's indexing and chat jobs from arq's queue with their retry state and kept results, then deletes the user's three hashes. If Redis fails, no row is deleted and the request can be repeated.
+15. **"Delete my data" erases the Redis state too.** `delete_user_data()` now takes an eraser for the stores outside Postgres and calls it while it holds the user's lock, before it deletes any row. The ingestion eraser (`app/ingestion/erasure.py`) removes the user's indexing and chat jobs from their queues (and from arq's default queue, where jobs queued before the queues were split may be) with their retry state and kept results, then deletes the user's three hashes. If Redis fails, no row is deleted and the request can be repeated.
 
 ## For Muhammed
 

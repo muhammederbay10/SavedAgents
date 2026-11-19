@@ -29,6 +29,12 @@ _UVICORN_SERVER_LOGGER_NAMES = ("uvicorn", "uvicorn.error")
 # query strings. Both can be personal data or secrets, so they are never written.
 _UVICORN_ACCESS_LOGGER_NAME = "uvicorn.access"
 
+# httpx logs every request line, with the full URL, at INFO, and httpcore adds
+# connection details at DEBUG. A media link from a webhook is a signed, private
+# URL, so these loggers never write below WARNING.
+_HTTP_CLIENT_LOGGER_NAMES = ("httpx", "httpcore")
+_HTTP_CLIENT_MIN_LEVEL = logging.WARNING
+
 
 class JsonLogFormatter(logging.Formatter):
     """Formats a log record as a single-line JSON object."""
@@ -64,7 +70,8 @@ def configure_logging(level: LogLevel, stream: TextIO = sys.stdout) -> None:
 
     The level is enforced on the handler, so it also holds for libraries that set
     a level on their own loggers. Uvicorn's server logs go through the same
-    handler, and its access log is switched off.
+    handler, and its access log is switched off. The HTTP client's request
+    lines, which hold full URLs, are only written from WARNING up.
 
     Calling it again replaces the previous handler, so it is safe to call once
     per application start.
@@ -86,6 +93,11 @@ def configure_logging(level: LogLevel, stream: TextIO = sys.stdout) -> None:
         server_logger.handlers = []
         server_logger.propagate = True
         server_logger.setLevel(level)
+
+    for name in _HTTP_CLIENT_LOGGER_NAMES:
+        logging.getLogger(name).setLevel(
+            max(logging.getLevelNamesMapping()[level], _HTTP_CLIENT_MIN_LEVEL)
+        )
 
     _disable_uvicorn_access_log()
 

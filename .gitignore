@@ -13,3 +13,6 @@ dist/
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
+
+# Local media store of the indexing pipeline (MEDIA_STORAGE_DIR)
+/media/

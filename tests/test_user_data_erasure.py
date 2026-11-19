@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.adapters.base import CaptureEvent, ChatMessage
 from app.db.deletion import delete_user_data
 from app.ingestion.erasure import IngestionDataEraser
-from app.ingestion.jobs import ArqJobQueue
+from app.ingestion.jobs import CHAT_QUEUE, INDEXING_QUEUE, ArqJobQueue
 from app.ingestion.service import IngestionService
 from app.ingestion.session_state import RedisIngestionState
 from tests.db_factories import INSTAGRAM
@@ -76,7 +76,10 @@ async def ingest_share_and_question(
 
 async def job_ids_by_user(redis: ArqRedis) -> dict[str, set[str]]:
     jobs: dict[str, set[str]] = {}
-    for job in await redis.queued_jobs():
+    for job in [
+        *await redis.queued_jobs(queue_name=INDEXING_QUEUE),
+        *await redis.queued_jobs(queue_name=CHAT_QUEUE),
+    ]:
         jobs.setdefault(str(job.kwargs["user_id"]), set()).add(job.job_id)
     return jobs
 

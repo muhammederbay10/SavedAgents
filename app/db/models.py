@@ -146,6 +146,10 @@ class PlatformAccount(Base):
 class SavedItem(Base):
     """One post a user saved, with everything indexing learned about it.
 
+    `indexing_attempts` counts the indexing runs started for the item, across
+    every requeue, and `indexing_updated_at` is when an indexing job or the
+    stuck-item sweeper last worked on it (record 0012).
+
     A user's item is stored once per post id and once per message id, whichever
     it has. Every item has a post id, a message id or a post link, so it can
     always be shown back to the user (decision record 0007).
@@ -170,6 +174,11 @@ class SavedItem(Base):
         CheckConstraint(_not_empty("post_url"), name="post_url_is_not_empty"),
         CheckConstraint(_one_of("status", ItemStatus), name="status_is_known"),
         Index("ix_saved_item_fields", "fields", postgresql_using="gin"),
+        Index(
+            "ix_saved_item_unfinished_since",
+            "indexing_updated_at",
+            postgresql_where=text("status IN ('pending', 'enriching')"),
+        ),
         Index(
             "ix_saved_item_embedding",
             "embedding",
@@ -201,6 +210,10 @@ class SavedItem(Base):
     embedding: Mapped[list[float] | None] = mapped_column(Vector())
     saved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     source_message_id: Mapped[str | None] = mapped_column(Text)
+    indexing_attempts: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    indexing_updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
 
 
 def saved_item_search_vector() -> ColumnElement[str]:
