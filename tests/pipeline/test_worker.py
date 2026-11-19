@@ -12,8 +12,8 @@ from arq.jobs import Job
 from app.config import Settings
 from app.ingestion.jobs import INDEX_SAVED_ITEM_JOB, INDEXING_QUEUE, ArqJobQueue, index_job_id
 from app.pipeline.indexer import IndexOutcome, RetryLaterError
-from app.pipeline.runs import Step
-from app.pipeline.sweeper import SweepReport
+from app.pipeline.recovery.runs import Step
+from app.pipeline.recovery.sweeper import SweepReport
 from app.pipeline.worker import (
     SWEEP_STUCK_ITEMS_JOB,
     WorkerResources,

@@ -121,11 +121,17 @@ def test_sdk_check_finds_every_import_form(source: str, found: set[str]) -> None
     ("source", "found"),
     [
         (
-            "from app.models.openrouter import OpenRouterTransport",
-            {"app.models.openrouter", "app.models.openrouter.OpenRouterTransport"},
+            "from app.models.openrouter.transport import OpenRouterTransport",
+            {
+                "app.models.openrouter.transport",
+                "app.models.openrouter.transport.OpenRouterTransport",
+            },
         ),
-        ("import app.models.deepseek", {"app.models.deepseek"}),
-        ("from app.models import decision", {"app.models", "app.models.decision"}),
+        ("import app.models.clients.deepseek", {"app.models.clients.deepseek"}),
+        (
+            "from app.models.clients import decision",
+            {"app.models.clients", "app.models.clients.decision"},
+        ),
         (
             "from app.models.fakes import FakeEmbedder",
             {"app.models.fakes", "app.models.fakes.FakeEmbedder"},

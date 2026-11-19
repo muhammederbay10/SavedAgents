@@ -569,9 +569,15 @@ app/
     jobs.py           # job names, ids and queues (one arq queue per job name)
     session_state.py  # per-user state in Redis: payloads, text receipts, recent shares
     erasure.py        # erases a user's Redis state and jobs for "delete my data"
-  pipeline/           # indexing: steps, prompts, vocabulary, the arq worker (see "Indexing pipeline")
+  pipeline/           # indexing: the arq worker, indexer and prompts at the top (see "Indexing pipeline")
+    steps/            # fetch, classify, transcribe, extract, embed, confirm
+    media/            # ffprobe/ffmpeg tools and the media store
+    vocabulary/       # open values, normalization and the shared vocabulary
+    recovery/         # per-item run state and the stuck-item sweeper
   types/              # content-type registry: one module per built-in type
-  models/             # model interfaces, OpenRouter clients, fakes (see "Models")
+  models/             # model interfaces, errors, factory and fakes (see "Models")
+    openrouter/       # the shared HTTP transport, routing checks, JSON helpers
+    clients/          # one client per model role
   agent/
     messenger.py      # Instagram Send API client: DMs, quick replies, replies to saved reels
     reply_templates.py # fixed DM wording in the user's language

@@ -16,10 +16,10 @@ from app.db.models import EnrichmentRun, ItemStatus, SavedItem, Vocabulary
 from app.logging_config import configure_logging
 from app.models.base import TranscriptionAttempt, YesNoAnswer
 from app.models.errors import ModelUnavailableError
-from app.pipeline.classify import NONE_OF_THESE
 from app.pipeline.indexer import IndexOutcome, RetryLaterError
-from app.pipeline.media import MediaProbe
-from app.pipeline.runs import Step
+from app.pipeline.media.tools import MediaProbe
+from app.pipeline.recovery.runs import Step
+from app.pipeline.steps.classify import NONE_OF_THESE
 from app.types.registry import UnknownContentTypeError
 from tests.pipeline.harness import Pipeline, add_item, add_user, load
 from tests.pipeline.support import (

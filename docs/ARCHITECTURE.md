@@ -406,17 +406,19 @@ Savely/
     models/
       base.py               # Generator / Classifier / Transcriber / Embedder interfaces
       errors.py             # error types of model calls
-      openrouter.py         # shared HTTP transport: key, timeouts, retries, error mapping
-      wire.py               # JSON helpers shared by the clients
-      decision.py           # Gemini Decision 1 client
-      transcriber.py        # speech-to-text: default model + fallback
-      chat_completions.py   # Generator over chat completions, with the provider pin
-      routing.py            # which provider served a reply, from OpenRouter's routing metadata
-      deepseek.py           # text model: extraction + response agent, pinned to one provider
-      multimodal.py         # video model for escalations
-      embeddings.py
       factory.py            # builds every client from the settings
       fakes.py              # fake implementations of the interfaces, for tests
+      openrouter/
+        transport.py        # shared HTTP transport: key, timeouts, retries, error mapping
+        routing.py          # which provider served a reply, from OpenRouter's routing metadata
+        wire.py             # JSON helpers shared by the clients
+      clients/
+        decision.py         # Gemini Decision 1 client
+        transcriber.py      # speech-to-text: default model + fallback
+        chat_completions.py # Generator over chat completions, with the provider pin
+        deepseek.py         # text model: extraction + response agent, pinned to one provider
+        multimodal.py       # video model for escalations
+        embeddings.py
     types/                  # built-in types only — one module each; items with no built-in type need none
       base.py               # what a type declares: ContentType, filters, schema bases, vocabulary marks
       registry.py           # the list of types, looked up by name
@@ -429,25 +431,29 @@ Savely/
       open_library.py
     pipeline/
       indexer.py            # runs the steps of one item, keeps each result, resumes after a failure
-      runs.py               # the item's row, status and steps in ENRICHMENT_RUN
-      payloads.py           # reads the capture event of a job from ingestion's Redis state
-      prompts.py            # every model prompt, in one versioned PipelinePrompts
-      fetch.py              # download media before links expire
-      media.py              # ffprobe and ffmpeg
-      storage.py            # MediaStore: object storage, a local folder in development
-      classify.py           # decision model on the video: type, is-list
-      transcribe.py         # speech-to-text (when the file has an audio track), near-empty rule
-      extract.py            # text model with the type's schema; escalates to video model
-      open_values.py        # paths of open values; extraction → item columns
-      normalize.py          # vocabulary: exact hit, privacy gate, match-or-new
-      vocabulary.py         # database work for the vocabulary and its counts
-      renormalize.py        # reject an alias and re-normalize only its items
-      resolve.py            # type's resolver + decision-model candidate choice
-      embed.py
-      confirm.py            # the save confirmation DM
-      costs.py              # charges of model calls, per step and item
-      sweeper.py            # stuck-item sweeper: requeues or fails unfinished items, from Postgres
       worker.py             # the arq worker; parallel fan-out for bulk imports
+      prompts.py            # every model prompt, in one versioned PipelinePrompts
+      payloads.py           # reads the capture event of a job from ingestion's Redis state
+      costs.py              # charges of model calls, per step and item
+      steps/
+        fetch.py            # download media before links expire
+        classify.py         # decision model on the video: type, is-list
+        transcribe.py       # speech-to-text (when the file has an audio track), near-empty rule
+        extract.py          # text model with the type's schema; escalates to video model
+        resolve.py          # type's resolver + decision-model candidate choice
+        embed.py
+        confirm.py          # the save confirmation DM
+      media/
+        tools.py            # ffprobe and ffmpeg
+        storage.py          # MediaStore: object storage, a local folder in development
+      vocabulary/
+        store.py            # database work for the vocabulary and its counts
+        normalize.py        # vocabulary: exact hit, privacy gate, match-or-new
+        open_values.py      # paths of open values; extraction → item columns
+        renormalize.py      # reject an alias and re-normalize only its items
+      recovery/
+        runs.py             # the item's row, status and steps in ENRICHMENT_RUN
+        sweeper.py          # stuck-item sweeper: requeues or fails unfinished items, from Postgres
     agent/
       agent.py              # response-agent loop
       tools.py              # search_items, near, deep_look, set_status…
@@ -478,7 +484,7 @@ Savely/
     fixtures/webhooks/      # real (anonymized) webhook payloads
     fixtures/openrouter/    # model responses written from the provider's documentation
     live/                   # opt-in smoke tests that call the real models
-    pipeline/               # the indexing pipeline on fake models
+    pipeline/               # the indexing pipeline on fake models, in the subfolders of app/pipeline/
   docker/postgres/          # Postgres 16 image with PostGIS + pgvector
   docker-compose.yml
   alembic.ini               # Alembic configuration

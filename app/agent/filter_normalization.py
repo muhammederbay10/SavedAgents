@@ -40,7 +40,7 @@ from app.agent.search_query import Wording
 from app.config import RetrievalSettings
 from app.models.base import ChoiceAnswer, ChoiceQuestion, Classifier, Embedder
 from app.models.errors import ModelError
-from app.pipeline.vocabulary import canonical_form, find_exact, rejected_value_ids
+from app.pipeline.vocabulary.store import canonical_form, find_exact, rejected_value_ids
 
 logger = logging.getLogger(__name__)
 

@@ -10,19 +10,19 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.adapters.base import CaptureEvent
 from app.db.models import PlatformAccount, SavedItem, User
 from app.models.base import GenerationResult, Transcript
+from app.models.clients.transcriber import FallbackTranscriber
 from app.models.errors import ModelError
 from app.models.fakes import FakeEmbedder, FakeGenerator, FakeTranscriber
-from app.models.transcriber import FallbackTranscriber
-from app.pipeline.classify import PostClassifier
-from app.pipeline.confirm import SaveConfirmer
-from app.pipeline.embed import ItemEmbedder
-from app.pipeline.extract import Extractor
-from app.pipeline.fetch import MediaFetcher
 from app.pipeline.indexer import ItemIndexer, PipelineSteps
-from app.pipeline.normalize import Normalizer, VocabularyRules
-from app.pipeline.storage import LocalMediaStore
-from app.pipeline.sweeper import Requeuer, StuckItemSweeper, SweepReport
-from app.pipeline.transcribe import SpeechToText
+from app.pipeline.media.storage import LocalMediaStore
+from app.pipeline.recovery.sweeper import Requeuer, StuckItemSweeper, SweepReport
+from app.pipeline.steps.classify import PostClassifier
+from app.pipeline.steps.confirm import SaveConfirmer
+from app.pipeline.steps.embed import ItemEmbedder
+from app.pipeline.steps.extract import Extractor
+from app.pipeline.steps.fetch import MediaFetcher
+from app.pipeline.steps.transcribe import SpeechToText
+from app.pipeline.vocabulary.normalize import Normalizer, VocabularyRules
 from app.types.registry import CONTENT_TYPES
 from tests.database import TEST_EMBEDDING_DIMENSION
 from tests.pipeline.support import (

@@ -5,7 +5,7 @@ from collections.abc import AsyncIterator, Callable, Sequence
 import httpx
 import pytest
 
-from app.models.openrouter import OpenRouterTransport, RetryPolicy, build_http_client
+from app.models.openrouter.transport import OpenRouterTransport, RetryPolicy, build_http_client
 from tests.models.support import SYNTHETIC_API_KEY, FakeOpenRouter, SleepRecorder
 
 MAX_ATTEMPTS = 3
