@@ -454,7 +454,7 @@ Savely/
       retrieval.py          # hybrid SQL + vector search, fallback ladder, time budget
       search_query.py       # the search's arguments, checked against the content types
       search_conditions.py  # SQL/PostGIS/pgvector conditions and rankings
-      saved_values.py       # the values in one user's saves, and vocabulary lookups
+      saved_values.py       # the values in one user's saves, ranked by meaning among them
       filter_normalization.py  # filter values → the user's own values (decision model)
       prompts.py            # versioned wording for the decision model
       deep_look.py          # parallel subagents + write-back

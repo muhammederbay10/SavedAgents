@@ -578,7 +578,7 @@ app/
     retrieval.py      # hybrid search: normalize, filter, rank, fallback L1–L2, time budget
     search_query.py   # SearchQuery, checked against the content types
     search_conditions.py # SQL/PostGIS/pgvector conditions and rankings
-    saved_values.py   # a user's own values for a filter, and vocabulary lookups
+    saved_values.py   # a user's own values for a filter, ranked by meaning among them
     filter_normalization.py # "netflx" → Netflix: exact hit, then the decision model
     fallback.py       # fallback levels, reasons and their log line
     prompts.py        # versioned wording for the decision model

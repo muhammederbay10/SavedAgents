@@ -8,7 +8,7 @@
 
 Questions are answered from the index, never from the videos (ARCHITECTURE §3.5). SAV-16 builds that search: exact filters on what indexing stored, ranking by meaning, filter normalization ("netflx" → Netflix) and the first two fallback levels (§3.6). Record 0005 (SAV-26) sets the rules: no closed lists of values, any country and any language, filter values normalized against **the asking user's own saves** plus the gated vocabulary, and streaming providers per `(entity_id, country)`.
 
-The pipeline (SAV-14) and the resolvers (SAV-15) are not merged yet, so this ticket reads the tables of SAV-9 as SAV-14 fills them, and seeds entities and availability rows in its tests.
+This ticket was built before the pipeline (SAV-14) was merged, and the resolvers (SAV-15) aren't built yet. It reads the tables of SAV-9 as SAV-14 fills them, and seeds entities and availability rows in its tests.
 
 ## Decision
 
@@ -37,12 +37,12 @@ The pipeline (SAV-14) and the resolvers (SAV-15) are not merged yet, so this tic
 - **Normalizing against the whole vocabulary** instead of the user's own values: a value nobody in this user's saves has can never match, and a typo could be mapped to another user's wording. The vocabulary is still used for exact hits and for ranking by meaning.
 - **A trigram index (`pg_trgm`) for spelling similarity:** a new database extension and migration. The user's own values for one filter are few, so ranking them in Python (`difflib`) is fast enough.
 - **A cosine-distance cut-off for "few results":** would need a threshold tuned on the evaluation set (SAV-19/20), which doesn't exist yet. Without one, vector ranking orders the filtered items, and L2 is triggered by the filters.
-- **Copying SAV-14's vocabulary matcher:** SAV-14 isn't merged and its matcher writes (candidate aliases, new values). Search only needs read-only lookups, kept in `app/agent/saved_values.py`.
+- **Copying SAV-14's vocabulary matcher:** two copies of the same comparison rules would drift apart. Search calls SAV-14's read-only helpers instead and never the ones that write (candidate aliases, new values).
 
 ## Consequences
 
 - **SAV-15 (resolvers)** links the entity resolved from the mention at index `i` of `fields.entities` with `item_entity.position = i`, and stores resolver values under the filter's name in `entity.data` (`genre` as a list, `year` as a number, `price`), and, as its storage contract for `entity_availability.providers`, one object per `(entity_id, country)` of the form `{"<offer kind>": ["<provider name>", …]}`, with TMDB's offer kinds as keys (`flatrate`, `free`, `ads`, `rent`, `buy`) and every kind kept. Only `flatrate`, `free` and `ads` satisfy a platform filter. It fetches or refreshes the rows named by `availability_gaps`; this ticket adds no fetching.
-- **SAV-14** and this ticket compare wordings the same way (trimmed, white space collapsed, lower-cased). Once SAV-14 is merged, `saved_values.comparison_form`, `vocabulary_exact_hit` and `rejected_values` can call its `canonical_form`, `find_exact` and `rejected_value_ids` instead; whichever branch merges second makes that change and rebases (approved by the owner).
+- **SAV-14** (merged in #19) and search share one way of comparing wordings. Search uses the pipeline's read-only helpers in `app/pipeline/vocabulary.py`: `canonical_form` (trimmed, white space collapsed, lower-cased), `find_exact` (a canonical value or a verified alias) and `rejected_value_ids`, whose ids `saved_values.vocabulary_values` turns into canonical values for the rejected-alias exclusion. Ranking by meaning stays in `saved_values.nearest_vocabulary_values`, because it must only return values in the asking user's saves, while the pipeline's `nearest_values` searches the whole field. Search never calls the helpers that write. This follows the plan the owner approved (comment `01a1efd3-a638-7119-b6ed-616d0f2c9576`), done on SAV-16 as the branch that merged second.
 - **SAV-17 (agent)** builds `SearchQuery` from the tool arguments, handles `CountryRequiredError` by asking once, tells the user when results were relaxed or `incomplete`, and passes availability gaps to SAV-15.
 - Python lower-cases the Turkish `İ` to `i̇`, so "BEŞİKTAŞ" is not an exact hit for "Beşiktaş"; it goes to the decision model, which picks it. Accepted by the owner.
 - Ranking by vector over the filtered items is exact (no approximate index) at Phase 1 sizes. The test seeds 600 items and checks a typical filtered vector search stays under 200 ms locally, model calls excluded.

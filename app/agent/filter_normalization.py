@@ -3,7 +3,7 @@
 "beşilktaş" → Beşiktaş, "netflx" → Netflix, "bruklin" → Brooklyn
 (ARCHITECTURE §3.4 and §3.5, decision record 0005). For each wording:
 
-1. **Exact hit, no model call.** The wording, in comparison form, equals a
+1. **Exact hit, no model call.** The wording, in canonical form, equals a
    value in the user's own saves, or a canonical value or *verified* alias of
    the wording's vocabulary field. Candidate and rejected aliases never count.
 2. **Options.** Otherwise the user's own values are ranked: by meaning, through
@@ -32,16 +32,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agent.prompts import RetrievalPrompts
 from app.agent.saved_values import (
     ValueScope,
-    comparison_form,
     nearest_vocabulary_values,
-    rejected_values,
     saved_values,
-    vocabulary_exact_hit,
+    vocabulary_values,
 )
 from app.agent.search_query import Wording
 from app.config import RetrievalSettings
 from app.models.base import ChoiceAnswer, ChoiceQuestion, Classifier, Embedder
 from app.models.errors import ModelError
+from app.pipeline.vocabulary import canonical_form, find_exact, rejected_value_ids
 
 logger = logging.getLogger(__name__)
 
@@ -148,16 +147,16 @@ class FilterNormalizer:
     async def _exact_hit(
         self, session: AsyncSession, wording: Wording, values: Sequence[str]
     ) -> NormalizedWording | None:
-        form = comparison_form(wording.wording)
+        form = canonical_form(wording.wording)
         for value in values:
-            if comparison_form(value) == form:
+            if canonical_form(value) == form:
                 return _result(wording, value, NormalizationMethod.SAVED_VALUE)
         if wording.vocabulary is None:
             return None
-        canonical = await vocabulary_exact_hit(session, wording.vocabulary, form)
-        if canonical is None:
+        hit = await find_exact(session, wording.vocabulary, form)
+        if hit is None:
             return None
-        return _result(wording, canonical, NormalizationMethod.VOCABULARY)
+        return _result(wording, hit.value, NormalizationMethod.VOCABULARY)
 
     async def _with_options(
         self, session: AsyncSession, candidates: Sequence[tuple[Wording, list[str]]]
@@ -201,16 +200,17 @@ class FilterNormalizer:
         if not values:
             return []
         limit = self._settings.filter_normalization_max_options
-        form = comparison_form(wording.wording)
+        form = canonical_form(wording.wording)
         excluded_forms: set[str] = set()
         if wording.vocabulary is not None:
-            rejected = await rejected_values(session, wording.vocabulary, form)
-            excluded_forms = {comparison_form(value) for value in rejected}
+            rejected_ids = await rejected_value_ids(session, wording.vocabulary, form)
+            rejected = await vocabulary_values(session, rejected_ids)
+            excluded_forms = {canonical_form(value) for value in rejected}
         # Saved values are compared in the same form as the vocabulary's, so "Restaurant"
         # or " restaurant " is left out when the wording was rejected for "restaurant".
         allowed: dict[str, list[str]] = {}
         for value in values:
-            value_form = comparison_form(value)
+            value_form = canonical_form(value)
             if value_form not in excluded_forms:
                 allowed.setdefault(value_form, []).append(value)
         by_meaning: list[str] = []
@@ -318,7 +318,7 @@ def _filter_name(wording: Wording) -> str:
 
 
 def _spelling_similarity(form: str, value: str) -> float:
-    return SequenceMatcher(None, form, comparison_form(value)).ratio()
+    return SequenceMatcher(None, form, canonical_form(value)).ratio()
 
 
 def _interleave(first: Sequence[str], second: Sequence[str], limit: int) -> list[str]:

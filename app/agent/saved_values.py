@@ -14,12 +14,12 @@ from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from typing import Final
 
-from sqlalchemy import Float, TextClause, bindparam, literal, select, text, union_all
+from sqlalchemy import Float, TextClause, bindparam, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.search_conditions import WATCHABLE_OFFER_KINDS
 from app.agent.search_query import CATEGORY_SLOT, COLLECTION_SLOT, Wording
-from app.db.models import AliasStatus, Vocabulary, VocabularyAlias
+from app.db.models import Vocabulary
 from app.db.types import Vector
 from app.types.base import FilterKind, FilterSource
 
@@ -110,21 +110,6 @@ class ValueScope:
     country: str | None
 
 
-def comparison_form(wording: str) -> str:
-    """Return wording in the form exact hits are compared in.
-
-    It is the form the vocabulary stores values and aliases in (record 0005):
-    trimmed, each run of white space one space, lower case.
-
-    Args:
-        wording: Any wording, in any language.
-
-    Returns:
-        The wording in comparison form.
-    """
-    return " ".join(wording.split()).lower()
-
-
 async def saved_values(session: AsyncSession, scope: ValueScope, wording: Wording) -> list[str]:
     """List the values in the user's own saves that a wording could stand for.
 
@@ -162,57 +147,19 @@ def _values_statement(scope: ValueScope, wording: Wording) -> tuple[TextClause, 
     return _USER_FIELD_VALUES, {**parameters, "key": search_filter.name}
 
 
-async def vocabulary_exact_hit(session: AsyncSession, field: str, form: str) -> str | None:
-    """Find the canonical value that wording equals, directly or through a verified alias.
-
-    Candidate and rejected aliases never count.
+async def vocabulary_values(session: AsyncSession, ids: Collection[uuid.UUID]) -> set[str]:
+    """Read the canonical values with the given ids.
 
     Args:
         session: The session to read in.
-        field: The vocabulary field, e.g. `cuisine`.
-        form: The wording in comparison form.
+        ids: Vocabulary ids, e.g. the values wording was rejected as an alias of.
 
     Returns:
-        The canonical value, or `None` if the wording is neither a value nor a
-        verified alias of one.
+        The canonical values.
     """
-    direct = select(Vocabulary.value, literal(0).label("rank")).where(
-        Vocabulary.field == field, Vocabulary.value == form
-    )
-    through_alias = (
-        select(Vocabulary.value, literal(1).label("rank"))
-        .join(VocabularyAlias, VocabularyAlias.vocabulary_id == Vocabulary.id)
-        .where(
-            Vocabulary.field == field,
-            VocabularyAlias.alias == form,
-            VocabularyAlias.status == AliasStatus.VERIFIED,
-        )
-    )
-    hits = union_all(direct, through_alias).subquery()
-    statement = select(hits.c.value).order_by(hits.c.rank, hits.c.value).limit(1)
-    return (await session.execute(statement)).scalar_one_or_none()
-
-
-async def rejected_values(session: AsyncSession, field: str, form: str) -> set[str]:
-    """List the values that wording was rejected as an alias of.
-
-    Args:
-        session: The session to read in.
-        field: The vocabulary field.
-        form: The wording in comparison form.
-
-    Returns:
-        The canonical values the wording must never be matched to.
-    """
-    rows = await session.execute(
-        select(Vocabulary.value)
-        .join(VocabularyAlias, VocabularyAlias.vocabulary_id == Vocabulary.id)
-        .where(
-            Vocabulary.field == field,
-            VocabularyAlias.alias == form,
-            VocabularyAlias.status == AliasStatus.REJECTED,
-        )
-    )
+    if not ids:
+        return set()
+    rows = await session.execute(select(Vocabulary.value).where(Vocabulary.id.in_(list(ids))))
     return set(rows.scalars())
 
 
@@ -227,6 +174,9 @@ async def nearest_vocabulary_values(
     """List the vocabulary values nearest in meaning to some wording, among the given ones.
 
     A near value is only a candidate for the decision model, never a match.
+    Unlike the pipeline's `nearest_values`, which searches the whole field,
+    only the values in `among` (those in the asking user's saves) can come
+    back, so search never offers a value the user doesn't have.
 
     Args:
         session: The session to read in.
