@@ -7,6 +7,7 @@ from app.types.base import (
     EntityExtraction,
     EntityMention,
     FilterKind,
+    FilterSource,
     NonEmptyText,
     SearchFilter,
 )
@@ -65,11 +66,13 @@ MOVIE = ContentType(
             name="streaming",
             kind=FilterKind.VALUE,
             description="A streaming platform that has the title in the user's country.",
+            source=FilterSource.COUNTRY_AVAILABILITY,
         ),
         SearchFilter(
             name="watched",
             kind=FilterKind.BOOLEAN,
             description="True for titles the user has watched, false for the ones still to watch.",
+            source=FilterSource.USER_STATUS,
         ),
     ),
 )

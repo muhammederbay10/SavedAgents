@@ -136,6 +136,38 @@ class FilterKind(StrEnum):
     TEXT = "text"
 
 
+class FilterSource(StrEnum):
+    """Where search finds what a filter is checked against.
+
+    Attributes:
+        SAVED_VALUES: What indexing stored. A `VALUE`, `INTEGER`, `BOOLEAN` or
+            `TEXT` filter reads the key named after the filter: in the item's
+            `fields` when the extraction schema has it as a top-level field,
+            otherwise in a linked entity's `data` or that entity's own mention.
+            An `AREA` filter reads the entities' address levels, a `LOCATION`
+            filter their coordinates.
+        COUNTRY_AVAILABILITY: Where an entity can be streamed in the asking
+            user's country (`entity_availability`). Only for `VALUE` filters.
+        USER_STATUS: Whether the asking user marked the item's entity as done
+            (visited, watched, read). Only for `BOOLEAN` filters.
+        OPENING_HOURS: The entity's opening hours, checked against the current
+            time. Only for `BOOLEAN` filters.
+    """
+
+    SAVED_VALUES = "saved_values"
+    COUNTRY_AVAILABILITY = "country_availability"
+    USER_STATUS = "user_status"
+    OPENING_HOURS = "opening_hours"
+
+
+# The filter kinds each source other than `SAVED_VALUES` can serve.
+_KINDS_OF_SOURCE: dict[FilterSource, frozenset[FilterKind]] = {
+    FilterSource.COUNTRY_AVAILABILITY: frozenset({FilterKind.VALUE}),
+    FilterSource.USER_STATUS: frozenset({FilterKind.BOOLEAN}),
+    FilterSource.OPENING_HOURS: frozenset({FilterKind.BOOLEAN}),
+}
+
+
 @dataclass(frozen=True)
 class SearchFilter:
     """An extra filter that a content type offers to search.
@@ -150,22 +182,30 @@ class SearchFilter:
             e.g. `cuisine`. Its aliases let a question in one language find a
             value saved in another. `None` when the values come from somewhere
             else, such as a resolver, and for every other kind.
+        source: Where search finds what the filter is checked against.
 
     Raises:
         ContentTypeDefinitionError: If a filter that is not a `VALUE` names a
-            vocabulary field.
+            vocabulary field, or its source cannot serve its kind.
     """
 
     name: str
     kind: FilterKind
     description: str
     vocabulary: str | None = None
+    source: FilterSource = FilterSource.SAVED_VALUES
 
     def __post_init__(self) -> None:
-        """Check that only an open-value filter points at the vocabulary."""
+        """Check that only an open-value filter points at the vocabulary, and the source fits."""
         if self.vocabulary is not None and self.kind is not FilterKind.VALUE:
             raise ContentTypeDefinitionError(
                 f"Filter '{self.name}' is not an open value, so it cannot use the vocabulary"
+            )
+        allowed_kinds = _KINDS_OF_SOURCE.get(self.source)
+        if allowed_kinds is not None and self.kind not in allowed_kinds:
+            raise ContentTypeDefinitionError(
+                f"Filter '{self.name}' is a {self.kind} filter, which the source "
+                f"'{self.source}' cannot serve"
             )
 
 

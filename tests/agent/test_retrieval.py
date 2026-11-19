@@ -1,0 +1,946 @@
+"""Hybrid retrieval on a seeded database: filters, ranking, normalization, fallback L1 and L2.
+
+These tests need Postgres with PostGIS and pgvector. See `tests/database.py`.
+No model is called: the decision model and the embedder are fakes.
+"""
+
+import logging
+from datetime import timedelta
+
+import pytest
+from sqlalchemy import update
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.agent.fallback import FallbackLevel, FallbackReason
+from app.agent.filter_normalization import NormalizationMethod
+from app.agent.retrieval import AvailabilityGapReason, SearchResult
+from app.agent.search_query import CountryRequiredError, Near, SearchQuery
+from app.db.models import Entity, EntityAvailability, ItemEntity, ItemStatus, SavedItem
+from app.db.types import GeoPoint
+from app.models.errors import ModelUnavailableError
+from tests.agent.retrieval_support import (
+    BEBEK,
+    COFFEE_AXIS,
+    KOREAN_AXIS,
+    NOW,
+    STUDY_AXIS,
+    MappedEmbedder,
+    PickingClassifier,
+    Saves,
+    build_retriever,
+    place_fields,
+    retrieval_settings,
+    seed_saves,
+)
+from tests.db_factories import unit_vector
+
+# A point about 1 km from the seeded café in Bebek, and far from every other place.
+NEAR_BEBEK = GeoPoint(latitude=41.0700, longitude=29.0350)
+TWO_KILOMETRES = 2_000.0
+TWENTY_KILOMETRES = 20_000.0
+
+
+@pytest.fixture
+async def saves(db_session: AsyncSession) -> Saves:
+    return await seed_saves(db_session)
+
+
+def ids(result: SearchResult) -> list[object]:
+    return [hit.item_id for hit in result.hits]
+
+
+def normalized_value(result: SearchResult, slot: str) -> tuple[str, NormalizationMethod]:
+    found = next(item for item in result.normalized if item.slot == slot)
+    return found.value, found.method
+
+
+async def test_district_filter_finds_only_places_in_that_district(
+    db_session: AsyncSession, saves: Saves
+) -> None:
+    query = SearchQuery(user_id=saves.user.id, type="place", filters={"area": "Beşiktaş"})
+
+    result = await build_retriever().search(db_session, query)
+
+    assert ids(result) == saves.ids("kronotrop")
+    assert result.level is FallbackLevel.NORMAL
+    assert result.fallbacks == ()
+
+
+@pytest.mark.parametrize(
+    ("area", "expected"),
+    [
+        ("Bebek", ["kronotrop"]),
+        ("Brooklyn", ["diner"]),
+        ("New York", ["diner"]),
+        ("Japan", ["izakaya"]),
+        ("İstanbul", ["kimchi", "kronotrop"]),
+    ],
+)
+async def test_area_filter_matches_any_address_level_in_any_country(
+    db_session: AsyncSession, saves: Saves, area: str, expected: list[str]
+) -> None:
+    query = SearchQuery(user_id=saves.user.id, type="place", filters={"area": area})
+
+    result = await build_retriever().search(db_session, query)
+
+    assert ids(result) == saves.ids(*expected)
+
+
+async def test_near_me_keeps_places_within_the_radius_nearest_first(
+    db_session: AsyncSession, saves: Saves
+) -> None:
+    close = SearchQuery(
+        user_id=saves.user.id,
+        type="place",
+        filters={"near": Near(point=NEAR_BEBEK, radius_m=TWO_KILOMETRES)},
+    )
+    wider = SearchQuery(
+        user_id=saves.user.id,
+        type="place",
+        filters={"near": Near(point=NEAR_BEBEK, radius_m=TWENTY_KILOMETRES)},
+    )
+    retriever = build_retriever()
+
+    close_result = await retriever.search(db_session, close)
+    wider_result = await retriever.search(db_session, wider)
+
+    assert ids(close_result) == saves.ids("kronotrop")
+    assert ids(wider_result) == saves.ids("kronotrop", "kimchi")
+
+
+async def test_genre_and_platform_filter_uses_the_asking_users_country(
+    db_session: AsyncSession, saves: Saves
+) -> None:
+    def horror_on_netflix(country: str) -> SearchQuery:
+        return SearchQuery(
+            user_id=saves.user.id,
+            country=country,
+            type="movie",
+            filters={"genre": "horror", "streaming": "Netflix"},
+        )
+
+    retriever = build_retriever()
+    in_us = await retriever.search(db_session, horror_on_netflix("US"))
+    in_japan = await retriever.search(db_session, horror_on_netflix("jp"))
+
+    assert ids(in_us) == saves.ids("hereditary")
+    assert ids(in_japan) == saves.ids("conjuring")
+
+
+async def test_a_streaming_filter_needs_the_users_country(
+    db_session: AsyncSession, saves: Saves
+) -> None:
+    query = SearchQuery(user_id=saves.user.id, type="movie", filters={"streaming": "Netflix"})
+
+    with pytest.raises(CountryRequiredError):
+        await build_retriever().search(db_session, query)
+
+
+async def test_another_countrys_row_never_stands_in_for_a_missing_one(
+    db_session: AsyncSession, saves: Saves
+) -> None:
+    # Inception is on Netflix in Japan only. A US user's search must not find it,
+    # and must report that the US row is missing.
+    query = SearchQuery(
+        user_id=saves.user.id,
+        country="US",
+        type="movie",
+        filters={"streaming": "Netflix"},
+        collection="Movies",
+    )
+
+    result = await build_retriever().search(db_session, query)
+
+    assert ids(result) == saves.ids("hereditary")
+    gaps = {(gap.entity_id, gap.country, gap.reason) for gap in result.availability_gaps}
+    assert gaps == {
+        (saves.entities["inception"].id, "US", AvailabilityGapReason.MISSING),
+        (saves.entities["conjuring"].id, "US", AvailabilityGapReason.STALE),
+    }
+
+
+async def test_refreshing_one_country_leaves_the_other_countrys_results_alone(
+    db_session: AsyncSession, saves: Saves
+) -> None:
+    japan_query = SearchQuery(
+        user_id=saves.user.id, country="JP", type="movie", filters={"streaming": "Netflix"}
+    )
+    retriever = build_retriever()
+    before = await retriever.search(db_session, japan_query)
+
+    await db_session.execute(
+        update(EntityAvailability)
+        .where(
+            EntityAvailability.entity_id == saves.entities["conjuring"].id,
+            EntityAvailability.country == "US",
+        )
+        .values(providers={"flatrate": ["Netflix"]}, refreshed_at=NOW)
+    )
+    after = await retriever.search(db_session, japan_query)
+    us_after = await retriever.search(
+        db_session,
+        SearchQuery(
+            user_id=saves.user.id, country="US", type="movie", filters={"streaming": "Netflix"}
+        ),
+    )
+
+    assert ids(after) == ids(before) == saves.ids("conjuring", "inception")
+    assert after.availability_gaps == before.availability_gaps
+    assert sorted(map(str, ids(us_after))) == sorted(map(str, saves.ids("hereditary", "conjuring")))
+    assert saves.entities["conjuring"].id not in {
+        gap.entity_id for gap in us_after.availability_gaps
+    }
+
+
+async def test_fuzzy_text_query_ranks_by_meaning(db_session: AsyncSession, saves: Saves) -> None:
+    embedder = MappedEmbedder(axes={"somewhere cozy for coffee": COFFEE_AXIS})
+    query = SearchQuery(user_id=saves.user.id, text="somewhere cozy for coffee")
+
+    result = await build_retriever(embedder=embedder).search(db_session, query)
+
+    assert ids(result)[0] == saves.items["kronotrop"].id
+    assert result.level is FallbackLevel.NORMAL
+    assert saves.items["pending"].id not in ids(result)
+    assert saves.items["other_place"].id not in ids(result)
+
+
+async def test_typos_in_filters_are_normalized_to_the_users_own_values(
+    db_session: AsyncSession, saves: Saves
+) -> None:
+    classifier = PickingClassifier(
+        picks={("area", "beşilktaş"): "Beşiktaş", ("streaming", "netflx"): "Netflix"}
+    )
+    retriever = build_retriever(classifier=classifier)
+
+    places = await retriever.search(
+        db_session,
+        SearchQuery(user_id=saves.user.id, type="place", filters={"area": "beşilktaş"}),
+    )
+    movies = await retriever.search(
+        db_session,
+        SearchQuery(
+            user_id=saves.user.id, country="US", type="movie", filters={"streaming": "netflx"}
+        ),
+    )
+
+    assert ids(places) == saves.ids("kronotrop")
+    assert normalized_value(places, "filters.area") == ("Beşiktaş", NormalizationMethod.DECISION)
+    assert ids(movies) == saves.ids("hereditary")
+    assert normalized_value(movies, "filters.streaming") == (
+        "Netflix",
+        NormalizationMethod.DECISION,
+    )
+
+
+async def test_a_value_the_user_saved_is_an_exact_hit_without_a_decision(
+    db_session: AsyncSession, saves: Saves
+) -> None:
+    classifier = PickingClassifier()
+    query = SearchQuery(user_id=saves.user.id, type="place", filters={"area": "  beşiktaş "})
+
+    result = await build_retriever(classifier=classifier).search(db_session, query)
+
+    assert ids(result) == saves.ids("kronotrop")
+    assert normalized_value(result, "filters.area") == (
+        "Beşiktaş",
+        NormalizationMethod.SAVED_VALUE,
+    )
+    assert classifier.calls == []
+
+
+async def test_category_and_tags_filter_every_item(db_session: AsyncSession, saves: Saves) -> None:
+    retriever = build_retriever()
+
+    cars = await retriever.search(
+        db_session, SearchQuery(user_id=saves.user.id, category="car review")
+    )
+    coffee = await retriever.search(
+        db_session, SearchQuery(user_id=saves.user.id, tags=("coffee",))
+    )
+    both = await retriever.search(
+        db_session, SearchQuery(user_id=saves.user.id, category="car review", tags=("bmw",))
+    )
+
+    assert ids(cars) == saves.ids("car")
+    assert ids(coffee) == saves.ids("kronotrop")
+    assert ids(both) == saves.ids("car")
+
+
+async def test_a_verified_alias_is_an_exact_hit_and_a_candidate_alias_is_not(
+    db_session: AsyncSession, saves: Saves
+) -> None:
+    classifier = PickingClassifier(picks={("category", "restoran"): "restaurant"})
+    retriever = build_retriever(classifier=classifier)
+
+    verified = await retriever.search(
+        db_session, SearchQuery(user_id=saves.user.id, category="Lokanta")
+    )
+    candidate = await retriever.search(
+        db_session, SearchQuery(user_id=saves.user.id, category="restoran")
+    )
+
+    assert normalized_value(verified, "category") == ("restaurant", NormalizationMethod.VOCABULARY)
+    assert normalized_value(candidate, "category") == ("restaurant", NormalizationMethod.DECISION)
+    assert [wording for wording, _ in classifier.calls] == ["restoran"]
+    assert ids(verified) == ids(candidate) == saves.ids("diner", "kimchi")
+
+
+async def test_a_rejected_alias_is_never_offered_as_a_match(
+    db_session: AsyncSession, saves: Saves
+) -> None:
+    classifier = PickingClassifier(picks={("category", "eatery"): "restaurant"})
+
+    result = await build_retriever(classifier=classifier).search(
+        db_session, SearchQuery(user_id=saves.user.id, category="eatery")
+    )
+
+    assert "restaurant" not in classifier.offered_values
+    assert normalized_value(result, "category") == ("eatery", NormalizationMethod.UNCHANGED)
+
+
+async def test_normalization_offers_only_the_asking_users_own_values(
+    db_session: AsyncSession, saves: Saves
+) -> None:
+    classifier = PickingClassifier()
+    query = SearchQuery(
+        user_id=saves.user.id,
+        category="grandma recipe",
+        type="place",
+        filters={"cuisine": "grandma cooking"},
+    )
+
+    await build_retriever(classifier=classifier).search(db_session, query)
+
+    offered = classifier.offered_values
+    assert offered
+    assert "grandma ayşe's recipe" not in offered
+    assert "grandma ayşe's cooking" not in offered
+    assert offered <= {
+        "café",
+        "restaurant",
+        "bar",
+        "horror movie",
+        "sci-fi movie",
+        "maths tutorial",
+        "car review",
+        "specialty coffee",
+        "korean barbecue",
+        "american breakfast",
+    }
+
+
+async def test_a_watched_filter_reads_the_asking_users_status(
+    db_session: AsyncSession, saves: Saves
+) -> None:
+    retriever = build_retriever()
+
+    watched = await retriever.search(
+        db_session, SearchQuery(user_id=saves.user.id, type="movie", filters={"watched": True})
+    )
+    to_watch = await retriever.search(
+        db_session, SearchQuery(user_id=saves.user.id, type="movie", filters={"watched": False})
+    )
+
+    assert ids(watched) == saves.ids("inception")
+    assert ids(to_watch) == saves.ids("hereditary", "conjuring")
+
+
+async def test_study_filters_read_the_items_fields(db_session: AsyncSession, saves: Saves) -> None:
+    query = SearchQuery(
+        user_id=saves.user.id,
+        type="study",
+        filters={"subject": "maths", "topic": "Integrals", "format": "tutorial"},
+    )
+
+    result = await build_retriever().search(db_session, query)
+
+    assert ids(result) == saves.ids("integrals")
+
+
+async def test_failed_embedding_falls_back_to_keyword_search_and_logs_l1(
+    db_session: AsyncSession, saves: Saves, caplog: pytest.LogCaptureFixture
+) -> None:
+    error = ModelUnavailableError("embed timed out", operation="embed", model="fake/embedding")
+    query = SearchQuery(user_id=saves.user.id, text="integrals")
+
+    with caplog.at_level(logging.WARNING, logger="app.agent.fallback"):
+        result = await build_retriever(embedder=MappedEmbedder(error=error)).search(
+            db_session, query
+        )
+
+    assert ids(result) == saves.ids("integrals")
+    assert result.level is FallbackLevel.DEGRADED
+    assert [(step.level, step.reason) for step in result.fallbacks] == [
+        (FallbackLevel.DEGRADED, FallbackReason.EMBEDDING_FAILED)
+    ]
+    logged = [record for record in caplog.records if record.getMessage() == "search_fallback"]
+    assert [(record.level, record.reason) for record in logged] == [  # type: ignore[attr-defined]
+        ("L1", "embedding_failed")
+    ]
+    assert "integrals" not in caplog.text
+
+
+async def test_failed_vector_search_falls_back_to_keyword_search(
+    db_session: AsyncSession, saves: Saves
+) -> None:
+    # A query vector of the wrong size makes the database reject the vector search.
+    embedder = MappedEmbedder(axes={"integrals": STUDY_AXIS}, dimension=3)
+    query = SearchQuery(user_id=saves.user.id, text="integrals")
+
+    result = await build_retriever(embedder=embedder).search(db_session, query)
+
+    assert ids(result) == saves.ids("integrals")
+    assert [(step.level, step.reason) for step in result.fallbacks] == [
+        (FallbackLevel.DEGRADED, FallbackReason.VECTOR_SEARCH_FAILED)
+    ]
+
+
+async def test_empty_result_relaxes_filters_and_widens_the_district_to_its_city(
+    db_session: AsyncSession, saves: Saves
+) -> None:
+    query = SearchQuery(
+        user_id=saves.user.id,
+        type="place",
+        filters={"area": "Bebek", "cuisine": "korean barbecue"},
+    )
+
+    result = await build_retriever().search(db_session, query)
+
+    assert result.level is FallbackLevel.RELAXED
+    assert [(step.level, step.reason) for step in result.fallbacks] == [
+        (FallbackLevel.RELAXED, FallbackReason.FEW_RESULTS)
+    ]
+    assert set(result.relaxed) == {"filters.area", "filters.cuisine"}
+    assert ids(result) == saves.ids("kimchi", "kronotrop")
+    assert all(hit.level is FallbackLevel.RELAXED for hit in result.hits)
+
+
+async def test_l2_finds_items_that_are_not_fully_indexed_by_their_caption(
+    db_session: AsyncSession, saves: Saves
+) -> None:
+    query = SearchQuery(
+        user_id=saves.user.id,
+        collection="Food",
+        type="place",
+        filters={"area": "Beşiktaş", "cuisine": "lahmacun"},
+    )
+
+    result = await build_retriever().search(db_session, query)
+
+    # Beşiktaş is widened to its city, so the café in Beyoğlu is found too.
+    assert ids(result) == saves.ids("kimchi", "kronotrop", "pending")
+    pending = result.hits[-1]
+    assert pending.fully_indexed is False
+    assert pending.level is FallbackLevel.RELAXED
+
+
+async def test_few_results_add_relaxed_ones_after_the_exact_ones(
+    db_session: AsyncSession, saves: Saves
+) -> None:
+    query = SearchQuery(user_id=saves.user.id, type="place", filters={"area": "Bebek"})
+    settings = retrieval_settings(search_min_results=3)
+
+    result = await build_retriever(settings=settings).search(db_session, query)
+
+    assert result.hits[0].item_id == saves.items["kronotrop"].id
+    assert result.hits[0].level is FallbackLevel.NORMAL
+    assert [hit.level for hit in result.hits[1:]] == [FallbackLevel.RELAXED]
+
+
+async def test_running_out_of_time_returns_an_incomplete_answer(
+    db_session: AsyncSession, saves: Saves
+) -> None:
+    settings = retrieval_settings(search_time_budget_seconds=0.05)
+    embedder = MappedEmbedder(delay_seconds=1.0)
+    query = SearchQuery(user_id=saves.user.id, text="anything")
+
+    result = await build_retriever(embedder=embedder, settings=settings).search(db_session, query)
+
+    assert result.incomplete is True
+    assert result.fallbacks[-1].reason is FallbackReason.TIME_BUDGET_EXCEEDED
+
+
+async def test_failed_decision_keeps_the_users_wording(
+    db_session: AsyncSession, saves: Saves
+) -> None:
+    error = ModelUnavailableError("decide failed", operation="decide", model="fake")
+    classifier = PickingClassifier(picks={("area", "beşilktaş"): "Beşiktaş"}, error=error)
+    query = SearchQuery(user_id=saves.user.id, type="place", filters={"area": "beşilktaş"})
+
+    result = await build_retriever(classifier=classifier).search(db_session, query)
+
+    assert normalized_value(result, "filters.area") == ("beşilktaş", NormalizationMethod.UNCHANGED)
+    assert result.level is FallbackLevel.RELAXED
+
+
+async def test_a_low_probability_pick_is_not_used(db_session: AsyncSession, saves: Saves) -> None:
+    classifier = PickingClassifier(picks={("area", "beşilktaş"): "Beşiktaş"}, probability=0.4)
+    query = SearchQuery(user_id=saves.user.id, type="place", filters={"area": "beşilktaş"})
+
+    result = await build_retriever(classifier=classifier).search(db_session, query)
+
+    assert normalized_value(result, "filters.area") == ("beşilktaş", NormalizationMethod.UNCHANGED)
+
+
+async def test_saved_after_and_limit_narrow_the_answer(
+    db_session: AsyncSession, saves: Saves
+) -> None:
+    query = SearchQuery(
+        user_id=saves.user.id, saved_after=NOW - timedelta(days=2, hours=1), limit=1
+    )
+
+    result = await build_retriever().search(db_session, query)
+
+    assert ids(result) == saves.ids("car")
+
+
+async def test_collection_matches_in_any_case_and_near_ranks_nearest_first(
+    db_session: AsyncSession, saves: Saves
+) -> None:
+    query = SearchQuery(
+        user_id=saves.user.id,
+        type="place",
+        filters={"near": Near(point=BEBEK, radius_m=TWENTY_KILOMETRES)},
+        collection="food",
+    )
+
+    result = await build_retriever().search(db_session, query)
+
+    assert ids(result) == saves.ids("kronotrop", "kimchi")
+
+
+async def add_list_post(
+    session: AsyncSession, saves: Saves, name: str, entities: tuple[str, ...]
+) -> SavedItem:
+    """A post that lists several titles or places, each linked to the same item."""
+    item = SavedItem(
+        user_id=saves.user.id,
+        platform="instagram",
+        platform_post_id=f"synthetic-list-{name}",
+        type=saves.entities[entities[0]].type,
+        category="list",
+        status=ItemStatus.DONE,
+        saved_at=NOW,
+    )
+    session.add(item)
+    await session.flush()
+    session.add_all(
+        ItemEntity(saved_item_id=item.id, entity_id=saves.entities[entity].id, position=position)
+        for position, entity in enumerate(entities)
+    )
+    await session.flush()
+    return item
+
+
+async def test_two_titles_of_a_list_post_cannot_split_the_entity_filters(
+    db_session: AsyncSession, saves: Saves
+) -> None:
+    # Hereditary is horror but on U-NEXT in Japan; Inception is on Netflix in Japan but sci-fi.
+    split = await add_list_post(db_session, saves, "split", ("hereditary", "inception"))
+    query = SearchQuery(
+        user_id=saves.user.id,
+        country="JP",
+        type="movie",
+        filters={"genre": "horror", "streaming": "Netflix"},
+    )
+
+    result = await build_retriever().search(db_session, query)
+
+    assert result.level is FallbackLevel.NORMAL
+    assert split.id not in ids(result)
+    assert ids(result) == saves.ids("conjuring")
+
+
+async def test_one_title_of_a_list_post_meeting_every_entity_filter_finds_the_post(
+    db_session: AsyncSession, saves: Saves
+) -> None:
+    # The Conjuring is horror and on Netflix in Japan, and the user has not watched it.
+    joined = await add_list_post(db_session, saves, "joined", ("inception", "conjuring"))
+    query = SearchQuery(
+        user_id=saves.user.id,
+        country="JP",
+        type="movie",
+        filters={"genre": "horror", "streaming": "Netflix", "watched": False},
+    )
+    watched_and_horror = SearchQuery(
+        user_id=saves.user.id, type="movie", filters={"genre": "horror", "watched": True}
+    )
+    retriever = build_retriever()
+
+    result = await retriever.search(db_session, query)
+    none_watched = await retriever.search(db_session, watched_and_horror)
+
+    assert result.level is FallbackLevel.NORMAL
+    assert ids(result) == [joined.id, saves.items["conjuring"].id]
+    assert joined.id not in [hit.item_id for hit in none_watched.hits if hit.level == "L0"]
+
+
+async def test_l2_after_l1_keeps_matching_the_words_of_the_text(
+    db_session: AsyncSession, saves: Saves
+) -> None:
+    error = ModelUnavailableError("embed timed out", operation="embed", model="fake/embedding")
+    retriever = build_retriever(
+        embedder=MappedEmbedder(error=error), settings=retrieval_settings(search_min_results=3)
+    )
+
+    nothing = await retriever.search(
+        db_session, SearchQuery(user_id=saves.user.id, text="nonexistenttermxyz")
+    )
+    few = await retriever.search(db_session, SearchQuery(user_id=saves.user.id, text="integrals"))
+
+    assert nothing.hits == ()
+    assert nothing.level is FallbackLevel.RELAXED
+    assert ids(few) == saves.ids("integrals")
+    assert few.level is FallbackLevel.RELAXED
+
+
+@pytest.mark.parametrize("wording", ["eatery", "Eatery", "  EATERY  ", "eatery "])
+async def test_a_rejected_alias_is_never_offered_in_any_case_or_spacing(
+    db_session: AsyncSession, saves: Saves, wording: str
+) -> None:
+    db_session.add(
+        SavedItem(
+            user_id=saves.user.id,
+            platform="instagram",
+            platform_post_id="synthetic-capitalized-restaurant",
+            category="Restaurant",
+            status=ItemStatus.DONE,
+            embedding=unit_vector(KOREAN_AXIS),
+        )
+    )
+    await db_session.flush()
+    classifier = PickingClassifier(picks={("category", wording): "Restaurant"})
+    # The wording embeds next to "restaurant", so it would be the first option by meaning.
+    embedder = MappedEmbedder(axes={wording: KOREAN_AXIS})
+
+    result = await build_retriever(classifier=classifier, embedder=embedder).search(
+        db_session, SearchQuery(user_id=saves.user.id, category=wording)
+    )
+
+    assert {"Restaurant", "restaurant"}.isdisjoint(classifier.offered_values)
+    assert normalized_value(result, "category") == (wording, NormalizationMethod.UNCHANGED)
+    assert result.hits == ()
+
+
+async def test_a_failed_vocabulary_ranking_falls_back_to_spelling_and_keeps_the_session(
+    db_session: AsyncSession, saves: Saves, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A wording vector of the wrong size makes the database reject the ranking by meaning.
+    embedder = MappedEmbedder(dimension=3)
+    classifier = PickingClassifier(picks={("category", "restarant"): "restaurant"})
+    retriever = build_retriever(classifier=classifier, embedder=embedder)
+
+    with caplog.at_level(logging.WARNING, logger="app.agent.filter_normalization"):
+        result = await retriever.search(
+            db_session, SearchQuery(user_id=saves.user.id, category="restarant")
+        )
+    after = await retriever.search(
+        db_session, SearchQuery(user_id=saves.user.id, type="place", filters={"area": "Brooklyn"})
+    )
+
+    assert normalized_value(result, "category") == ("restaurant", NormalizationMethod.DECISION)
+    assert ids(result) == saves.ids("diner", "kimchi")
+    assert ids(after) == saves.ids("diner")
+    logged = [r for r in caplog.records if r.getMessage() == "filter_normalization_ranking_failed"]
+    assert len(logged) == 1
+    assert "restarant" not in str(logged[0].__dict__)
+
+
+async def test_availability_gaps_cover_titles_added_by_l2_in_the_asking_country_only(
+    db_session: AsyncSession, saves: Saves
+) -> None:
+    query = SearchQuery(
+        user_id=saves.user.id,
+        country="US",
+        type="movie",
+        filters={"genre": "horror", "streaming": "Netflix"},
+    )
+    settings = retrieval_settings(search_min_results=3)
+
+    result = await build_retriever(settings=settings).search(db_session, query)
+
+    assert ids(result) == saves.ids("hereditary", "conjuring", "inception")
+    assert [hit.level for hit in result.hits] == [
+        FallbackLevel.NORMAL,
+        FallbackLevel.RELAXED,
+        FallbackLevel.RELAXED,
+    ]
+    # Inception has a Japanese row with Netflix, which must not count for the US.
+    gaps = {(gap.entity_id, gap.country, gap.reason) for gap in result.availability_gaps}
+    assert gaps == {
+        (saves.entities["inception"].id, "US", AvailabilityGapReason.MISSING),
+        (saves.entities["conjuring"].id, "US", AvailabilityGapReason.STALE),
+    }
+
+
+async def add_two_venue_list(session: AsyncSession, saves: Saves, *, cuisines_on: str) -> SavedItem:
+    """A list post of the Bebek coffee shop and the Korean restaurant in Beyoğlu.
+
+    `cuisines_on` says where each venue's own cuisine is stored: in its
+    `mention` in `fields.entities`, or in its `entity` data. Either way the item
+    also lists both cuisines at the top of `fields`, as SAV-14 does.
+    """
+    on_mentions = cuisines_on == "mention"
+    item = SavedItem(
+        user_id=saves.user.id,
+        platform="instagram",
+        platform_post_id=f"synthetic-two-venues-{cuisines_on}",
+        type="place",
+        category="café",
+        fields=place_fields(
+            ("Kronotrop", "Bebek", "specialty coffee" if on_mentions else None),
+            ("Kimchi House", "Beyoğlu", "korean barbecue" if on_mentions else None),
+        ),
+        status=ItemStatus.DONE,
+        saved_at=NOW,
+    )
+    if not on_mentions:
+        item.fields = {**item.fields, "cuisine": ["specialty coffee", "korean barbecue"]}
+        saves.entities["kronotrop"].data = {"cuisine": ["specialty coffee"]}
+        saves.entities["kimchi"].data = {"cuisine": ["korean barbecue"]}
+    session.add(item)
+    await session.flush()
+    session.add_all(
+        ItemEntity(saved_item_id=item.id, entity_id=saves.entities[entity].id, position=position)
+        for position, entity in enumerate(("kronotrop", "kimchi"))
+    )
+    await session.flush()
+    return item
+
+
+@pytest.mark.parametrize("cuisines_on", ["mention", "entity"])
+async def test_a_listed_cuisine_counts_only_for_its_own_venue(
+    db_session: AsyncSession, saves: Saves, cuisines_on: str
+) -> None:
+    listing = await add_two_venue_list(db_session, saves, cuisines_on=cuisines_on)
+    retriever = build_retriever()
+
+    other_venue = await retriever.search(
+        db_session,
+        SearchQuery(
+            user_id=saves.user.id,
+            type="place",
+            filters={"area": "Bebek", "cuisine": "korean barbecue"},
+        ),
+    )
+    same_venue = await retriever.search(
+        db_session,
+        SearchQuery(
+            user_id=saves.user.id,
+            type="place",
+            filters={"area": "Beyoğlu", "cuisine": "korean barbecue"},
+        ),
+    )
+
+    assert listing.id not in [hit.item_id for hit in other_venue.hits if hit.level == "L0"]
+    assert same_venue.level is FallbackLevel.NORMAL
+    assert ids(same_venue) == [listing.id, saves.items["kimchi"].id]
+
+
+async def test_a_single_venue_post_matches_its_own_cuisine_and_area(
+    db_session: AsyncSession, saves: Saves
+) -> None:
+    query = SearchQuery(
+        user_id=saves.user.id,
+        type="place",
+        filters={"area": "Bebek", "cuisine": "specialty coffee"},
+    )
+
+    result = await build_retriever().search(db_session, query)
+
+    assert result.level is FallbackLevel.NORMAL
+    assert ids(result) == saves.ids("kronotrop")
+
+
+async def test_item_wide_study_fields_still_filter_items_without_entities(
+    db_session: AsyncSession, saves: Saves
+) -> None:
+    query = SearchQuery(
+        user_id=saves.user.id, type="study", filters={"subject": "maths", "format": "tutorial"}
+    )
+
+    result = await build_retriever().search(db_session, query)
+
+    assert result.level is FallbackLevel.NORMAL
+    assert ids(result) == saves.ids("integrals")
+
+
+# A synthetic provider, so no seeded title offers it by accident.
+STREAMLY = "Streamly"
+
+
+def strict_ids(result: SearchResult) -> list[object]:
+    """The items that met every filter; relaxed L2 results are left out."""
+    return [hit.item_id for hit in result.hits if hit.level is not FallbackLevel.RELAXED]
+
+
+async def add_title_with_offers(
+    session: AsyncSession,
+    saves: Saves,
+    name: str,
+    offers_by_country: dict[str, dict[str, list[str]]],
+    *,
+    genre: str = "drama",
+    link: bool = True,
+) -> tuple[Entity, SavedItem | None]:
+    """A title with providers per country, saved by the asking user unless `link` is false."""
+    title = Entity(
+        type="movie",
+        source="tmdb",
+        external_id=f"synthetic-offers-{name}",
+        name=name,
+        data={"genre": [genre]},
+    )
+    session.add(title)
+    await session.flush()
+    session.add_all(
+        EntityAvailability(entity_id=title.id, country=country, providers=offers, refreshed_at=NOW)
+        for country, offers in offers_by_country.items()
+    )
+    item = None
+    if link:
+        item = SavedItem(
+            user_id=saves.user.id,
+            platform="instagram",
+            platform_post_id=f"synthetic-offers-{name}",
+            type="movie",
+            category="movie",
+            status=ItemStatus.DONE,
+            saved_at=NOW,
+        )
+        session.add(item)
+        await session.flush()
+        session.add(ItemEntity(saved_item_id=item.id, entity_id=title.id))
+    await session.flush()
+    return title, item
+
+
+def on_streamly(saves: Saves, country: str, **filters: str) -> SearchQuery:
+    return SearchQuery(
+        user_id=saves.user.id,
+        country=country,
+        type="movie",
+        filters={"streaming": STREAMLY, **filters},
+    )
+
+
+@pytest.mark.parametrize("offer_kind", ["flatrate", "free", "ads"])
+async def test_a_platform_filter_counts_titles_watchable_without_paying_extra(
+    db_session: AsyncSession, saves: Saves, offer_kind: str
+) -> None:
+    _, item = await add_title_with_offers(
+        db_session, saves, offer_kind, {"US": {offer_kind: [STREAMLY]}}
+    )
+
+    result = await build_retriever().search(db_session, on_streamly(saves, "US"))
+
+    assert result.level is FallbackLevel.NORMAL
+    assert strict_ids(result) == [item.id]  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize("offer_kind", ["rent", "buy"])
+async def test_renting_or_buying_never_satisfies_a_platform_filter(
+    db_session: AsyncSession, saves: Saves, offer_kind: str
+) -> None:
+    _, item = await add_title_with_offers(
+        db_session, saves, offer_kind, {"US": {offer_kind: [STREAMLY]}}
+    )
+
+    result = await build_retriever().search(db_session, on_streamly(saves, "US"))
+
+    assert strict_ids(result) == []
+    assert result.level is FallbackLevel.RELAXED
+    assert "filters.streaming" in result.relaxed
+    # L2 may still show the title, but only as a relaxed result, never as a match.
+    assert {hit.level for hit in result.hits if hit.item_id == item.id} <= {  # type: ignore[union-attr]
+        FallbackLevel.RELAXED
+    }
+
+
+async def test_with_mixed_offers_only_the_watchable_provider_matches(
+    db_session: AsyncSession, saves: Saves
+) -> None:
+    offers = {"flatrate": [STREAMLY], "rent": ["Rently"], "buy": ["Rently", STREAMLY]}
+    _, item = await add_title_with_offers(db_session, saves, "mixed", {"US": offers})
+    retriever = build_retriever()
+
+    watchable = await retriever.search(db_session, on_streamly(saves, "US"))
+    rent_only = await retriever.search(
+        db_session,
+        SearchQuery(
+            user_id=saves.user.id, country="US", type="movie", filters={"streaming": "Rently"}
+        ),
+    )
+    apple_rent = await retriever.search(
+        db_session,
+        SearchQuery(
+            user_id=saves.user.id, country="US", type="movie", filters={"streaming": "Apple TV"}
+        ),
+    )
+
+    assert strict_ids(watchable) == [item.id]  # type: ignore[union-attr]
+    assert strict_ids(rent_only) == []
+    # Hereditary is only for rent on Apple TV in the US.
+    assert strict_ids(apple_rent) == []
+
+
+async def test_offer_kinds_are_judged_per_country(db_session: AsyncSession, saves: Saves) -> None:
+    offers = {"US": {"rent": [STREAMLY]}, "JP": {"ads": [STREAMLY]}}
+    _, item = await add_title_with_offers(db_session, saves, "split-country", offers)
+    retriever = build_retriever()
+
+    in_us = await retriever.search(db_session, on_streamly(saves, "US"))
+    in_japan = await retriever.search(db_session, on_streamly(saves, "JP"))
+
+    assert strict_ids(in_us) == []
+    assert strict_ids(in_japan) == [item.id]  # type: ignore[union-attr]
+
+
+async def test_a_rented_title_and_a_watchable_one_cannot_split_a_list_posts_filters(
+    db_session: AsyncSession, saves: Saves
+) -> None:
+    rented, _ = await add_title_with_offers(
+        db_session, saves, "rented-horror", {"US": {"rent": [STREAMLY]}}, genre="horror", link=False
+    )
+    free, _ = await add_title_with_offers(
+        db_session, saves, "free-drama", {"US": {"free": [STREAMLY]}}, genre="drama", link=False
+    )
+    listing = SavedItem(
+        user_id=saves.user.id,
+        platform="instagram",
+        platform_post_id="synthetic-offers-list",
+        type="movie",
+        category="movie list",
+        status=ItemStatus.DONE,
+        saved_at=NOW,
+    )
+    db_session.add(listing)
+    await db_session.flush()
+    db_session.add_all(
+        ItemEntity(saved_item_id=listing.id, entity_id=title.id, position=position)
+        for position, title in enumerate((rented, free))
+    )
+    await db_session.flush()
+    retriever = build_retriever()
+
+    horror = await retriever.search(db_session, on_streamly(saves, "US", genre="horror"))
+    drama = await retriever.search(db_session, on_streamly(saves, "US", genre="drama"))
+
+    assert listing.id not in strict_ids(horror)
+    assert strict_ids(drama) == [listing.id]
+
+
+async def test_providers_offered_to_normalization_are_only_the_watchable_ones(
+    db_session: AsyncSession, saves: Saves
+) -> None:
+    offers = {"US": {"flatrate": [STREAMLY], "rent": ["Rently"], "buy": ["Buyly"]}}
+    await add_title_with_offers(db_session, saves, "options", offers)
+    classifier = PickingClassifier()
+    query = SearchQuery(
+        user_id=saves.user.id, country="US", type="movie", filters={"streaming": "strealy"}
+    )
+
+    await build_retriever(classifier=classifier).search(db_session, query)
+
+    assert STREAMLY in classifier.offered_values
+    assert {"Rently", "Buyly", "Apple TV"}.isdisjoint(classifier.offered_values)

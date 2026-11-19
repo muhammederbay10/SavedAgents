@@ -202,7 +202,7 @@ The dimension stays a setting, so another model can be tried on a fresh database
 
 ## Configuration
 
-All configuration comes from environment variables. Locally they live in `.env`, and `.env.example` lists every variable. The variables of the model clients have their own table under [Model settings](#model-settings).
+All configuration comes from environment variables. Locally they live in `.env`, and `.env.example` lists every variable. The variables of the model clients have their own table under [Model settings](#model-settings), and those of search under [Search](#search).
 
 | Variable | Used by | Meaning |
 |---|---|---|
@@ -502,7 +502,54 @@ Add a type only when it needs something that the open category can't give: its o
 6. **Test it:** in `tests/test_content_type_schemas.py`, add a good example, values nobody listed in several languages, and malformed output. In `tests/test_content_type_registry.py`, add the expected resolver, filters and vocabulary fields.
 7. **Update the docs:** the table above and `docs/ARCHITECTURE.md` §3.4.
 
-A declaration that can't work fails when the module is imported, with a `ContentTypeDefinitionError`: a repeated filter or type name, a vocabulary field on a filter that is not a `value`, or a resolver on a type whose schema has no `entities` (or the reverse).
+A filter also declares its **source**, where search reads what it is checked against (`FilterSource`):
+
+| Source | Search reads | Used by |
+|---|---|---|
+| `saved_values` (the default) | The key named after the filter: in the item's `fields` when the type's schema has it as a top-level field (study `subject`), otherwise in the linked entity's `data` or in that entity's own mention in `fields.entities` (place `cuisine`); for `area` the entities' address levels, for `location` their coordinates | most filters |
+| `country_availability` | `entity_availability` for the asking user's country, offer kinds `flatrate`, `free` and `ads` only. Only for `value` filters | `streaming` |
+| `user_status` | Whether the asking user marked the item's entity as done. Only for `boolean` filters | `watched` |
+| `opening_hours` | The entity's opening hours. Only for `boolean` filters. Search rejects it until the place resolver stores hours | `open_now` |
+
+A declaration that can't work fails when the module is imported, with a `ContentTypeDefinitionError`: a repeated filter or type name, a vocabulary field on a filter that is not a `value`, a source that cannot serve the filter's kind, or a resolver on a type whose schema has no `entities` (or the reverse).
+
+## Search
+
+[`app/agent/retrieval.py`](app/agent/retrieval.py) searches one user's saves (ARCHITECTURE §3.5 and §3.6, decision record 0014). The response agent's tools (SAV-17) build a `SearchQuery` and call `HybridRetriever.search()`:
+
+```python
+result = await retriever.search(session, SearchQuery(
+    user_id=user.id, country="US", type="movie",
+    filters={"genre": "horror", "streaming": "netflx"},
+))
+result.hits                # item ids, best first, each with the level that found it
+result.level               # L0, L1 or L2
+result.normalized          # "netflx" → "Netflix", and how
+result.availability_gaps   # (movie, country) rows to fetch or refresh (SAV-15)
+```
+
+1. **Check** the query against the content types: an unknown type or filter, or a value of the wrong kind, raises `SearchQueryError`. A streaming filter without the user's country raises `CountryRequiredError`, so the agent asks once.
+2. **Normalize** what the user wrote to a value in **their own** saves: an exact hit (their value, or a canonical value or verified alias in the vocabulary) needs no model call; otherwise Gemini Decision 1 picks one of their values or "none of these". No other user's values are ever read, and search never writes to the vocabulary.
+3. **L0:** SQL/PostGIS filters, then pgvector ranking by the query text. The type's filters must all hold on the same place or title of a list post. Without a text, places near a point come nearest first, and everything else newest first.
+4. **L1:** if the embedding or the vector search fails, the same filters plus Postgres full-text search on the caption, summary and transcript.
+5. **L2:** with fewer than `SEARCH_MIN_RESULTS` results, a district or neighbourhood widens to its city, tags and the type's other filters are dropped (a keyword match from L1 is kept), and items that are not fully indexed yet are searched by the words of the query. The result lists what was relaxed.
+
+Every step up the ladder is logged as `search_fallback` with its level and reason, never with the query's text. The whole search runs within `SEARCH_TIME_BUDGET_SECONDS`; when it runs out, the result has what was found and `incomplete=True`.
+
+The wording sent to the decision model is `RETRIEVAL_PROMPTS` in [`app/agent/prompts.py`](app/agent/prompts.py), version `2026-11-18.1`, approved by the owner. Any change to it bumps the version and is scored on the evaluation set.
+
+A streaming filter matches a title only when it's watchable on that platform in the user's country without paying extra: listed under the offer kind `flatrate`, `free` or `ads` in `entity_availability.providers` (`{"<offer kind>": ["<provider name>", …]}`). `rent` and `buy` offers are stored for replies but never match.
+
+| Variable | Meaning |
+|---|---|
+| `SEARCH_TIME_BUDGET_SECONDS` | How long one search may take in total, model calls included |
+| `SEARCH_MAX_RESULTS` | The most items one search returns |
+| `SEARCH_MIN_RESULTS` | Fewer results than this climb to L2. At most `SEARCH_MAX_RESULTS` |
+| `FILTER_NORMALIZATION_MIN_PROBABILITY` | The decision model's lowest probability for a value that counts as what the user meant, 0 to 1 |
+| `FILTER_NORMALIZATION_MAX_OPTIONS` | The most saved values offered to the decision model for one filter |
+| `AVAILABILITY_MAX_AGE_DAYS` | Streaming availability older than this is reported as stale for that country |
+
+They are read through `RetrievalSettings` in [`app/config.py`](app/config.py), with `get_retrieval_settings()`, with the same rules as the other settings classes.
 
 ## Project layout
 
@@ -528,6 +575,13 @@ app/
   agent/
     messenger.py      # Instagram Send API client: DMs, quick replies, replies to saved reels
     reply_templates.py # fixed DM wording in the user's language
+    retrieval.py      # hybrid search: normalize, filter, rank, fallback L1–L2, time budget
+    search_query.py   # SearchQuery, checked against the content types
+    search_conditions.py # SQL/PostGIS/pgvector conditions and rankings
+    saved_values.py   # a user's own values for a filter, ranked by meaning among them
+    filter_normalization.py # "netflx" → Netflix: exact hit, then the decision model
+    fallback.py       # fallback levels, reasons and their log line
+    prompts.py        # versioned wording for the decision model
   db/
     models.py         # SQLAlchemy models
     session.py        # the API's engine and session factory

@@ -12,6 +12,7 @@ from app.types.base import (
     EntityMention,
     Extraction,
     FilterKind,
+    FilterSource,
     SearchFilter,
 )
 from app.types.registry import CONTENT_TYPES, ContentTypeRegistry, UnknownContentTypeError
@@ -313,3 +314,38 @@ def test_no_code_outside_the_type_modules_branches_on_a_type_name() -> None:
         "Branching on a content type's name belongs in app/types/ or app/resolvers/. "
         "Read the type's declaration from the registry instead."
     )
+
+
+@pytest.mark.parametrize(
+    ("type_name", "filter_name", "source"),
+    [
+        ("movie", "streaming", FilterSource.COUNTRY_AVAILABILITY),
+        ("movie", "watched", FilterSource.USER_STATUS),
+        ("place", "open_now", FilterSource.OPENING_HOURS),
+        ("place", "area", FilterSource.SAVED_VALUES),
+        ("movie", "genre", FilterSource.SAVED_VALUES),
+        ("study", "subject", FilterSource.SAVED_VALUES),
+    ],
+)
+def test_filter_declares_where_search_reads_its_values(
+    type_name: str, filter_name: str, source: FilterSource
+) -> None:
+    filters = {item.name: item for item in CONTENT_TYPES.get(type_name).search_filters}
+
+    assert filters[filter_name].source is source
+
+
+@pytest.mark.parametrize(
+    ("kind", "source"),
+    [
+        (FilterKind.BOOLEAN, FilterSource.COUNTRY_AVAILABILITY),
+        (FilterKind.AREA, FilterSource.COUNTRY_AVAILABILITY),
+        (FilterKind.VALUE, FilterSource.USER_STATUS),
+        (FilterKind.INTEGER, FilterSource.OPENING_HOURS),
+    ],
+)
+def test_a_source_only_serves_the_kinds_it_can_check(
+    kind: FilterKind, source: FilterSource
+) -> None:
+    with pytest.raises(ContentTypeDefinitionError, match="'served' is a"):
+        SearchFilter(name="served", kind=kind, description="Anything.", source=source)
