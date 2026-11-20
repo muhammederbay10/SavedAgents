@@ -19,7 +19,7 @@ after the steps that already finished (`app.pipeline.indexer`). Reading the
 payload and the item at the start is retried the same way.
 
 **The stuck-item sweeper.** An arq cron in this worker runs
-`app.pipeline.sweeper` every `INDEXING_SWEEP_INTERVAL_SECONDS`. It repairs, from
+`app.pipeline.recovery.sweeper` every `INDEXING_SWEEP_INTERVAL_SECONDS`. It repairs, from
 Postgres, any unfinished item that no job has worked on for
 `INDEXING_STALE_AFTER_SECONDS`: it queues it again, or marks it `failed`.
 
@@ -51,33 +51,28 @@ from arq.typing import StartupShutdown
 from arq.worker import Worker, func
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from app.agent.messenger import InstagramMessenger
-from app.config import (
-    SECONDS_PER_MINUTE,
-    PipelineSettings,
-    Settings,
-    get_messenger_settings,
-    get_model_settings,
-    get_pipeline_settings,
-    get_settings,
-)
+from app.agent.replies.messenger import InstagramMessenger
+from app.config.base import SECONDS_PER_MINUTE, Settings, get_settings
+from app.config.messenger import get_messenger_settings
+from app.config.models import get_model_settings
+from app.config.pipeline import PipelineSettings, get_pipeline_settings
 from app.db.session import create_engine, create_session_factory
 from app.ingestion.jobs import INDEX_SAVED_ITEM_JOB, INDEXING_QUEUE, ArqJobQueue
 from app.logging_config import configure_logging
 from app.models.factory import build_model_clients, open_http_client
-from app.pipeline.classify import PostClassifier
-from app.pipeline.confirm import SaveConfirmer
-from app.pipeline.embed import ItemEmbedder
-from app.pipeline.extract import Extractor
-from app.pipeline.fetch import MediaFetcher
 from app.pipeline.indexer import ItemIndexer, PipelineSteps, RetryLaterError
-from app.pipeline.media import FfmpegMediaTools
-from app.pipeline.normalize import Normalizer, VocabularyRules
+from app.pipeline.media.storage import LocalMediaStore
+from app.pipeline.media.tools import FfmpegMediaTools
 from app.pipeline.payloads import CapturePayloads
 from app.pipeline.prompts import PIPELINE_PROMPTS
-from app.pipeline.storage import LocalMediaStore
-from app.pipeline.sweeper import StuckItemSweeper
-from app.pipeline.transcribe import SpeechToText
+from app.pipeline.recovery.sweeper import StuckItemSweeper
+from app.pipeline.steps.classify import PostClassifier
+from app.pipeline.steps.confirm import SaveConfirmer
+from app.pipeline.steps.embed import ItemEmbedder
+from app.pipeline.steps.extract import Extractor
+from app.pipeline.steps.fetch import MediaFetcher
+from app.pipeline.steps.transcribe import SpeechToText
+from app.pipeline.vocabulary.normalize import Normalizer, VocabularyRules
 from app.types.registry import CONTENT_TYPES
 
 # Where the worker keeps what its jobs share, in arq's context.

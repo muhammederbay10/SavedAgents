@@ -249,7 +249,7 @@ Normal search should answer almost everything. The fallback covers two different
 | **L3 Decision scan over text** | Still nothing, or the database is unreachable | **Gemini Decision 1 does the search temporarily:** it checks each item's stored text against the question ("is this a horror movie?") in batched, parallel calls | Cents, a few seconds |
 | **L4 Decision scan over video** (last resort) | Items with no usable text (indexing failed) | Gemini Decision 1 on the stored videos themselves, **capped** (e.g. the 50 most recent), in parallel | Most expensive, ~5–10 s |
 
-Phase 1 builds L0–L2 (`app/agent/retrieval.py`, decision record 0014). L1 is chosen when the query text can't be embedded or the vector query fails. L2 runs when L0 or L1 found fewer than `SEARCH_MIN_RESULTS` items: a district or neighbourhood is widened to its city, tags and the type's other filters are dropped (collection, type, category, platform, date, a "near" point and L1's keyword match stay), and items that aren't fully indexed are matched by any word of the query in their caption. The result names the filters it relaxed, so the reply can say so.
+Phase 1 builds L0–L2 (`app/agent/search/retrieval.py`, decision record 0014). L1 is chosen when the query text can't be embedded or the vector query fails. L2 runs when L0 or L1 found fewer than `SEARCH_MIN_RESULTS` items: a district or neighbourhood is widened to its city, tags and the type's other filters are dropped (collection, type, category, platform, date, a "near" point and L1's keyword match stay), and items that aren't fully indexed are matched by any word of the query in their caption. The result names the filters it relaxed, so the reply can say so.
 
 Rules:
 - **Time budget:** about 10 s in total (`SEARCH_TIME_BUDGET_SECONDS`). Answer with what we have, and tell the user when results may be incomplete ("Search is in backup mode right now, so this list may be missing some items").
@@ -389,7 +389,12 @@ erDiagram
 Savely/
   app/
     main.py                 # FastAPI app
-    config.py
+    config/                 # settings from environment variables, one module per group
+      base.py               # the API's Settings, shared constants and types
+      models.py             # ModelSettings
+      messenger.py          # MessengerSettings
+      pipeline.py           # PipelineSettings
+      retrieval.py          # RetrievalSettings
     logging_config.py       # structured (JSON) logging setup
     adapters/
       base.py               # CaptureEvent and ChatMessage
@@ -406,17 +411,19 @@ Savely/
     models/
       base.py               # Generator / Classifier / Transcriber / Embedder interfaces
       errors.py             # error types of model calls
-      openrouter.py         # shared HTTP transport: key, timeouts, retries, error mapping
-      wire.py               # JSON helpers shared by the clients
-      decision.py           # Gemini Decision 1 client
-      transcriber.py        # speech-to-text: default model + fallback
-      chat_completions.py   # Generator over chat completions, with the provider pin
-      routing.py            # which provider served a reply, from OpenRouter's routing metadata
-      deepseek.py           # text model: extraction + response agent, pinned to one provider
-      multimodal.py         # video model for escalations
-      embeddings.py
       factory.py            # builds every client from the settings
       fakes.py              # fake implementations of the interfaces, for tests
+      openrouter/
+        transport.py        # shared HTTP transport: key, timeouts, retries, error mapping
+        routing.py          # which provider served a reply, from OpenRouter's routing metadata
+        wire.py             # JSON helpers shared by the clients
+      clients/
+        decision.py         # Gemini Decision 1 client
+        transcriber.py      # speech-to-text: default model + fallback
+        chat_completions.py # Generator over chat completions, with the provider pin
+        deepseek.py         # text model: extraction + response agent, pinned to one provider
+        multimodal.py       # video model for escalations
+        embeddings.py
     types/                  # built-in types only — one module each; items with no built-in type need none
       base.py               # what a type declares: ContentType, filters, schema bases, vocabulary marks
       registry.py           # the list of types, looked up by name
@@ -429,38 +436,44 @@ Savely/
       open_library.py
     pipeline/
       indexer.py            # runs the steps of one item, keeps each result, resumes after a failure
-      runs.py               # the item's row, status and steps in ENRICHMENT_RUN
-      payloads.py           # reads the capture event of a job from ingestion's Redis state
-      prompts.py            # every model prompt, in one versioned PipelinePrompts
-      fetch.py              # download media before links expire
-      media.py              # ffprobe and ffmpeg
-      storage.py            # MediaStore: object storage, a local folder in development
-      classify.py           # decision model on the video: type, is-list
-      transcribe.py         # speech-to-text (when the file has an audio track), near-empty rule
-      extract.py            # text model with the type's schema; escalates to video model
-      open_values.py        # paths of open values; extraction → item columns
-      normalize.py          # vocabulary: exact hit, privacy gate, match-or-new
-      vocabulary.py         # database work for the vocabulary and its counts
-      renormalize.py        # reject an alias and re-normalize only its items
-      resolve.py            # type's resolver + decision-model candidate choice
-      embed.py
-      confirm.py            # the save confirmation DM
-      costs.py              # charges of model calls, per step and item
-      sweeper.py            # stuck-item sweeper: requeues or fails unfinished items, from Postgres
       worker.py             # the arq worker; parallel fan-out for bulk imports
+      prompts.py            # every model prompt, in one versioned PipelinePrompts
+      payloads.py           # reads the capture event of a job from ingestion's Redis state
+      costs.py              # charges of model calls, per step and item
+      steps/
+        fetch.py            # download media before links expire
+        classify.py         # decision model on the video: type, is-list
+        transcribe.py       # speech-to-text (when the file has an audio track), near-empty rule
+        extract.py          # text model with the type's schema; escalates to video model
+        resolve.py          # type's resolver + decision-model candidate choice
+        embed.py
+        confirm.py          # the save confirmation DM
+      media/
+        tools.py            # ffprobe and ffmpeg
+        storage.py          # MediaStore: object storage, a local folder in development
+      vocabulary/
+        store.py            # database work for the vocabulary and its counts
+        normalize.py        # vocabulary: exact hit, privacy gate, match-or-new
+        open_values.py      # paths of open values; extraction → item columns
+        renormalize.py      # reject an alias and re-normalize only its items
+      recovery/
+        runs.py             # the item's row, status and steps in ENRICHMENT_RUN
+        sweeper.py          # stuck-item sweeper: requeues or fails unfinished items, from Postgres
     agent/
       agent.py              # response-agent loop
       tools.py              # search_items, near, deep_look, set_status…
-      retrieval.py          # hybrid SQL + vector search, fallback ladder, time budget
-      search_query.py       # the search's arguments, checked against the content types
-      search_conditions.py  # SQL/PostGIS/pgvector conditions and rankings
-      saved_values.py       # the values in one user's saves, ranked by meaning among them
-      filter_normalization.py  # filter values → the user's own values (decision model)
-      prompts.py            # versioned wording for the decision model
       deep_look.py          # parallel subagents + write-back
-      fallback.py           # L1–L4 fallback levels, reasons, logging
-      messenger.py          # send DM replies, incl. replies that quote a saved reel (reply_to)
-      reply_templates.py    # fixed DM wording: confirmation, "which one?", progress, error, result line
+      search/
+        retrieval.py        # hybrid SQL + vector search, fallback ladder, time budget
+        query.py            # the search's arguments, checked against the content types
+        conditions.py       # SQL/PostGIS/pgvector conditions and rankings
+        saved_values.py     # the values in one user's saves, ranked by meaning among them
+        normalization.py    # filter values → the user's own values (decision model)
+        prompts.py          # versioned wording for the decision model
+        fallback.py         # L1–L4 fallback levels, reasons, logging
+      replies/
+        messenger.py        # send DM replies, incl. replies that quote a saved reel (reply_to)
+        templates.py        # fixed DM wording: confirmation, "which one?", progress, error, result line
     memory/
       session.py            # short-term: history + working set (Redis)
       longterm.py           # extract → gate → consolidate → retrieve
@@ -478,7 +491,7 @@ Savely/
     fixtures/webhooks/      # real (anonymized) webhook payloads
     fixtures/openrouter/    # model responses written from the provider's documentation
     live/                   # opt-in smoke tests that call the real models
-    pipeline/               # the indexing pipeline on fake models
+    pipeline/, agent/, …    # tests in folders that mirror app/; the pipeline runs on fake models
   docker/postgres/          # Postgres 16 image with PostGIS + pgvector
   docker-compose.yml
   alembic.ini               # Alembic configuration

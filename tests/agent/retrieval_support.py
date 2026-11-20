@@ -12,9 +12,9 @@ from datetime import UTC, datetime, timedelta
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agent.prompts import RetrievalPrompts
-from app.agent.retrieval import HybridRetriever
-from app.config import RetrievalSettings
+from app.agent.search.prompts import RetrievalPrompts
+from app.agent.search.retrieval import HybridRetriever
+from app.config.retrieval import RetrievalSettings
 from app.db.models import (
     AliasStatus,
     Entity,

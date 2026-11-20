@@ -1,7 +1,7 @@
 """SQLAlchemy models for the tables in `docs/ARCHITECTURE.md` §4.
 
 The Alembic migrations in `app/db/migrations/` create the schema. These models
-describe the same tables for queries, and `tests/test_migrations.py` fails when
+describe the same tables for queries, and `tests/db/test_migrations.py` fails when
 the two drift apart.
 
 Deleting a `user` row deletes everything that belongs to that user: platform

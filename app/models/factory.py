@@ -14,14 +14,15 @@ from dataclasses import dataclass
 
 import httpx
 
-from app.config import ModelSettings
+from app.config.models import ModelSettings
 from app.models.base import Classifier, Embedder, Generator, Transcriber
-from app.models.chat_completions import ProviderPin
-from app.models.decision import OpenRouterClassifier
-from app.models.deepseek import DeepSeekGenerator
-from app.models.embeddings import OpenRouterEmbedder
-from app.models.multimodal import MultimodalGenerator
-from app.models.openrouter import (
+from app.models.clients.chat_completions import ProviderPin
+from app.models.clients.decision import OpenRouterClassifier
+from app.models.clients.deepseek import DeepSeekGenerator
+from app.models.clients.embeddings import OpenRouterEmbedder
+from app.models.clients.multimodal import MultimodalGenerator
+from app.models.clients.transcriber import FallbackTranscriber, OpenRouterTranscriber
+from app.models.openrouter.transport import (
     CHAT_COMPLETIONS_PATH,
     EMBEDDINGS_PATH,
     TRANSCRIPTIONS_PATH,
@@ -30,7 +31,6 @@ from app.models.openrouter import (
     build_http_client,
     endpoint_url,
 )
-from app.models.transcriber import FallbackTranscriber, OpenRouterTranscriber
 
 
 @dataclass(frozen=True)

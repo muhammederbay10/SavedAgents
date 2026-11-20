@@ -9,8 +9,8 @@ from pathlib import Path
 import httpx
 from pydantic import HttpUrl, SecretStr
 
-from app.agent.messenger import InstagramMessenger
-from app.config import MessengerSettings
+from app.agent.replies.messenger import InstagramMessenger
+from app.config.messenger import MessengerSettings
 
 FIXTURES = Path(__file__).parent.parent / "fixtures" / "send_api"
 

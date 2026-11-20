@@ -14,7 +14,7 @@ import sys
 from datetime import UTC, datetime
 from typing import TextIO
 
-from app.config import LogLevel
+from app.config.base import LogLevel
 
 # Attributes every LogRecord has. Anything else on a record came from `extra=`.
 # `message` and `asctime` are only set while a record is being formatted.

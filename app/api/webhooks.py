@@ -20,7 +20,7 @@ from fastapi import APIRouter, Header, HTTPException, Query, Request, Response, 
 from fastapi.responses import PlainTextResponse
 
 from app.adapters import instagram
-from app.config import Settings
+from app.config.base import Settings
 from app.ingestion.service import IngestionService
 
 logger = logging.getLogger(__name__)

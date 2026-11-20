@@ -21,7 +21,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.adapters.base import CaptureEvent
-from app.config import Settings
+from app.config.base import Settings
 from app.db.models import EnrichmentRun, ItemStatus
 from app.ingestion.jobs import (
     ANSWER_CHAT_MESSAGE_JOB,

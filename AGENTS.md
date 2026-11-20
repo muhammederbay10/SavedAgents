@@ -86,7 +86,7 @@ pytest
 - **Type hints everywhere.** No untyped public functions. Avoid `Any` unless there's a comment explaining why.
 - **Small, single-purpose functions and modules.** If a function needs a comment to explain *what* it does, split it or rename it.
 - **Clear names.** `resolve_place_candidates()`, not `process()`. No abbreviations except well-known ones (`id`, `url`, `db`).
-- **No magic values.** Thresholds, model names, limits and URLs live in `app/config.py` (loaded from environment variables).
+- **No magic values.** Thresholds, model names, limits and URLs live in `app/config/` (loaded from environment variables).
 - **No closed lists of real-world values, and nothing tied to one place or language.** Categories, cuisines, genres, subjects, platforms and areas come from real data through the vocabulary, Google Places or TMDB, never from an enum or list in code. Code must work for any country and any language (decision record 0005).
 - **No dead code.** No commented-out code, unused imports or "just in case" functions. Git remembers.
 - **Explicit errors.** No bare `except:` and no swallowed exceptions. Catch specific errors, add context, and re-raise or handle them.

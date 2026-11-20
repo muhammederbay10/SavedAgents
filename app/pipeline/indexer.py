@@ -43,18 +43,12 @@ from app.db.models import ItemStatus, SavedItem
 from app.ingestion.repository import lock_user
 from app.models.base import ContentPart, Image, Video
 from app.models.errors import ModelError
-from app.pipeline.classify import Classification, PostClassifier
-from app.pipeline.confirm import ConfirmationStatus, SaveConfirmer
 from app.pipeline.costs import CallCosts
-from app.pipeline.embed import ItemEmbedder
-from app.pipeline.extract import ExtractionResult, Extractor, PostText
-from app.pipeline.fetch import MediaDownloadError, MediaFetcher, MediaKind, StoredMedia
-from app.pipeline.media import MediaToolError
-from app.pipeline.normalize import PROVENANCE_VALUES, Normalizer, raw_values_of
-from app.pipeline.open_values import find_open_values, item_values, set_value
+from app.pipeline.media.storage import MediaNotFoundError, MediaStore
+from app.pipeline.media.tools import MediaToolError
 from app.pipeline.payloads import CaptureSource
 from app.pipeline.prompts import PipelinePrompts
-from app.pipeline.runs import (
+from app.pipeline.recovery.runs import (
     JsonObject,
     RunStatus,
     Step,
@@ -65,9 +59,15 @@ from app.pipeline.runs import (
     recipient_of,
     record_step,
 )
-from app.pipeline.storage import MediaNotFoundError, MediaStore
-from app.pipeline.transcribe import SpeechOutcome, SpeechToText
-from app.pipeline.vocabulary import apply_item_values
+from app.pipeline.steps.classify import Classification, PostClassifier
+from app.pipeline.steps.confirm import ConfirmationStatus, SaveConfirmer
+from app.pipeline.steps.embed import ItemEmbedder
+from app.pipeline.steps.extract import ExtractionResult, Extractor, PostText
+from app.pipeline.steps.fetch import MediaDownloadError, MediaFetcher, MediaKind, StoredMedia
+from app.pipeline.steps.transcribe import SpeechOutcome, SpeechToText
+from app.pipeline.vocabulary.normalize import PROVENANCE_VALUES, Normalizer, raw_values_of
+from app.pipeline.vocabulary.open_values import find_open_values, item_values, set_value
+from app.pipeline.vocabulary.store import apply_item_values
 from app.types.registry import ContentTypeRegistry
 
 logger = logging.getLogger(__name__)

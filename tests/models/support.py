@@ -8,7 +8,7 @@ from typing import Any
 
 import httpx
 
-from app.models.openrouter import (
+from app.models.openrouter.transport import (
     CHAT_COMPLETIONS_PATH,
     EMBEDDINGS_PATH,
     TRANSCRIPTIONS_PATH,

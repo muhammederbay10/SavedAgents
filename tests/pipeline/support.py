@@ -13,8 +13,8 @@ from pathlib import Path
 import httpx
 
 from app.adapters.base import CaptureEvent
-from app.agent.messenger import OutgoingMessage, SendResult, SendStatus
-from app.config import PipelineSettings
+from app.agent.replies.messenger import OutgoingMessage, SendResult, SendStatus
+from app.config.pipeline import PipelineSettings
 from app.models.base import (
     Answer,
     ChoiceAnswer,
@@ -28,10 +28,14 @@ from app.models.base import (
     Unanswered,
     YesNoAnswer,
 )
-from app.pipeline.classify import IS_LIST_QUESTION_KEY, NONE_OF_THESE, TYPE_QUESTION_KEY
-from app.pipeline.media import MediaProbe, MediaTools
-from app.pipeline.normalize import MATCH_QUESTION_KEY, NEW_VALUE_OPTION, PRIVACY_QUESTION_KEY
+from app.pipeline.media.tools import MediaProbe, MediaTools
 from app.pipeline.prompts import PipelinePrompts
+from app.pipeline.steps.classify import IS_LIST_QUESTION_KEY, NONE_OF_THESE, TYPE_QUESTION_KEY
+from app.pipeline.vocabulary.normalize import (
+    MATCH_QUESTION_KEY,
+    NEW_VALUE_OPTION,
+    PRIVACY_QUESTION_KEY,
+)
 
 TEST_PROMPTS = PipelinePrompts(
     version="test-prompts-1",

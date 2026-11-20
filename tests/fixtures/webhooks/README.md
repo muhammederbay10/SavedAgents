@@ -40,7 +40,7 @@ Only the values were changed; every key, nesting level and value type is exactly
 | Captions (`title`) | Synthetic captions with the same shape: length, language, line breaks, hashtags and emoji |
 
 The texts the tester typed ("Test", "Restaurants in beşiktaş", "For my movies collection") are kept
-as sent. `tests/test_webhook_fixtures.py` fails if a fixture contains an id, URL or signature that
+as sent. `tests/adapters/test_webhook_fixtures.py` fails if a fixture contains an id, URL or signature that
 doesn't follow these fake patterns. It also fails if a file named `instagram_*.json` holds a `share`
 attachment, so a synthetic payload can't pass as a recording.
 

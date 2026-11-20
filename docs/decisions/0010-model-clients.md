@@ -16,8 +16,8 @@ Every model call goes through OpenRouter with one key, and every model sits behi
 
 ### The clients
 
-1. **Four interfaces in `app/models/base.py`:** `Classifier.decide`, `Transcriber.transcribe`, `Generator.generate` and `Embedder.embed`, with plain value types. The rest of the code imports only `base`, `errors` and `factory` from `app/models/`; a test (`tests/test_model_boundary.py`) fails on any other import from the package, and on any model SDK import outside it.
-2. **One HTTP transport, no model SDK.** `app/models/openrouter.py` adds the key, applies each call's timeout, retries, and maps failures to error types. The clients build and read JSON themselves. An SDK would not cover the decisions endpoint or OpenRouter's JSON transcription format, and would be a second new dependency.
+1. **Four interfaces in `app/models/base.py`:** `Classifier.decide`, `Transcriber.transcribe`, `Generator.generate` and `Embedder.embed`, with plain value types. The rest of the code imports only `base`, `errors` and `factory` from `app/models/`; a test (`tests/models/test_model_boundary.py`) fails on any other import from the package, and on any model SDK import outside it.
+2. **One HTTP transport, no model SDK.** `app/models/openrouter/transport.py` adds the key, applies each call's timeout, retries, and maps failures to error types. The clients build and read JSON themselves. An SDK would not cover the decisions endpoint or OpenRouter's JSON transcription format, and would be a second new dependency.
 3. **Retries:** timeouts, connection failures and HTTP 408, 429, 500, 502, 503, 504, 524 and 529 are tried again, up to `OPENROUTER_MAX_ATTEMPTS` in total. The wait starts at `OPENROUTER_RETRY_BASE_DELAY_SECONDS`, doubles each time, follows a longer `Retry-After` header, and never passes `OPENROUTER_RETRY_MAX_DELAY_SECONDS`. Every other failure is raised at once. An `error` object inside an HTTP 200 is treated as the error it describes.
 4. **Errors and logs carry no content.** An error names the operation, the model, the HTTP status and the provider's short error label (for example `rate_limit_exceeded`). It never quotes a request, a response or the provider's own message, because a provider can quote its input back. Logs hold the same fields plus the attempt number and the elapsed time. Captions, transcripts, messages and media are also left out of the `repr` of every value type.
 5. **Model settings are their own class, `ModelSettings`,** read with `get_model_settings()`. The health endpoint and the migrations call no model, so they don't need an API key to start. Like `Settings`, no field has a default. Both endpoint URLs must be `https`, because the key travels in a header.
@@ -70,7 +70,7 @@ OpenRouter's own US routing (`us.openrouter.ai`) is not an option: this model is
 **How the pin is enforced, twice:**
 
 - **In the request.** Every text-model request carries `provider: {"only": [slug], "order": [slug], "allow_fallbacks": false}`. OpenRouter may use that one endpoint and nothing else.
-- **In the response.** Every request sends `X-OpenRouter-Metadata: enabled`, so the reply carries `openrouter_metadata` (OpenRouter's "Router metadata" guide, read 18 Nov 2026). `app/models/routing.py` accepts the reply only if all of these hold, and otherwise discards it with `ProviderPinViolationError`:
+- **In the response.** Every request sends `X-OpenRouter-Metadata: enabled`, so the reply carries `openrouter_metadata` (OpenRouter's "Router metadata" guide, read 18 Nov 2026). `app/models/openrouter/routing.py` accepts the reply only if all of these hold, and otherwise discards it with `ProviderPinViolationError`:
   - the metadata is there and well formed;
   - exactly one endpoint in `endpoints.available` has `selected: true` (a JSON boolean), and it names `TEXT_MODEL_PROVIDER_NAME` (any letter case) and exactly `TEXT_MODEL`;
   - `attempt`, the number of the attempt that succeeded, is a JSON integer of 1 or more;
@@ -98,7 +98,7 @@ Embeddings are matched to their texts by `index`, and only a JSON integer from 0
 
 ## Needs the owner's decision
 
-1. **`httpx` becomes a runtime dependency.** It was already in the project, but only as a development tool (for tests). The clients need an async HTTP client when the app runs, so `pyproject.toml` now lists it under `dependencies`. No new package is installed. AGENTS.md §1 asks for approval of a new dependency; this is the request. To undo it: move the line back and replace the transport in `app/models/openrouter.py`.
+1. **`httpx` becomes a runtime dependency.** It was already in the project, but only as a development tool (for tests). The clients need an async HTTP client when the app runs, so `pyproject.toml` now lists it under `dependencies`. No new package is installed. AGENTS.md §1 asks for approval of a new dependency; this is the request. To undo it: move the line back and replace the transport in `app/models/openrouter/transport.py`.
 2. **The provider.** Is `coreweave/fp8` on the evidence above acceptable, or should the pin be `fireworks/us` (a stated US-only route, about 3.5 times the input price)? Changing it is two lines in `.env`.
 3. **A live smoke run** of `tests/live/` (six calls, a fraction of a cent) to confirm the pin, the routing metadata on a real chat completion and the hand-written fixtures.
 

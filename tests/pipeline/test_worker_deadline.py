@@ -25,7 +25,7 @@ from sqlalchemy import func, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.adapters.base import CaptureEvent
-from app.config import Settings
+from app.config.base import Settings
 from app.db.models import ItemStatus, SavedItem
 from app.ingestion.jobs import INDEX_SAVED_ITEM_JOB, INDEXING_QUEUE, ArqJobQueue, index_job_id
 from app.models.base import GenerationRequest, GenerationResult

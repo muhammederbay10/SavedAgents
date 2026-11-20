@@ -1,7 +1,7 @@
 """Fixed values of the SAV-7 spike: endpoints, models, prices and the test set.
 
 These are the spike's own constants. The application's model settings are added
-to `app/config.py` by SAV-10.
+to `app/config/models.py` by SAV-10.
 """
 
 from dataclasses import dataclass
