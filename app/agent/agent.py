@@ -355,10 +355,14 @@ class ResponseAgent:
         """Ask the fixed deletion question, and prepare the "done" message in the same words."""
         wording = await self._wording(language)
         minutes = math.ceil(self._settings.data_deletion_confirm_seconds / _SECONDS_PER_MINUTE)
+        question = deletion_confirmation(minutes, wording)
         return AgentAnswer(
             language=language,
             messages=AnswerMessages(
-                intro=deletion_confirmation(minutes, wording).text, results=(), wording=wording
+                intro=question.text,
+                results=(),
+                wording=wording,
+                intro_quick_replies=question.quick_replies,
             ),
             notices=frozenset(),
             more_item_ids=(),

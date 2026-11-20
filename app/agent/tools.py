@@ -27,8 +27,9 @@ these hold, and refuses otherwise:
 - this turn is the user's next message: `begin_turn` takes the request out, so
   "no" or any other message uses it up, and a request of the same turn never counts;
 - the caller reports an explicit confirmation with this message
-  (`ToolContext.deletion_confirmed`). How the platform signals it is the owner's
-  decision (record 0015, Q9); until then nothing sets it, and nothing is deleted;
+  (`ToolContext.deletion_confirmed`): a tap on the question's "Yes, delete"
+  button, whose fixed payload the chat worker (SAV-18) checks with
+  `confirms_deletion`. A typed "yes" never counts; the question is asked again;
 - the deadline (`DATA_DELETION_CONFIRM_SECONDS` after delivery) has not passed,
   checked right before erasing.
 
@@ -747,7 +748,16 @@ class UserTools:
 
     async def _confirm_data_deletion(self, arguments: NoArguments) -> ToolOutcome:
         pending, self._pending_deletion = self._pending_deletion, None
-        if pending is None or not self._context.deletion_confirmed:
+        if pending is None:
+            return _deletion_refused()
+        if not self._context.deletion_confirmed:
+            # Typed text, even "yes", never deletes (record 0015, Q9): while the
+            # question is still open, the bot asks it again, with its button.
+            if self._now() < pending.deadline:
+                return ToolOutcome(
+                    content={"asked_again": "only the Yes, delete button confirms"},
+                    asks_deletion_confirmation=True,
+                )
             return _deletion_refused()
         async with self._sessions() as session:
             recipients = await _platform_recipients(session, self._context.user_id)

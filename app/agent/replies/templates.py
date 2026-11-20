@@ -28,6 +28,11 @@ from typing import Final
 
 from app.agent.replies.messenger import MAX_QUICK_REPLIES, OutgoingMessage, QuickReply
 
+# The payload of the "Yes, delete" button under the deletion question (record
+# 0015, Q9). It is the bot's own fixed text, the same in every language; only a
+# tap on that button reports it, a typed "yes" never does.
+DELETION_CONFIRM_PAYLOAD: Final = "savely:delete_my_data:confirm"
+
 # Joins the parts of one line ("Kronotrop, Beşiktaş · open now"). The middle dot
 # is the bot's own layout, used in every language.
 SEPARATOR: Final = " · "
@@ -91,8 +96,10 @@ class ReplyWording:
         list_separator: Joins values in a list, e.g. ", " or "、".
         deletion_confirmation: Asks the user to confirm "delete my data": it
             names what goes (all saves, stored media, the conversation, the
-            profile), says it can't be undone, and how to confirm; `{minutes}`
-            is how long the request waits.
+            profile), says it can't be undone, and that tapping the button
+            confirms; `{minutes}` is how long the request waits.
+        delete_button: The label of the button that confirms the deletion,
+            e.g. "Yes, delete". Meta cuts labels after 20 characters.
         deletion_done: Says the data was deleted and that writing again starts fresh.
     """
 
@@ -108,6 +115,7 @@ class ReplyWording:
     closed_now: str
     list_separator: str
     deletion_confirmation: str
+    delete_button: str
     deletion_done: str
 
     def __post_init__(self) -> None:
@@ -166,9 +174,10 @@ _BUILT_IN_WORDINGS: Final[dict[str, ReplyWording]] = {
         list_separator=", ",
         deletion_confirmation=(
             "This deletes all your saves, their stored media, our conversation and your "
-            'profile. It can\'t be undone. To confirm, reply "yes" within {minutes} minutes; '
-            "anything else cancels it."
+            'profile. It can\'t be undone. To confirm, tap "Yes, delete" within {minutes} '
+            "minutes; anything else cancels it."
         ),
+        delete_button="Yes, delete",
         deletion_done=("Done: all your data is deleted. If you write again, you start fresh."),
     ),
     "tr": ReplyWording(
@@ -185,9 +194,10 @@ _BUILT_IN_WORDINGS: Final[dict[str, ReplyWording]] = {
         list_separator=", ",
         deletion_confirmation=(
             "Bu işlem tüm kayıtlarını, saklanan medyalarını, konuşmamızı ve profilini siler. "
-            'Geri alınamaz. Onaylamak için {minutes} dakika içinde "evet" yaz; başka bir '
-            "mesaj işlemi iptal eder."
+            'Geri alınamaz. Onaylamak için {minutes} dakika içinde "Evet, sil" düğmesine '
+            "dokun; başka bir mesaj işlemi iptal eder."
         ),
+        delete_button="Evet, sil",
         deletion_done=("Tamam: tüm verilerin silindi. Tekrar yazarsan sıfırdan başlarsın."),
     ),
 }
@@ -417,16 +427,36 @@ def error_message(wording: ReplyWording) -> OutgoingMessage:
 
 
 def deletion_confirmation(minutes: int, wording: ReplyWording) -> OutgoingMessage:
-    """Build the question that asks the user to confirm "delete my data".
+    """Build the question that asks the user to confirm "delete my data", with its button.
 
     Args:
         minutes: How long the request waits for the confirmation.
         wording: The bot's words in the user's language, from `reply_wording`.
 
     Returns:
-        What is deleted, that it can't be undone, and how to confirm.
+        What is deleted, that it can't be undone and how to confirm, with one
+        "Yes, delete" button whose payload is `DELETION_CONFIRM_PAYLOAD`.
     """
-    return OutgoingMessage(text=wording.deletion_confirmation.format(minutes=minutes))
+    return OutgoingMessage(
+        text=wording.deletion_confirmation.format(minutes=minutes),
+        quick_replies=(QuickReply(title=wording.delete_button, payload=DELETION_CONFIRM_PAYLOAD),),
+    )
+
+
+def confirms_deletion(quick_reply_payload: str | None) -> bool:
+    """Tell whether a message is a tap on the deletion question's "Yes, delete" button.
+
+    The chat worker (SAV-18) sets `AgentTurn.deletion_confirmed` from it. The
+    tools still check that a delivered question is waiting for this sender's
+    next message and that it hasn't expired.
+
+    Args:
+        quick_reply_payload: `ChatMessage.quick_reply_payload` of the message.
+
+    Returns:
+        True only for the button's fixed payload; never for typed text.
+    """
+    return quick_reply_payload == DELETION_CONFIRM_PAYLOAD
 
 
 def deletion_done(wording: ReplyWording) -> OutgoingMessage:

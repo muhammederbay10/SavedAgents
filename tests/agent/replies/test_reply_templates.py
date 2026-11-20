@@ -4,12 +4,14 @@ import pytest
 
 from app.agent.replies.messenger import MAX_QUICK_REPLIES, QuickReply, build_message_body
 from app.agent.replies.templates import (
+    DELETION_CONFIRM_PAYLOAD,
     ChoiceOption,
     ImportCount,
     ReplyWording,
     ReplyWordingUnavailableError,
     ResultLine,
     SavedItemSummary,
+    confirms_deletion,
     deletion_confirmation,
     deletion_done,
     error_message,
@@ -51,6 +53,7 @@ JAPANESE = ReplyWording(
         "保存、メディア、会話、プロフィールをすべて削除します。元に戻せません。"
         "{minutes}分以内に「はい」と返信してください。"
     ),
+    delete_button="はい、削除",
     deletion_done="すべてのデータを削除しました。また書けば最初から始まります。",
 )
 KRONOTROP = ResultLine(
@@ -367,9 +370,33 @@ def test_deletion_confirmation_names_the_deadline_in_built_in_languages(language
 
     assert "10" in message.text
     assert message.reply_to_message_id is None
-    assert message.quick_replies == ()
+    (button,) = message.quick_replies
+    assert button.title == reply_wording(language).delete_button
+    assert button.payload == DELETION_CONFIRM_PAYLOAD
 
 
 def test_deletion_messages_in_supplied_wording() -> None:
     assert deletion_confirmation(5, JAPANESE).text.endswith("5分以内に「はい」と返信してください。")
     assert deletion_done(JAPANESE).text == JAPANESE.deletion_done
+
+
+def test_the_delete_button_has_the_same_fixed_payload_in_every_language() -> None:
+    (japanese,) = deletion_confirmation(5, JAPANESE).quick_replies
+    (english,) = deletion_confirmation(5, reply_wording("en")).quick_replies
+
+    assert japanese.title == "はい、削除"
+    assert japanese.payload == english.payload == DELETION_CONFIRM_PAYLOAD
+
+
+@pytest.mark.parametrize(
+    ("payload", "confirms"),
+    [
+        (DELETION_CONFIRM_PAYLOAD, True),
+        (None, False),
+        ("yes", False),
+        ("Yes, delete", False),
+        (f"{DELETION_CONFIRM_PAYLOAD} ", False),
+    ],
+)
+def test_only_the_buttons_payload_confirms_a_deletion(payload: str | None, confirms: bool) -> None:
+    assert confirms_deletion(payload) is confirms

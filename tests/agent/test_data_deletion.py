@@ -22,7 +22,12 @@ from app.agent.agent import AgentAnswer, AgentTurn, AgentWordingError
 from app.agent.deletion_requests import RedisDeletionRequests
 from app.agent.replies.answers import AnswerSender, DeliveryReport
 from app.agent.replies.messenger import MessengerRequestError
-from app.agent.replies.templates import deletion_confirmation, deletion_done, reply_wording
+from app.agent.replies.templates import (
+    DELETION_CONFIRM_PAYLOAD,
+    deletion_confirmation,
+    deletion_done,
+    reply_wording,
+)
 from app.agent.send import send_answer
 from app.agent.tools import (
     CONFIRM_DATA_DELETION_TOOL,
@@ -341,13 +346,13 @@ async def test_a_wrong_confirm_call_after_no_or_another_message_erases_nothing(
     stores: Stores, reply: str
 ) -> None:
     user = await save_something(stores, LEAVING_SENDER_ID)
-    # The model calls the confirm tool although the user did not confirm.
+    # The model calls the confirm tool although the user did not tap the button.
     agent = stores.agent(
         [
             REQUEST,
             final_answer("en", "…"),
             CONFIRM,
-            final_answer("en", "Nothing deleted."),
+            final_answer("en", "…"),
             CONFIRM,
             final_answer("en", "Nothing deleted."),
         ]
@@ -355,13 +360,71 @@ async def test_a_wrong_confirm_call_after_no_or_another_message_erases_nothing(
 
     try:
         await request_deletion(agent, user, "delete my data")
-        await answer(agent, user, reply)
-        # The request was used up by that message, so a later explicit yes finds none.
-        await answer(agent, user, "yes", confirmed=True)
+        asked_again = await answer(agent, user, reply)
+        # That message used the request up, and the repeated question was never
+        # delivered, so even a tap afterwards finds nothing to confirm.
+        await answer(agent, user, "Yes, delete", confirmed=True)
 
-        refusals = [tool_results(agent.generator.requests[i])[0] for i in (3, 5)]
-        assert all("Nothing was deleted" in str(refusal["error"]) for refusal in refusals)
+        assert asked_again.deletion_confirmation is not None
+        assert asked_again.deleted_recipients == ()
+        (refused,) = tool_results(agent.generator.requests[5])
+        assert "Nothing was deleted" in str(refused["error"])
         assert await user_exists(stores, user.user_id)
+    finally:
+        await clean_up(stores, user)
+
+
+async def test_a_typed_yes_shows_the_question_and_its_button_again(stores: Stores) -> None:
+    user = await save_something(stores, LEAVING_SENDER_ID)
+    agent = stores.agent(
+        [REQUEST, final_answer("en", "…"), CONFIRM, final_answer("en", "…"), CONFIRM]
+    )
+
+    try:
+        await request_deletion(agent, user, "delete my data")
+        typed_yes = await answer(agent, user, "yes")
+
+        expected = deletion_confirmation(CONFIRM_MINUTES, reply_wording("en"))
+        assert typed_yes.messages.intro == expected.text
+        assert typed_yes.messages.intro_quick_replies == expected.quick_replies
+        assert typed_yes.deleted_recipients == ()
+        assert await user_exists(stores, user.user_id)
+
+        # The repeated question is delivered, and the tap on its button deletes.
+        await deliver(agent, user, typed_yes)
+        tapped = await answer(agent, user, "Yes, delete", confirmed=True)
+
+        assert tapped.deleted_recipients == (PlatformRecipient(INSTAGRAM, LEAVING_SENDER_ID),)
+        assert not await user_exists(stores, user.user_id)
+    finally:
+        await clean_up(stores, user)
+
+
+async def test_the_delivered_question_carries_the_delete_button(stores: Stores) -> None:
+    user = await save_something(stores, LEAVING_SENDER_ID)
+    agent = stores.agent([REQUEST, final_answer("tr", "…")])
+
+    try:
+        result = await answer(agent, user, "verilerimi sil")
+        under_test = build_messenger([sent()])
+        await send_answer(
+            AnswerSender(under_test.messenger),
+            agent.toolbox,
+            user.user_id,
+            user.sender_id,
+            result,
+            MESSENGER_NOW,
+        )
+
+        (body,) = under_test.api.bodies()
+        assert body["message"]["quick_replies"] == [  # type: ignore[index]
+            {
+                "content_type": "text",
+                "title": reply_wording("tr").delete_button,
+                "payload": DELETION_CONFIRM_PAYLOAD,
+            }
+        ]
+        assert await stores.requests.take(user.user_id) is not None
     finally:
         await clean_up(stores, user)
 

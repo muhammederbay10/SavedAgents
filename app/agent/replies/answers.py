@@ -31,6 +31,7 @@ from typing import Final, Protocol
 from app.agent.replies.messenger import (
     MessengerRequestError,
     OutgoingMessage,
+    QuickReply,
     SendResult,
     SendStatus,
 )
@@ -85,11 +86,13 @@ class AnswerMessages:
         intro: The intro, in the user's language, written by the response agent.
         results: The items to show, in order, already capped.
         wording: The bot's own words in the user's language.
+        intro_quick_replies: Buttons under the intro, e.g. "Yes, delete".
     """
 
     intro: str = field(repr=False)
     results: tuple[ResultCard, ...]
     wording: ReplyWording | None
+    intro_quick_replies: tuple[QuickReply, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -156,7 +159,8 @@ class AnswerSender:
         sent = 0
         fallbacks = 0
         try:
-            await self._send_one(recipient_id, OutgoingMessage(answer.intro), last_user_message_at)
+            intro = OutgoingMessage(answer.intro, quick_replies=answer.intro_quick_replies)
+            await self._send_one(recipient_id, intro, last_user_message_at)
             sent += 1
             for position, card in enumerate(answer.results, start=1):
                 line = ResultLine(

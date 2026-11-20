@@ -129,6 +129,7 @@ def translated_wording(language: str, separator: str = ", ") -> dict[str, str]:
         "closed_now": f"{language}: closed",
         "list_separator": separator,
         "deletion_confirmation": f"{language}: delete everything? yes within {{minutes}} min",
+        "delete_button": f"{language}: yes, delete",
         "deletion_done": f"{language}: everything deleted",
     }
 
