@@ -12,8 +12,6 @@
   <a href="docs/decisions/">Decisions</a>
   ·
   <a href="docs/development.md">Development</a>
-  ·
-  <a href="AGENTS.md">Contributing</a>
 </p>
 
 You save posts on Instagram all the time: a restaurant to try, a movie to watch, a study tip. Instagram lets you sort them into collections, but you can't search or filter inside them. Standing in a new neighbourhood, you can't ask "which restaurants did I save around here?". So the saves pile up and get forgotten.
@@ -61,7 +59,3 @@ Working today: the bot receives the posts and reels you share, indexes each one 
 - [Development](docs/development.md): set up, run and test Savely, and how each part works.
 - [Architecture](docs/ARCHITECTURE.md): the design, and the source of truth.
 - [Decision records](docs/decisions/): why things are the way they are.
-
-## Contributing
-
-Read [AGENTS.md](AGENTS.md) first. It has the rules for people and AI agents: the approval gates, the git workflow, the code and documentation rules, and the checks that must pass.
