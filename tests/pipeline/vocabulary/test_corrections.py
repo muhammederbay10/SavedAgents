@@ -31,6 +31,7 @@ from tests.pipeline.support import capture_event, place_extraction, structured_r
 
 WORDING = "Kore mutfağı"
 CUISINE_PATH = "entities.0.cuisine"
+REVIEW_MIN_USERS = 2
 
 
 @pytest.fixture
@@ -47,6 +48,7 @@ def corrections(pipeline: Pipeline) -> ItemCorrection:
         pipeline.normalizer(),
         CONTENT_TYPES,
         alias_min_probability=RULES.alias_min_probability,
+        review_min_users=REVIEW_MIN_USERS,
     )
 
 
@@ -151,9 +153,79 @@ async def test_one_users_repeated_corrections_never_flag_a_verified_alias(
         for item_id in corrected:
             await corrections(pipeline).correct(first_user, item_id, CUISINE_PATH, "japanese")
 
-    assert [r for r in caplog.records if "flagged" in r.getMessage()] == []
+    assert flags(caplog) == []
     counted = await the_alias(pipeline)
     assert (counted.status, counted.correction_count) == (AliasStatus.VERIFIED, 3)
+
+
+def flags(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.getMessage() == "vocabulary_alias_flagged_for_review"]
+
+
+async def test_corrections_from_different_users_flag_a_verified_alias(
+    pipeline: Pipeline, caplog: pytest.LogCaptureFixture
+) -> None:
+    await add_korean(pipeline)
+    first_user, second_user = await add_user(pipeline.sessions), await add_user(pipeline.sessions)
+    first = await index_place(pipeline, first_user, WORDING)
+    second = await index_place(pipeline, second_user, WORDING)
+    alias = await the_alias(pipeline)
+    assert alias.status == AliasStatus.VERIFIED
+
+    with caplog.at_level(logging.INFO):
+        await corrections(pipeline).correct(first_user, first, CUISINE_PATH, "japanese")
+        assert flags(caplog) == []
+        await corrections(pipeline).correct(second_user, second, CUISINE_PATH, "chinese")
+
+    (flagged,) = flags(caplog)
+    assert (flagged.alias_id, flagged.correcting_users) == (str(alias.id), REVIEW_MIN_USERS)
+    async with pipeline.sessions() as session:
+        run = await vocabulary.normalize_run(session, first)
+    assert run is not None and run.output is not None
+    entry = run.output["values"][CUISINE_PATH]
+    assert entry[vocabulary.PROVENANCE_CORRECTED_ALIAS_IDS] == [str(alias.id)]
+    # Reviewing it changes nothing by itself: the alias stays verified.
+    assert (await the_alias(pipeline)).status == AliasStatus.VERIFIED
+
+
+async def test_correction_evidence_is_deleted_with_the_users_items(pipeline: Pipeline) -> None:
+    await add_korean(pipeline)
+    leaving, staying = await add_user(pipeline.sessions), await add_user(pipeline.sessions)
+    leaving_item = await index_place(pipeline, leaving, WORDING)
+    staying_item = await index_place(pipeline, staying, WORDING)
+    await corrections(pipeline).correct(leaving, leaving_item, CUISINE_PATH, "japanese")
+    await corrections(pipeline).correct(staying, staying_item, CUISINE_PATH, "chinese")
+    alias = await the_alias(pipeline)
+    async with pipeline.sessions() as session:
+        assert await vocabulary.correcting_user_count(session, alias.id) == 2
+
+    async with pipeline.sessions() as session, session.begin():
+        await delete_user_data(session, leaving, pipeline.store)
+
+    async with pipeline.sessions() as session:
+        assert await vocabulary.correcting_user_count(session, alias.id) == 1
+
+
+async def test_correcting_a_corrected_value_keeps_the_first_alias_as_evidence(
+    pipeline: Pipeline,
+) -> None:
+    await add_korean(pipeline)
+    user_id = await add_user(pipeline.sessions)
+    item_id = await index_place(pipeline, user_id, WORDING)
+    alias = await the_alias(pipeline)
+
+    await corrections(pipeline).correct(user_id, item_id, CUISINE_PATH, "japanese")
+    await corrections(pipeline).correct(user_id, item_id, CUISINE_PATH, "ramen")
+
+    async with pipeline.sessions() as session:
+        run = await vocabulary.normalize_run(session, item_id)
+        users = await vocabulary.correcting_user_count(session, alias.id)
+    assert run is not None and run.output is not None
+    assert run.output["values"][CUISINE_PATH][vocabulary.PROVENANCE_CORRECTED_ALIAS_IDS] == [
+        str(alias.id)
+    ]
+    assert users == 1
+    assert (await the_alias(pipeline)).correction_count == 1
 
 
 @pytest.mark.parametrize("generic_probability", [0.1, 0.5])

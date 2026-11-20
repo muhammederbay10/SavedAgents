@@ -35,6 +35,7 @@ TEXT_MODEL = "fake/text"
 MAX_STEPS = 5
 MAX_RESULTS = 5
 CONFIRM_SECONDS = 600
+REVIEW_MIN_USERS = 2
 TURN_TIME = datetime(2026, 11, 20, 12, 0, tzinfo=UTC)
 
 
@@ -69,6 +70,7 @@ def agent_settings(**overrides: int) -> AgentSettings:
         "agent_max_steps": MAX_STEPS,
         "agent_max_results_per_answer": MAX_RESULTS,
         "agent_max_output_tokens": 400,
+        "vocab_alias_review_min_users": REVIEW_MIN_USERS,
         "data_deletion_confirm_seconds": CONFIRM_SECONDS,
     }
     return AgentSettings(_env_file=None, **{**values, **overrides})  # type: ignore[arg-type]
@@ -179,6 +181,7 @@ def build_agent(
             normalizer,
             CONTENT_TYPES,
             alias_min_probability=RULES.alias_min_probability,
+            review_min_users=REVIEW_MIN_USERS,
         ),
         registry=CONTENT_TYPES,
         deletion_requests=deletion_requests or MemoryDeletionRequests(),
