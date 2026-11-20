@@ -277,7 +277,8 @@ class ResultLine:
     Attributes:
         position: The result's number, starting at 1.
         total: How many results the answer shows.
-        name: The item's name, e.g. "Kronotrop".
+        name: The item's name, e.g. "Kronotrop"; `None` for an item with no
+            name yet (e.g. one that is still being indexed).
         area: Where it is, e.g. "Beşiktaş", for places.
         details: Further values to show as given, e.g. ("Sci-fi",).
         open_now: Whether a place is open now; `None` when unknown or not a place.
@@ -287,7 +288,7 @@ class ResultLine:
 
     position: int
     total: int
-    name: str
+    name: str | None
     area: str | None = None
     details: tuple[str, ...] = ()
     open_now: bool | None = None
@@ -417,8 +418,11 @@ def result_reply(
     """
     if not 1 <= line.position <= line.total:
         raise ValueError("position must be between 1 and total")
-    place = line.name if line.area is None else f"{line.name}{wording.list_separator}{line.area}"
-    parts = [_with_emoji_before(line.emoji, f"{line.position}/{line.total}"), place, *line.details]
+    named = [part for part in (line.name, line.area) if part is not None]
+    parts = [_with_emoji_before(line.emoji, f"{line.position}/{line.total}")]
+    if named:
+        parts.append(wording.list_separator.join(named))
+    parts.extend(line.details)
     if line.open_now is not None:
         parts.append(wording.open_now if line.open_now else wording.closed_now)
     if line.link is not None:

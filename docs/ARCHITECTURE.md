@@ -184,7 +184,7 @@ Values are stored in one canonical form (English, lower case) with aliases in an
 
 **Corrections move one item; synonyms need evidence.**
 - When a user corrects an item ("no, it's a travel video"), **only that item changes**: its category becomes "travel video", through the same steps as above. "Car review" and "travel video" are **not** made synonyms, and no other item, the user's or anyone else's, is touched. Values the user sets by hand are marked as such in `raw_values` and are never re-normalized.
-- The correction is counted against the alias that produced the wrong value. A candidate alias that gets corrected is not verified. A verified alias that collects corrections from several users is flagged for review.
+- The correction is counted against the alias that produced the wrong value (`correction_count`). A candidate alias that gets corrected is not verified. A verified alias that collects `VOCAB_ALIAS_REVIEW_MIN_CORRECTIONS` corrections is flagged for review (logged as `vocabulary_alias_flagged_for_review`).
 - **Undoing a wrong alias:** we mark it `rejected`, which stops future matches. Only the items that were matched through it (recorded in their `ENRICHMENT_RUN` normalize step) are re-normalized from their own `raw_values`. Items the user corrected by hand keep the user's choice, also when the correction arrives while the models are working: the result is applied under the owner's lock, only where the item's wording and provenance haven't changed.
 
 **Places are global.** Location fields come from Google Places' address components for any country: country, region or state, city, district, neighbourhood, plus coordinates. "Restaurants in Beşiktaş", "cafés in Brooklyn" and "bars in Shibuya" work the same way. A filter can match any of those levels.
@@ -222,15 +222,17 @@ flowchart TD
 | Tool | What it does |
 |---|---|
 | `search_items(collection?, type?, category?, tags?, filters?, text?, platform?, saved_after?)` | Hybrid search. `filters` is checked against the type's fields (e.g. `{"area": "Beşiktaş"}`, `{"area": "Brooklyn"}`, `{"genre": "horror", "streaming": "Netflix"}`, `{"subject": "maths"}`); `category` and `tags` work for every item (e.g. `category="car review"`) |
-| `near(lat, lng, radius_m, subtype?, open_now?)` | PostGIS search around a point (places only) |
+| `near(lat, lng, radius_m, category?, tags?, text?, open_now?)` | PostGIS search around a point, for the types with a location filter (places only) |
 | `deep_look(item_ids, question)` | Fans out parallel subagents (see diagram) for questions the index can't answer |
-| `get_item(id)` | Full details: entity info, original post link, why we matched it |
-| `update_item(id, fields)` | Fix mistakes ("no, it's the Bebek branch", "it's a travel video"), add notes. Changes only this item and never adds a synonym (§3.4) |
-| `set_status(entity_id, status)` | Mark as visited / watched / read / done, or "want to" |
-| `resolve_choice(item_id, option)` | Handles the user's answer to a "which one?" question |
+| `get_item(item_id)` | Full details: open values with their paths, entity info and links, original post link, streaming in the user's country |
+| `update_item(item_id, path, value)` | Fix one open value ("it's a travel video"). Changes only this item and never adds a synonym (§3.4). Re-resolving an entity ("no, it's the Bebek branch") and notes come with the resolvers (SAV-15) |
+| `set_status(item_id, status, entity_position?)` | Mark the item's place or title as visited / watched / read / done, or "want to" (`USER_ENTITY.status`); `entity_position` picks one of a list post's entities |
+| `resolve_choice(item_id, option)` | Handles the user's answer to a "which one?" question (with SAV-15's pending choices) |
 | `list_memories()` / `forget_memory(id)` | "What do you remember about me?" / "Forget that" (§3.7) |
 
 **How results are shown: the saved reels come back.** When an answer lists saved items, the bot sends a short intro ("3 places in Beşiktaş from your Food collection 🍽"), then **one message per result that replies to the user's original share** (`reply_to.mid` = the item's `source_message_id`). Instagram shows the saved reel or post quoted above the bot's line, e.g. "1/3 · Kronotrop, Beşiktaş · open now · Maps link". This works for DM shares and for saves into a collaborative collection alike (decision record 0004). If an item has no message id (for example a later browser import), the bot falls back to the post link, which Instagram shows as a preview card, or to the name and Maps or TMDB link. Results are capped (e.g. 5 per answer) with "show more" for the rest. Replies only work inside the 24-hour window, which is always true when answering a question the user just asked.
+
+**The agent never touches the database.** Every tool is bound to the DM sender's `user_id` and country; no tool takes a user id from the model, and another user's item is answered like a missing one. The model's final answer is JSON (language, reply, notice, item ids) and is checked before it is sent: it may list only items the tools returned or the user's last results, it must carry a notice when search fell back (L1 "backup mode", L2 "broader results", or an incomplete search), and it must fit in one DM. The loop is capped at `AGENT_MAX_STEPS` model calls, and the last one may not call tools (decision record [0015](decisions/0015-response-agent.md)).
 
 Location for places in Phase 1: the user can type an area ("I'm in Beşiktaş") or share their location in the DM. Real "near me" alerts come with the mobile app.
 
@@ -395,6 +397,7 @@ Savely/
       messenger.py          # MessengerSettings
       pipeline.py           # PipelineSettings
       retrieval.py          # RetrievalSettings
+      agent.py              # AgentSettings
     logging_config.py       # structured (JSON) logging setup
     adapters/
       base.py               # CaptureEvent and ChatMessage
@@ -456,12 +459,14 @@ Savely/
         normalize.py        # vocabulary: exact hit, privacy gate, match-or-new
         open_values.py      # paths of open values; extraction → item columns
         renormalize.py      # reject an alias and re-normalize only its items
+        corrections.py      # a user's correction of one value of one item
       recovery/
         runs.py             # the item's row, status and steps in ENRICHMENT_RUN
         sweeper.py          # stuck-item sweeper: requeues or fails unfinished items, from Postgres
     agent/
-      agent.py              # response-agent loop
-      tools.py              # search_items, near, deep_look, set_status…
+      agent.py              # response-agent loop and answer checks
+      tools.py              # search_items, near, get_item, update_item, set_status… (the only DB access)
+      prompts.py            # versioned wording for the text model
       deep_look.py          # parallel subagents + write-back
       search/
         retrieval.py        # hybrid SQL + vector search, fallback ladder, time budget
@@ -474,6 +479,7 @@ Savely/
       replies/
         messenger.py        # send DM replies, incl. replies that quote a saved reel (reply_to)
         templates.py        # fixed DM wording: confirmation, "which one?", progress, error, result line
+        answers.py          # an answer: the intro, then one reply per result, with fallbacks
     memory/
       session.py            # short-term: history + working set (Redis)
       longterm.py           # extract → gate → consolidate → retrieve
