@@ -14,7 +14,7 @@ from dataclasses import dataclass
 
 import httpx
 
-from app.config import ModelSettings
+from app.config.models import ModelSettings
 from app.models.base import Classifier, Embedder, Generator, Transcriber
 from app.models.clients.chat_completions import ProviderPin
 from app.models.clients.decision import OpenRouterClassifier

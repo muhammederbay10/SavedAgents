@@ -12,7 +12,7 @@ SAV-4 creates the skeleton that every later ticket builds on. `docs/ARCHITECTURE
 
 1. **Structured logging uses the standard library.** `app/logging_config.py` installs one JSON handler on the root logger and routes uvicorn's server loggers through it. Fields are passed with `extra=`. `LOG_LEVEL` is enforced on the handler, so it also holds for libraries that set a level on their own loggers.
 2. **Postgres runs from our own small image.** `docker/postgres/Dockerfile` starts from the official `postgres:16-bookworm` image and installs `postgresql-16-postgis-3` and `postgresql-16-pgvector` from the PostgreSQL apt repository. Both extensions are enabled when the data volume is first created.
-3. **Settings have no defaults.** Every field in `app/config.py` must be set in the environment (or in `.env` locally). A missing variable stops the app at startup.
+3. **Settings have no defaults.** Every field in `app/config/` must be set in the environment (or in `.env` locally). A missing variable stops the app at startup.
 4. **The app is built by a factory.** `create_app()` in `app/main.py` takes optional settings. Uvicorn runs it with `--factory`, and tests pass their own settings.
 5. **Packaging is plain `pyproject.toml` with setuptools and pip.** Development tools are the `dev` extra. There is no lock file yet.
 6. **`GET /health` is a liveness check.** It reports that the process serves requests and does not contact Postgres or Redis.

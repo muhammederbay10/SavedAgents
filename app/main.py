@@ -13,7 +13,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 
 from app.api.webhooks import create_instagram_webhook_router
-from app.config import Settings, get_settings
+from app.config.base import Settings, get_settings
 from app.db.session import create_engine, create_session_factory
 from app.ingestion.jobs import ArqJobQueue, create_arq_redis
 from app.ingestion.service import IngestionService

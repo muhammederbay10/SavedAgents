@@ -190,7 +190,7 @@ The schema is defined twice, and a test keeps the two in step:
 | `alembic revision -m "add x"` | Start a new, empty migration to fill in by hand |
 | `alembic check` | Fail if the models and the database differ |
 
-Alembic reads `DATABASE_URL` and `EMBEDDING_DIMENSION` through `app/config.py`, from `.env` or the environment. Run it from the repository root.
+Alembic reads `DATABASE_URL` and `EMBEDDING_DIMENSION` through `app/config/base.py`, from `.env` or the environment. Run it from the repository root.
 
 The first migration creates the two embedding columns (`saved_item.embedding` and `vocabulary.embedding`) with `EMBEDDING_DIMENSION` components. The embedding model is `openai/text-embedding-3-large` at **1024 dimensions** (Muhammed's choice in SAV-7), so set `EMBEDDING_DIMENSION=1024`, as `.env.example` does. Both columns are then `vector(1024)`, and the database rejects a vector of any other length.
 
@@ -225,18 +225,18 @@ All configuration comes from environment variables. Locally they live in `.env`,
 | `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` | Docker Compose | Credentials and database name for the `db` container |
 | `API_PORT`, `POSTGRES_PORT`, `REDIS_PORT` | Docker Compose | Ports published on `127.0.0.1` |
 
-The API settings are defined in [`app/config.py`](app/config.py): `Settings` for the API and `MessengerSettings` for DM replies, which is only read when the bot sends a DM, so `/health` and the migrations don't need the token. None of them has a default, so the API refuses to start when one is missing or invalid. The error names the variable but never prints its value, because a URL can contain a password. The two secrets are also hidden when the settings are printed. Under Docker Compose, `DATABASE_URL` and `REDIS_URL` are built in `docker-compose.yml` from the `POSTGRES_*` values, so the two in `.env` are only used by `make run`.
+The API settings are defined in [`app/config/`](app/config/): `Settings` for the API (`base.py`) and `MessengerSettings` for DM replies (`messenger.py`), which is only read when the bot sends a DM, so `/health` and the migrations don't need the token. None of them has a default, so the API refuses to start when one is missing or invalid. The error names the variable but never prints its value, because a URL can contain a password. The two secrets are also hidden when the settings are printed. Under Docker Compose, `DATABASE_URL` and `REDIS_URL` are built in `docker-compose.yml` from the `POSTGRES_*` values, so the two in `.env` are only used by `make run`.
 
 ## DM replies
 
-[`app/agent/messenger.py`](app/agent/messenger.py) sends the bot's DMs through the Instagram Send API, and [`app/agent/reply_templates.py`](app/agent/reply_templates.py) holds the fixed wording (decision records [0004](docs/decisions/0004-reply-to-saved-reels.md) and [0011](docs/decisions/0011-dm-replies.md)). The indexing pipeline sends the save confirmation with them; the response agent (SAV-17) will send the rest.
+[`app/agent/replies/messenger.py`](app/agent/replies/messenger.py) sends the bot's DMs through the Instagram Send API, and [`app/agent/replies/templates.py`](app/agent/replies/templates.py) holds the fixed wording (decision records [0004](docs/decisions/0004-reply-to-saved-reels.md) and [0011](docs/decisions/0011-dm-replies.md)). The indexing pipeline sends the save confirmation with them; the response agent (SAV-17) will send the rest.
 
 ```python
 import httpx
 
-from app.agent.messenger import InstagramMessenger
-from app.agent.reply_templates import ResultLine, reply_wording, result_reply
-from app.config import get_messenger_settings
+from app.agent.replies.messenger import InstagramMessenger
+from app.agent.replies.templates import ResultLine, reply_wording, result_reply
+from app.config.messenger import get_messenger_settings
 
 wording = reply_wording(user.language, localized=agent_wording)  # see "Languages" below
 async with httpx.AsyncClient() as http_client:
@@ -305,7 +305,7 @@ Under Compose, the `worker` service runs the same command from the image, which 
 
 **Prompts** are in [`app/pipeline/prompts.py`](app/pipeline/prompts.py), in one `PipelinePrompts` object with a version. The version is stored with each step's result. Change the version with any change to the wording, and score the change on the eval set (AGENTS.md §4).
 
-The worker reads `Settings`, `ModelSettings`, `MessengerSettings` and `PipelineSettings` (all in [`app/config.py`](app/config.py)). The pipeline's own variables:
+The worker reads `Settings`, `ModelSettings`, `MessengerSettings` and `PipelineSettings` (in [`app/config/`](app/config/), one module per group). The pipeline's own variables:
 
 | Variable | Meaning |
 |---|---|
@@ -344,7 +344,7 @@ Every model call goes through [OpenRouter](https://openrouter.ai) with one key, 
 | `Embedder.embed` | Embeddings | `openai/text-embedding-3-large` (`EMBEDDING_MODEL`) at `EMBEDDING_DIMENSION` | `POST /api/v1/embeddings` |
 
 ```python
-from app.config import get_model_settings
+from app.config.models import get_model_settings
 from app.models.base import GenerationRequest, Message, YesNoQuestion
 from app.models.factory import build_model_clients, open_http_client
 
@@ -362,7 +362,7 @@ async with open_http_client(settings) as http_client:
     vectors = await models.embedder.embed(["a cosy café"])
 ```
 
-**The boundary.** Code outside `app/models/` imports only `app.models.base` (the interfaces), `app.models.errors` and `app.models.factory`. It never imports a model SDK, a client class or the HTTP transport. `tests/test_model_boundary.py` fails if it does.
+**The boundary.** Code outside `app/models/` imports only `app.models.base` (the interfaces), `app.models.errors` and `app.models.factory`. It never imports a model SDK, a client class or the HTTP transport. `tests/models/test_model_boundary.py` fails if it does.
 
 **In tests, use the fakes** in [`app/models/fakes.py`](app/models/fakes.py): `FakeClassifier`, `FakeTranscriber`, `FakeGenerator` and `FakeEmbedder`. They make no network call, return what the test scripted (or raise a scripted error), and record the calls they received.
 
@@ -410,7 +410,7 @@ No page says which zone serves the endpoint, and **no live call has confirmed th
 
 ### Model settings
 
-The model clients read these variables through `ModelSettings` in [`app/config.py`](app/config.py), with `get_model_settings()`. It is a separate class from the API's `Settings`: the API and the migrations call no model, so they start without these. The same rules apply: no variable has a default, and an error names the variable without printing its value. The values in `.env.example` are the approved models; only `OPENROUTER_API_KEY` needs a real value, and only for real model calls.
+The model clients read these variables through `ModelSettings` in [`app/config/models.py`](app/config/models.py), with `get_model_settings()`. It is a separate class from the API's `Settings`: the API and the migrations call no model, so they start without these. The same rules apply: no variable has a default, and an error names the variable without printing its value. The values in `.env.example` are the approved models; only `OPENROUTER_API_KEY` needs a real value, and only for real model calls.
 
 | Variable | Meaning |
 |---|---|
@@ -449,7 +449,7 @@ The text-model test also checks, from the reply's routing metadata, that the pin
 
 Every saved post gets an open **category** and **tags**, written by the text model in plain words and in any language ("restaurant", "car review", "ギターレッスン"). Nothing is picked from a list in code, and nothing is tied to a city, a country or a language (decision record 0005, SAV-26).
 
-A **built-in type** exists only where a kind of post gets extra behaviour: more fields, a resolver or more search filters. Each one is a module in `app/types/` that declares a `ContentType`, and [`app/types/registry.py`](app/types/registry.py) lists them. The rest of the code asks the registry and reads the declaration. It never checks for a type by name, and a test (`tests/test_content_type_registry.py`) fails if it does.
+A **built-in type** exists only where a kind of post gets extra behaviour: more fields, a resolver or more search filters. Each one is a module in `app/types/` that declares a `ContentType`, and [`app/types/registry.py`](app/types/registry.py) lists them. The rest of the code asks the registry and reads the declaration. It never checks for a type by name, and a test (`tests/types/test_content_type_registry.py`) fails if it does.
 
 | Built-in type | Fields added to the schema | Resolver | Extra search filters |
 |---|---|---|---|
@@ -499,7 +499,7 @@ Add a type only when it needs something that the open category can't give: its o
 3. **Keep values open.** Never add an enum or a list of real-world values (diets, cuisines, cities…). Use `NonEmptyText`, and mark a field whose values should be kept consistent: `diet: Annotated[NonEmptyText | None, Vocabulary("diet")]`. Write examples in the description, not rules, and don't assume a language or a country.
 4. **Declare the `ContentType`:** the name, a one-line description, the resolver name (or `None`) and the search filters. Give a `value` filter the same vocabulary field as the schema field it searches.
 5. **Register it:** add it to `CONTENT_TYPES` in `app/types/registry.py`. This is the only existing file you change.
-6. **Test it:** in `tests/test_content_type_schemas.py`, add a good example, values nobody listed in several languages, and malformed output. In `tests/test_content_type_registry.py`, add the expected resolver, filters and vocabulary fields.
+6. **Test it:** in `tests/types/test_content_type_schemas.py`, add a good example, values nobody listed in several languages, and malformed output. In `tests/types/test_content_type_registry.py`, add the expected resolver, filters and vocabulary fields.
 7. **Update the docs:** the table above and `docs/ARCHITECTURE.md` §3.4.
 
 A filter also declares its **source**, where search reads what it is checked against (`FilterSource`):
@@ -515,7 +515,7 @@ A declaration that can't work fails when the module is imported, with a `Content
 
 ## Search
 
-[`app/agent/retrieval.py`](app/agent/retrieval.py) searches one user's saves (ARCHITECTURE §3.5 and §3.6, decision record 0014). The response agent's tools (SAV-17) build a `SearchQuery` and call `HybridRetriever.search()`:
+[`app/agent/search/retrieval.py`](app/agent/search/retrieval.py) searches one user's saves (ARCHITECTURE §3.5 and §3.6, decision record 0014). The response agent's tools (SAV-17) build a `SearchQuery` and call `HybridRetriever.search()`:
 
 ```python
 result = await retriever.search(session, SearchQuery(
@@ -536,7 +536,7 @@ result.availability_gaps   # (movie, country) rows to fetch or refresh (SAV-15)
 
 Every step up the ladder is logged as `search_fallback` with its level and reason, never with the query's text. The whole search runs within `SEARCH_TIME_BUDGET_SECONDS`; when it runs out, the result has what was found and `incomplete=True`.
 
-The wording sent to the decision model is `RETRIEVAL_PROMPTS` in [`app/agent/prompts.py`](app/agent/prompts.py), version `2026-11-18.1`, approved by the owner. Any change to it bumps the version and is scored on the evaluation set.
+The wording sent to the decision model is `RETRIEVAL_PROMPTS` in [`app/agent/search/prompts.py`](app/agent/search/prompts.py), version `2026-11-18.1`, approved by the owner. Any change to it bumps the version and is scored on the evaluation set.
 
 A streaming filter matches a title only when it's watchable on that platform in the user's country without paying extra: listed under the offer kind `flatrate`, `free` or `ads` in `entity_availability.providers` (`{"<offer kind>": ["<provider name>", …]}`). `rent` and `buy` offers are stored for replies but never match.
 
@@ -549,14 +549,15 @@ A streaming filter matches a title only when it's watchable on that platform in 
 | `FILTER_NORMALIZATION_MAX_OPTIONS` | The most saved values offered to the decision model for one filter |
 | `AVAILABILITY_MAX_AGE_DAYS` | Streaming availability older than this is reported as stale for that country |
 
-They are read through `RetrievalSettings` in [`app/config.py`](app/config.py), with `get_retrieval_settings()`, with the same rules as the other settings classes.
+They are read through `RetrievalSettings` in [`app/config/retrieval.py`](app/config/retrieval.py), with `get_retrieval_settings()`, with the same rules as the other settings classes.
 
 ## Project layout
 
 ```
 app/
   main.py             # FastAPI app factory and GET /health
-  config.py           # settings from environment variables
+  config/             # settings from environment variables, one module per group:
+                      # base (the API's Settings), models, messenger, pipeline, retrieval
   logging_config.py   # JSON logging setup
   adapters/
     base.py           # CaptureEvent and ChatMessage: what every adapter outputs
@@ -579,15 +580,17 @@ app/
     openrouter/       # the shared HTTP transport, routing checks, JSON helpers
     clients/          # one client per model role
   agent/
-    messenger.py      # Instagram Send API client: DMs, quick replies, replies to saved reels
-    reply_templates.py # fixed DM wording in the user's language
-    retrieval.py      # hybrid search: normalize, filter, rank, fallback L1–L2, time budget
-    search_query.py   # SearchQuery, checked against the content types
-    search_conditions.py # SQL/PostGIS/pgvector conditions and rankings
-    saved_values.py   # a user's own values for a filter, ranked by meaning among them
-    filter_normalization.py # "netflx" → Netflix: exact hit, then the decision model
-    fallback.py       # fallback levels, reasons and their log line
-    prompts.py        # versioned wording for the decision model
+    search/
+      retrieval.py    # hybrid search: normalize, filter, rank, fallback L1–L2, time budget
+      query.py        # SearchQuery, checked against the content types
+      conditions.py   # SQL/PostGIS/pgvector conditions and rankings
+      saved_values.py # a user's own values for a filter, ranked by meaning among them
+      normalization.py # "netflx" → Netflix: exact hit, then the decision model
+      fallback.py     # fallback levels, reasons and their log line
+      prompts.py      # versioned wording for the decision model
+    replies/
+      messenger.py    # Instagram Send API client: DMs, quick replies, replies to saved reels
+      templates.py    # fixed DM wording in the user's language
   db/
     models.py         # SQLAlchemy models
     session.py        # the API's engine and session factory
@@ -596,7 +599,7 @@ app/
     migrations/       # Alembic environment and revisions
 alembic.ini           # Alembic configuration
 scripts/spikes/       # reproducible experiments behind decision records (see its README)
-tests/                # pytest suite
+tests/                # pytest suite, in folders that mirror app/
 docker/postgres/      # Postgres 16 image with PostGIS and pgvector
 docker-compose.yml    # local stack: db, redis, api, worker
 Dockerfile            # the image of the API and the worker

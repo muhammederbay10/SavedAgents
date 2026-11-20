@@ -9,7 +9,7 @@ from arq import Retry
 from arq.connections import ArqRedis
 from arq.jobs import Job
 
-from app.config import Settings
+from app.config.base import Settings
 from app.ingestion.jobs import INDEX_SAVED_ITEM_JOB, INDEXING_QUEUE, ArqJobQueue, index_job_id
 from app.pipeline.indexer import IndexOutcome, RetryLaterError
 from app.pipeline.recovery.runs import Step

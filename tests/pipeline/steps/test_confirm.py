@@ -4,7 +4,7 @@ from datetime import datetime
 
 import pytest
 
-from app.agent.messenger import (
+from app.agent.replies.messenger import (
     MessengerDeliveryUnknownError,
     OutgoingMessage,
     SendResult,

@@ -18,8 +18,8 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Final, Protocol
 
-from app.agent.messenger import MessengerError, OutgoingMessage, SendResult, SendStatus
-from app.agent.reply_templates import (
+from app.agent.replies.messenger import MessengerError, OutgoingMessage, SendResult, SendStatus
+from app.agent.replies.templates import (
     ReplyWording,
     ReplyWordingUnavailableError,
     SavedItemSummary,

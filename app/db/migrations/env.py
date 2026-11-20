@@ -1,7 +1,7 @@
 """Alembic environment: runs the migrations on the database from `DATABASE_URL`.
 
 Alembic imports this module for every command. Settings come from
-`app/config.py`, so migrations and the API always use the same database URL
+`app/config/base.py`, so migrations and the API always use the same database URL
 and embedding dimension.
 """
 
@@ -13,7 +13,7 @@ from sqlalchemy import Connection
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
-from app.config import get_settings
+from app.config.base import get_settings
 from app.db.models import Base
 from app.logging_config import configure_logging
 

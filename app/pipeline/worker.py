@@ -51,16 +51,11 @@ from arq.typing import StartupShutdown
 from arq.worker import Worker, func
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from app.agent.messenger import InstagramMessenger
-from app.config import (
-    SECONDS_PER_MINUTE,
-    PipelineSettings,
-    Settings,
-    get_messenger_settings,
-    get_model_settings,
-    get_pipeline_settings,
-    get_settings,
-)
+from app.agent.replies.messenger import InstagramMessenger
+from app.config.base import SECONDS_PER_MINUTE, Settings, get_settings
+from app.config.messenger import get_messenger_settings
+from app.config.models import get_model_settings
+from app.config.pipeline import PipelineSettings, get_pipeline_settings
 from app.db.session import create_engine, create_session_factory
 from app.ingestion.jobs import INDEX_SAVED_ITEM_JOB, INDEXING_QUEUE, ArqJobQueue
 from app.logging_config import configure_logging

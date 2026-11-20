@@ -13,8 +13,8 @@ from pathlib import Path
 import httpx
 
 from app.adapters.base import CaptureEvent
-from app.agent.messenger import OutgoingMessage, SendResult, SendStatus
-from app.config import PipelineSettings
+from app.agent.replies.messenger import OutgoingMessage, SendResult, SendStatus
+from app.config.pipeline import PipelineSettings
 from app.models.base import (
     Answer,
     ChoiceAnswer,

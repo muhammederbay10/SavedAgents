@@ -15,7 +15,7 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-from app.config import get_settings
+from app.config.base import get_settings
 from app.db.types import GeographyPoint, Vector
 
 revision: str = "0001"

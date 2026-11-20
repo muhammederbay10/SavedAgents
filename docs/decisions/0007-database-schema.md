@@ -15,7 +15,7 @@
 ## Decision
 
 1. **One migration creates the eleven Phase 1 tables:** `user`, `platform_account`, `saved_item`, `entity`, `entity_availability`, `item_entity`, `user_entity`, `enrichment_run`, `conversation_msg`, `vocabulary` and `vocabulary_alias`. `memory` comes in Phase 2. `user` is a reserved word in Postgres, so raw SQL must write it as `"user"`. SQLAlchemy does that by itself.
-2. **Migrations are written by hand, and a test compares them with the models.** `app/db/models.py` describes the tables for queries. `tests/test_migrations.py` runs `alembic check`, which fails when the models and a migrated database differ.
+2. **Migrations are written by hand, and a test compares them with the models.** `app/db/models.py` describes the tables for queries. `tests/db/test_migrations.py` runs `alembic check`, which fails when the models and a migrated database differ.
 3. **The embedding size is read from `EMBEDDING_DIMENSION` when the first migration runs.** It sizes both `saved_item.embedding` and `vocabulary.embedding`. The models leave the size out, and the database enforces it. The setting accepts 1 to 2000, because pgvector can't build an HNSW index on a larger `vector` column. The value is **1024**: Muhammed chose `openai/text-embedding-3-large` at 1024 dimensions in SAV-7 (P5). The size stays a setting and is not written into the migration or the models.
 4. **Which columns are required.**
    - Required: every id and owner reference, `platform`, an entity's `type`, `source`, `external_id` and `name`, the three `status` columns, the role and content of a conversation message, a vocabulary row's `field` and `value`, an alias's wording and the value it belongs to, and the country of an availability row.

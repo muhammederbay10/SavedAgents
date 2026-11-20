@@ -13,7 +13,7 @@ from sqlalchemy import URL
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
-from app.config import Settings
+from app.config.base import Settings
 from app.ingestion.jobs import create_arq_redis
 from app.ingestion.session_state import RedisIngestionState
 from app.main import create_app

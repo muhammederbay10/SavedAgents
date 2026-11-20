@@ -3,7 +3,7 @@ from collections.abc import AsyncIterator
 import httpx
 import pytest
 
-from app.config import ModelSettings
+from app.config.models import ModelSettings
 from app.models.base import (
     Audio,
     GenerationRequest,

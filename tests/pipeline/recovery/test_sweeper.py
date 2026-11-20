@@ -17,7 +17,7 @@ from arq.jobs import Job, JobStatus
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from app.config import Settings
+from app.config.base import Settings
 from app.db.deletion import delete_user_data
 from app.db.models import ItemStatus, SavedItem
 from app.ingestion.jobs import (

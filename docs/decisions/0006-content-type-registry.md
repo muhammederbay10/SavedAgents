@@ -28,7 +28,7 @@ The first version of this ticket declared closed lists: the 39 Istanbul district
 11. **`category` and `tags` are not declared as filters.** Search offers them for every item (§3.5), so a type only declares what it adds.
 12. **The decision model only picks the type.** A type's `description` is its option in that choice. The registry declares no subtype or tag questions any more, because subtypes and tags are open values and a decision model can only pick from fixed options.
 13. **The shared parts live in `app/types/base.py`.** The type modules import from it and the registry imports the type modules, so there is no import cycle. `base.py` is new in the §6 layout. It follows `adapters/base.py` and `models/base.py`.
-14. **A test guards the boundary.** `tests/test_content_type_registry.py` fails when code outside `app/types/` and `app/resolvers/` compares something with a type's name.
+14. **A test guards the boundary.** `tests/types/test_content_type_registry.py` fails when code outside `app/types/` and `app/resolvers/` compares something with a type's name.
 15. **Ruff accepts the dotless `ı`.** `pyproject.toml` sets `allowed-confusables = ["ı"]`. Without it, ruff reports names such as Kadıköy in the multilingual tests as a mistyped `i`.
 
 ## Open points
