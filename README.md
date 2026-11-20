@@ -59,3 +59,7 @@ Working today: the bot receives the posts and reels you share, indexes each one 
 - [Development](docs/development.md): set up, run and test Savely, and how each part works.
 - [Architecture](docs/ARCHITECTURE.md): the design, and the source of truth.
 - [Decision records](docs/decisions/): why things are the way they are.
+
+## License
+
+[MIT](./LICENSE)
