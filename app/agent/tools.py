@@ -462,10 +462,8 @@ class UserTools:
             ModelError: If a model call behind a tool failed.
             sqlalchemy.exc.SQLAlchemyError: If the database failed.
         """
-        logger.info(
-            "agent_tool_called",
-            extra={"user_id": str(self._context.user_id), "tool": tool_call.name},
-        )
+        # The tool's name only: a call may be the one that deletes the user.
+        logger.info("agent_tool_called", extra={"tool": tool_call.name})
         handlers: dict[str, Callable[[Mapping[str, object]], Awaitable[ToolOutcome]]] = {
             SEARCH_ITEMS_TOOL: lambda arguments: self._search_items(
                 SearchItemsArguments.model_validate(arguments)
@@ -679,7 +677,8 @@ class UserTools:
 
     async def _request_data_deletion(self, arguments: NoArguments) -> ToolOutcome:
         await self._deletion_requests.save(self._context.user_id, self._now())
-        logger.info("data_deletion_requested", extra={"user_id": str(self._context.user_id)})
+        # The event only, never who asked (owner update of 20 Nov 2026).
+        logger.info("data_deletion_requested")
         return ToolOutcome(
             content={"pending": True, "confirm_with": "the user's next message"},
             template=ReplyTemplate.DELETION_CONFIRMATION,

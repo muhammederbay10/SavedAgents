@@ -5,6 +5,7 @@ pgvector (`TEST_DATABASE_ADMIN_URL`) and Redis (`TEST_REDIS_URL`). Every id,
 text and file is synthetic.
 """
 
+import logging
 import uuid
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
@@ -393,3 +394,45 @@ async def test_erasing_an_unknown_user_changes_nothing(stores: Stores) -> None:
     eraser = UserDataEraser(stores.sessions, stores.outside_postgres())
 
     assert await eraser.erase(uuid.uuid4()) is None
+
+
+def logged_text(records: Sequence[logging.LogRecord]) -> str:
+    """Every message and every field of the records, as one text."""
+    return "\n".join(
+        f"{record.getMessage()} {' '.join(str(value) for value in vars(record).values())}"
+        for record in records
+    )
+
+
+async def test_deletion_logs_hold_only_events_and_counts(
+    stores: Stores, caplog: pytest.LogCaptureFixture
+) -> None:
+    user = await save_something(stores, LEAVING_SENDER_ID)
+    request_text = f"please erase everything {user.marker}"
+    confirm_text = f"yes, I am sure {user.marker}"
+    agent = stores.agent(
+        [REQUEST, final_answer("en", "…"), CONFIRM, final_answer("en", "Deleted.")]
+    )
+
+    try:
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG):
+            await answer(stores, agent, user, request_text)
+            await answer(stores, agent, user, confirm_text)
+
+        events = [record.getMessage() for record in caplog.records]
+        assert "data_deletion_requested" in events
+        assert "user_data_deleted" in events
+        logged = logged_text(caplog.records)
+        forbidden = {
+            "user id": str(user.user_id),
+            "user id (hex)": user.user_id.hex,
+            "item id": str(user.item_id),
+            "sender id": LEAVING_SENDER_ID,
+            "message marker": user.marker,
+            "request text": request_text,
+            "confirmation text": confirm_text,
+        }
+        assert [name for name, value in forbidden.items() if value in logged] == []
+    finally:
+        await clean_up(stores, user)

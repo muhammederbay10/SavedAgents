@@ -256,13 +256,11 @@ class ResponseAgent:
             final, problem = self._check_answer(result, state)
             if final is not None:
                 answer = await self._finish(final, state)
-                self._log_answer(turn, step, answer)
+                self._log_answer(step, answer)
                 return answer
             messages.append(Message(role="assistant", content=result.text))
             messages.append(Message(role="system", content=problem))
-        logger.warning(
-            "agent_step_limit_reached", extra={"user_id": str(turn.user_id), "steps": max_steps}
-        )
+        logger.warning("agent_step_limit_reached", extra={"steps": max_steps})
         raise AgentStepLimitError(f"no valid answer within {max_steps} steps")
 
     def _opening_messages(self, turn: AgentTurn) -> list[Message]:
@@ -376,11 +374,11 @@ class ResponseAgent:
         except (TypeError, ValueError) as error:
             raise AgentWordingError(f"unusable wording for language {language!r}") from error
 
-    def _log_answer(self, turn: AgentTurn, steps: int, answer: AgentAnswer) -> None:
+    def _log_answer(self, steps: int, answer: AgentAnswer) -> None:
+        # Counts and names only: a turn can end with the user deleted (record 0015).
         logger.info(
             "agent_answered",
             extra={
-                "user_id": str(turn.user_id),
                 "prompts_version": self._prompts.version,
                 "steps": steps,
                 "results": len(answer.messages.results),
