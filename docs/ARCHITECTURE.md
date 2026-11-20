@@ -498,7 +498,10 @@ Savely/
   Dockerfile                # image of the API and the indexing worker (with ffmpeg)
   Makefile                  # fmt, lint, typecheck, test, up
   pyproject.toml
+  README.md                 # product front page for visitors
+  assets/                   # the logo
   docs/ARCHITECTURE.md
+  docs/development.md       # setup, run, test and how each part works
   docs/decisions/           # decision records
 ```
 
