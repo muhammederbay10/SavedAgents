@@ -103,10 +103,10 @@ class AgentTurn:
         history: The conversation before this message, oldest first.
         working_set: The items of the user's last answer, in the order they
             were numbered, so "the second one" can be resolved.
-        deletion_confirmed: The platform reported an explicit confirmation of
-            the bot's deletion question with this message. How is the owner's
-            decision (record 0015, Q9); nothing sets it yet, and without it no
-            deletion runs, whatever the model does.
+        deletion_confirmed: This message is a tap on the deletion question's
+            "Yes, delete" button: the chat worker (SAV-18) sets it only when
+            `confirms_deletion(message.quick_reply_payload)` holds (record 0015,
+            Q9). Without it no deletion runs, whatever the model does.
     """
 
     user_id: uuid.UUID

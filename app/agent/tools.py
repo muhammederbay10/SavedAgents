@@ -185,9 +185,8 @@ class ToolContext:
         user_id: The sender of the DM.
         country: The sender's country (ISO 3166-1 alpha-2) from their profile;
             `None` if it is not known yet.
-        deletion_confirmed: The platform reported an explicit confirmation of
-            the bot's deletion question with this message. How is the owner's
-            decision (record 0015, Q9); without it no deletion runs.
+        deletion_confirmed: This message is a tap on the deletion question's
+            "Yes, delete" button (record 0015, Q9); without it no deletion runs.
     """
 
     user_id: uuid.UUID

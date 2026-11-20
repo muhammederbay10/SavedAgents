@@ -83,8 +83,8 @@ def _placeholders(field_name: str, template: str) -> frozenset[str]:
     return frozenset(names)
 
 
-# Proposed with SAV-17 and not yet approved by the owner. Change the version with
-# any change to the wording, and score the change on the eval set (SAV-19/20).
+# Approved for now by Muhammed on 2026-11-20 (record 0015, Q3); scored on the eval set
+# when SAV-19/20 exist. Change the version with any change to the wording.
 AGENT_PROMPTS: Final = AgentPrompts(
     version="2026-11-20.3",
     system=(

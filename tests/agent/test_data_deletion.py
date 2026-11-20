@@ -1,8 +1,12 @@
 """ "Delete my data" from the DM: two steps enforced in code, and one eraser for every store.
 
-The text model is scripted (fake). These tests need Postgres with PostGIS and
-pgvector (`TEST_DATABASE_ADMIN_URL`) and Redis (`TEST_REDIS_URL`). Every id,
-text and file is synthetic.
+The text model is scripted (fake), and in the adversarial tests it calls
+`confirm_data_deletion` when it should not. Only a tap on the "Yes, delete"
+button (`deletion_confirmed=True`, set by SAV-18's worker in production) on the
+user's next message, after the question was delivered and before its deadline,
+erases anything. These tests need Postgres with PostGIS and pgvector
+(`TEST_DATABASE_ADMIN_URL`) and Redis (`TEST_REDIS_URL`). Every id, text and
+file is synthetic.
 """
 
 import logging
