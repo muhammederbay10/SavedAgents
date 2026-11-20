@@ -10,6 +10,8 @@ from app.agent.replies.templates import (
     ReplyWordingUnavailableError,
     ResultLine,
     SavedItemSummary,
+    deletion_confirmation,
+    deletion_done,
     error_message,
     has_built_in_wording,
     import_progress,
@@ -45,6 +47,11 @@ JAPANESE = ReplyWording(
     open_now="営業中",
     closed_now="営業時間外",
     list_separator="、",
+    deletion_confirmation=(
+        "保存、メディア、会話、プロフィールをすべて削除します。元に戻せません。"
+        "{minutes}分以内に「はい」と返信してください。"
+    ),
+    deletion_done="すべてのデータを削除しました。また書けば最初から始まります。",
 )
 KRONOTROP = ResultLine(
     position=1,
@@ -106,6 +113,8 @@ def test_empty_language_is_refused(language: str) -> None:
         ("error", "Failed: {item}"),  # no placeholder allowed here
         ("none_of_these", "   "),
         ("list_separator", ""),
+        ("deletion_confirmation", "Reply yes to delete everything."),  # {minutes} missing
+        ("deletion_done", "Deleted {minutes} ago"),  # no placeholder allowed here
     ],
 )
 def test_supplied_wording_with_wrong_placeholders_or_empty_text_is_refused(
@@ -350,3 +359,17 @@ def test_every_template_uses_supplied_wording_for_a_third_language() -> None:
     )
     assert error_message(wording).text == JAPANESE.error
     assert result_reply(line, SAVED_MESSAGE_ID, wording).text == "1/2 · 一蘭、渋谷区 · 営業時間外"
+
+
+@pytest.mark.parametrize("language", ["en", "tr"])
+def test_deletion_confirmation_names_the_deadline_in_built_in_languages(language: str) -> None:
+    message = deletion_confirmation(10, reply_wording(language))
+
+    assert "10" in message.text
+    assert message.reply_to_message_id is None
+    assert message.quick_replies == ()
+
+
+def test_deletion_messages_in_supplied_wording() -> None:
+    assert deletion_confirmation(5, JAPANESE).text.endswith("5分以内に「はい」と返信してください。")
+    assert deletion_done(JAPANESE).text == JAPANESE.deletion_done

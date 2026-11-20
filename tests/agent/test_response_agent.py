@@ -37,6 +37,7 @@ from tests.agent.agent_support import (
     structured_reply,
     tool_calls,
     tool_results,
+    translated_wording,
 )
 from tests.agent.retrieval_support import (
     BEBEK,
@@ -492,19 +493,7 @@ async def test_a_language_without_built_in_wording_gets_translated_wording(
     question: str,
 ) -> None:
     meze = saves.items["meze"].id
-    translated = {
-        "saved_named": "«{item}»",
-        "saved_as": "«{category}»",
-        "streaming_on": "{platforms}",
-        "which_one": f"{language}: which one?",
-        "none_of_these": f"{language}: none",
-        "import_progress": "{done}/{total}",
-        "import_progress_with_counts": "{done}/{total} {counts}",
-        "error": f"{language}: error",
-        "open_now": f"{language}: open",
-        "closed_now": f"{language}: closed",
-        "list_separator": separator,
-    }
+    translated = translated_wording(language, separator)
     under_test = build_agent(
         session_factory,
         [

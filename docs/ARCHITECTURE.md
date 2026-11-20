@@ -228,6 +228,8 @@ flowchart TD
 | `update_item(item_id, path, value)` | Fix one open value ("it's a travel video"). Changes only this item and never adds a synonym (§3.4). Re-resolving an entity ("no, it's the Bebek branch") and notes come with the resolvers (SAV-15) |
 | `set_status(item_id, status, entity_position?)` | Mark the item's place or title as visited / watched / read / done, or "want to" (`USER_ENTITY.status`); `entity_position` picks one of a list post's entities |
 | `resolve_choice(item_id, option)` | Handles the user's answer to a "which one?" question (with SAV-15's pending choices) |
+| `request_data_deletion()` | "Delete my data", in any words or language: stores a pending request for the sender (`DATA_DELETION_CONFIRM_SECONDS`), and the bot sends a fixed confirmation question in the user's language |
+| `confirm_data_deletion()` | Deletes everything of the sender, only when **their previous message** made a request that hasn't expired. The request is taken out at the start of every turn, so "no" or any other message cancels it; enforced in code, not by the prompt. A final fixed "done" DM goes to the platform id read before the deletion |
 | `list_memories()` / `forget_memory(id)` | "What do you remember about me?" / "Forget that" (§3.7) |
 
 **How results are shown: the saved reels come back.** When an answer lists saved items, the bot sends a short intro ("3 places in Beşiktaş from your Food collection 🍽"), then **one message per result that replies to the user's original share** (`reply_to.mid` = the item's `source_message_id`). Instagram shows the saved reel or post quoted above the bot's line, e.g. "1/3 · Kronotrop, Beşiktaş · open now · Maps link". This works for DM shares and for saves into a collaborative collection alike (decision record 0004). If an item has no message id (for example a later browser import), the bot falls back to the post link, which Instagram shows as a preview card, or to the name and Maps or TMDB link. Results are capped (e.g. 5 per answer) with "show more" for the rest. Replies only work inside the 24-hour window, which is always true when answering a question the user just asked.
@@ -366,7 +368,7 @@ erDiagram
 - **`ENRICHMENT_RUN`** has one row per step of an item (`fetch`, `classify`, `transcribe`, `extract`, `normalize`, `embed`, `confirm`), with `status` `done`, `failed` or `skipped`. A failed step keeps an `error` with no content in it. The normalize step's `output` records, per path, the vocabulary field, the outcome (`exact_value`, `exact_alias`, `matched`, `new`, `private` or `undecided`), the value and alias it went through, and the match probability.
 - **`VOCABULARY`** holds one canonical value per `field` (category, tag, cuisine, genre, subject, exam…) in English lower case, with an `embedding` for matching new wordings; `(field, value)` is unique. It's shared by all users, grows from real saves, and holds only wording that passed the privacy gate (§3.4).
 - **`VOCABULARY_ALIAS`** holds other wordings of a value, in any language, each with a `status`: `candidate` (one decision-model match), `verified` (confirmed, used for exact hits) or `rejected` (a wrong match, never used again). `probability` is the best match confidence seen, and `correction_count` counts user corrections against it. Which items matched through an alias is recorded in their `ENRICHMENT_RUN` normalize step, not here.
-- **"Delete my data"** removes the user's items with their `raw_values` and enrichment runs, and lowers each value's `item_count`. The vocabulary keeps only gated, generic wording with no link to any user. A value no item uses any more can be cleaned up.
+- **"Delete my data"** goes through one eraser (`app/db/deletion.UserDataEraser`): first every store outside Postgres (ingestion's Redis state and queued jobs, a pending deletion request, stored media files), then the rows. If a store outside Postgres fails, Postgres is unchanged and the erasure can be repeated. Any new store of user data (short-term memory, SAV-18) joins this eraser. It removes the user's items with their `raw_values` and enrichment runs, and lowers each value's `item_count`. The vocabulary keeps only gated, generic wording with no link to any user. A value no item uses any more can be cleaned up.
 - Opening hours and ratings go out of date, so refresh `ENTITY.data` regularly (e.g. every 30 days), and also when the user asks for `open_now`. Streaming availability is refreshed per country (`ENTITY_AVAILABILITY`).
 - **Dedupe keys on `SAVED_ITEM`** (decision record 0007). A user's item is stored once per `(user_id, platform, platform_post_id)` and once per `(user_id, source_message_id)`, whichever of the two ids it has. `platform_post_id` and `post_url` may be empty: a reel saved into a collaborative collection has neither. Every item has at least a post id, a message id or a post link, and a missing value is never stored as empty text. The message-id key tells **messages apart, not reels**: the same reel saved through two messages (saved twice, or saved and also shared by DM) becomes two items, because nothing in the payloads links them.
 - Column-level choices (which columns may be empty, defaults, what is deleted with a user, index types) are in decision record 0007. The `MEMORY` table is created in Phase 2.
@@ -467,6 +469,7 @@ Savely/
       agent.py              # response-agent loop and answer checks
       tools.py              # search_items, near, get_item, update_item, set_status… (the only DB access)
       prompts.py            # versioned wording for the text model
+      deletion_requests.py  # pending "delete my data" requests (Redis), confirmed by the next message
       deep_look.py          # parallel subagents + write-back
       search/
         retrieval.py        # hybrid SQL + vector search, fallback ladder, time budget
@@ -487,7 +490,7 @@ Savely/
       models.py             # SQLAlchemy models for the tables in §4
       session.py            # the API's engine and session factory
       types.py              # column types for pgvector and PostGIS
-      deletion.py           # "delete my data": removes a user's rows, lowers vocabulary counts
+      deletion.py           # "delete my data": the one eraser of every store, then the user's rows
       migrations/           # Alembic environment and revisions
   evals/
     labeled_saves.jsonl     # ~100 hand-labeled saves for model comparison

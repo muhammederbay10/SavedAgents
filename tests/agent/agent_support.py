@@ -6,16 +6,19 @@ final answer, so the agent's loop and the tools run for real, offline.
 
 import json
 import uuid
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.agent.agent import ResponseAgent
+from app.agent.deletion_requests import DeletionRequests
 from app.agent.prompts import AGENT_PROMPTS
 from app.agent.search.retrieval import HybridRetriever
 from app.agent.tools import Toolbox
 from app.config.agent import AgentSettings
+from app.db.deletion import UserDataEraser, UserDataOutsidePostgres
 from app.models.base import GenerationRequest, GenerationResult, ToolCall
 from app.models.errors import ModelError
 from app.models.fakes import FakeEmbedder, FakeGenerator
@@ -32,6 +35,36 @@ TEXT_MODEL = "fake/text"
 MAX_STEPS = 5
 MAX_RESULTS = 5
 REVIEW_MIN_CORRECTIONS = 2
+CONFIRM_SECONDS = 600
+TURN_TIME = datetime(2026, 11, 20, 12, 0, tzinfo=UTC)
+
+
+@dataclass
+class FakeClock:
+    """A clock that only moves when a test moves it."""
+
+    now: datetime = TURN_TIME
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += timedelta(seconds=seconds)
+
+
+@dataclass
+class MemoryDeletionRequests(DeletionRequests):
+    """Pending deletion requests in memory, with the same rules as the Redis store."""
+
+    lifetime: timedelta = timedelta(seconds=CONFIRM_SECONDS)
+    requests: dict[uuid.UUID, datetime] = field(default_factory=dict)
+
+    async def save(self, user_id: uuid.UUID, requested_at: datetime) -> None:
+        self.requests[user_id] = requested_at
+
+    async def take(self, user_id: uuid.UUID, now: datetime) -> bool:
+        requested_at = self.requests.pop(user_id, None)
+        return requested_at is not None and now - requested_at < self.lifetime
 
 
 def agent_settings(**overrides: int) -> AgentSettings:
@@ -40,6 +73,7 @@ def agent_settings(**overrides: int) -> AgentSettings:
         "agent_max_results_per_answer": MAX_RESULTS,
         "agent_max_output_tokens": 400,
         "vocab_alias_review_min_corrections": REVIEW_MIN_CORRECTIONS,
+        "data_deletion_confirm_seconds": CONFIRM_SECONDS,
     }
     return AgentSettings(_env_file=None, **{**values, **overrides})  # type: ignore[arg-type]
 
@@ -84,6 +118,25 @@ def structured_reply(structured: Mapping[str, object]) -> GenerationResult:
     )
 
 
+def translated_wording(language: str, separator: str = ", ") -> dict[str, str]:
+    """What the model answers when asked for the bot's fixed words in `language`."""
+    return {
+        "saved_named": "«{item}»",
+        "saved_as": "«{category}»",
+        "streaming_on": "{platforms}",
+        "which_one": f"{language}: which one?",
+        "none_of_these": f"{language}: none",
+        "import_progress": "{done}/{total}",
+        "import_progress_with_counts": "{done}/{total} {counts}",
+        "error": f"{language}: error",
+        "open_now": f"{language}: open",
+        "closed_now": f"{language}: closed",
+        "list_separator": separator,
+        "deletion_confirmation": f"{language}: delete everything? yes within {{minutes}} min",
+        "deletion_done": f"{language}: everything deleted",
+    }
+
+
 def tool_results(request: GenerationRequest) -> list[dict[str, object]]:
     """The JSON of every tool result the model was shown in a request."""
     return [
@@ -104,6 +157,9 @@ def build_agent(
     *,
     retriever: HybridRetriever | None = None,
     classifier: ScriptedClassifier | None = None,
+    deletion_requests: DeletionRequests | None = None,
+    outside_postgres: Sequence[UserDataOutsidePostgres] = (),
+    clock: Callable[[], datetime] | None = None,
     **settings: int,
 ) -> AgentUnderTest:
     """The agent with real tools on the test database and a scripted text model."""
@@ -127,6 +183,9 @@ def build_agent(
             review_min_corrections=REVIEW_MIN_CORRECTIONS,
         ),
         registry=CONTENT_TYPES,
+        deletion_requests=deletion_requests or MemoryDeletionRequests(),
+        eraser=UserDataEraser(sessions, outside_postgres),
+        now=clock or FakeClock(),
     )
     agent = ResponseAgent(
         generator=generator,

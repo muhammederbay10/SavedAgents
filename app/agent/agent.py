@@ -14,6 +14,10 @@ One answer is a loop of at most `AGENT_MAX_STEPS` model calls:
 4. The last call may not call tools, so the loop ends with an answer or an
    explicit error.
 
+**Fixed messages.** The "delete my data" tools ask for a fixed message in the
+user's language (`ReplyTemplate`). It replaces the model's reply, so the
+confirmation question and the "done" message always say the same thing.
+
 The items are capped at `AGENT_MAX_RESULTS_PER_ANSWER`; the rest are kept for
 "show more". Each shown item becomes a reply quoting the saved post
 (`app/agent/replies/answers.py`, decision record 0004).
@@ -26,6 +30,7 @@ it between messages is short-term memory (SAV-18).
 
 import json
 import logging
+import math
 import uuid
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field, fields
@@ -38,9 +43,19 @@ from app.agent.replies.messenger import MAX_TEXT_BYTES
 from app.agent.replies.templates import (
     ReplyWording,
     ReplyWordingUnavailableError,
+    deletion_confirmation,
+    deletion_done,
     reply_wording,
 )
-from app.agent.tools import AvailabilityGap, Notice, Toolbox, ToolContext, UserTools
+from app.agent.tools import (
+    AvailabilityGap,
+    Notice,
+    PlatformRecipient,
+    ReplyTemplate,
+    Toolbox,
+    ToolContext,
+    UserTools,
+)
 from app.config.agent import AgentSettings
 from app.models.base import (
     GenerationRequest,
@@ -56,6 +71,7 @@ _ANSWER_SCHEMA_NAME = "answer"
 _WORDING_SCHEMA_NAME = "reply_wording"
 # The built-in wording that a translation starts from.
 _SOURCE_LANGUAGE = "en"
+_SECONDS_PER_MINUTE = 60
 
 
 class AgentError(Exception):
@@ -102,6 +118,9 @@ class AgentAnswer:
         notices: What the intro had to say about how results were found.
         more_item_ids: Results beyond the cap, for "show more".
         availability_gaps: Streaming availability the resolver should fetch (SAV-15).
+        deleted_recipients: Set when the user's data was deleted in this turn:
+            where to send `messages`, read before the deletion, because the
+            user's platform accounts are gone now.
     """
 
     language: str
@@ -109,6 +128,7 @@ class AgentAnswer:
     notices: frozenset[Notice]
     more_item_ids: tuple[uuid.UUID, ...]
     availability_gaps: tuple[AvailabilityGap, ...]
+    deleted_recipients: tuple[PlatformRecipient, ...] = ()
 
     @property
     def working_set(self) -> tuple[uuid.UUID, ...]:
@@ -171,6 +191,8 @@ class _Turn:
     allowed_item_ids: set[uuid.UUID]
     notices: set[Notice] = field(default_factory=set)
     availability_gaps: dict[tuple[uuid.UUID, str], AvailabilityGap] = field(default_factory=dict)
+    template: ReplyTemplate | None = None
+    deleted_recipients: tuple[PlatformRecipient, ...] = ()
 
 
 class ResponseAgent:
@@ -214,6 +236,7 @@ class ResponseAgent:
             sqlalchemy.exc.SQLAlchemyError: If the database failed behind a tool.
         """
         tools = self._toolbox.for_user(ToolContext(user_id=turn.user_id, country=turn.country))
+        await tools.begin_turn()
         state = _Turn(tools=tools, allowed_item_ids=set(turn.working_set))
         messages = self._opening_messages(turn)
         max_steps = self._settings.agent_max_steps
@@ -266,6 +289,10 @@ class ResponseAgent:
             state.notices.update(outcome.notices)
             for gap in outcome.availability_gaps:
                 state.availability_gaps[(gap.entity_id, gap.country)] = gap
+            if outcome.template is not None:
+                state.template = outcome.template
+            if outcome.deleted_recipients:
+                state.deleted_recipients = outcome.deleted_recipients
             messages.append(
                 Message(role="tool", content=outcome.as_json(), tool_call_id=tool_call.id)
             )
@@ -288,6 +315,8 @@ class ResponseAgent:
         return final, ""
 
     async def _finish(self, final: _FinalAnswer, state: _Turn) -> AgentAnswer:
+        if state.template is not None:
+            return await self._fixed_answer(final.language, state)
         cards = await state.tools.result_cards(final.item_ids)
         cap = self._settings.agent_max_results_per_answer
         shown: tuple[ResultCard, ...] = cards[:cap]
@@ -298,6 +327,23 @@ class ResponseAgent:
             notices=frozenset(state.notices),
             more_item_ids=tuple(card.item_id for card in cards[cap:]),
             availability_gaps=tuple(state.availability_gaps.values()),
+        )
+
+    async def _fixed_answer(self, language: str, state: _Turn) -> AgentAnswer:
+        """Answer with the fixed message a tool asked for, in the user's language."""
+        wording = await self._wording(language)
+        if state.template is ReplyTemplate.DELETION_CONFIRMATION:
+            minutes = math.ceil(self._settings.data_deletion_confirm_seconds / _SECONDS_PER_MINUTE)
+            text = deletion_confirmation(minutes, wording).text
+        else:
+            text = deletion_done(wording).text
+        return AgentAnswer(
+            language=language,
+            messages=AnswerMessages(intro=text, results=(), wording=wording),
+            notices=frozenset(),
+            more_item_ids=(),
+            availability_gaps=(),
+            deleted_recipients=state.deleted_recipients,
         )
 
     async def _wording(self, language: str) -> ReplyWording:

@@ -21,7 +21,8 @@ Two parts of the ticket depend on tickets that have not started: `resolve_choice
 7. **Working set (proposal for SAV-18).** `AgentTurn.working_set` is the ordered ids of the user's last answer, and `AgentAnswer.working_set` the ordered ids of this one, shown and "show more" alike. The agent shows the model the list by number, so "the second one" is resolved by the model to an id. The agent keeps nothing between messages; storing the list is SAV-18's.
 8. **Corrections** (`app/pipeline/vocabulary/corrections.py`) normalize the user's wording through the vocabulary's normal steps, put it on that item only with `user_set: true` in `raw_values`, and replace the path's provenance in the normalize step. The alias that produced the old value gets `correction_count + 1`. `verify_alias` now refuses a candidate with any correction. A verified alias reaching `VOCAB_ALIAS_REVIEW_MIN_CORRECTIONS` is logged as `vocabulary_alias_flagged_for_review`; there is no review column.
 9. **Links.** The Maps or TMDB link is read from `entity.data["link"]`. The resolvers (SAV-15) store it there: Google Places returns `googleMapsUri`, and the TMDB page URL is built from the title's id. The agent builds no URL itself.
-10. **Prompt wording** lives in `app/agent/prompts.py` as `AGENT_PROMPTS`, version `2026-11-20.1`, proposed and not yet approved by the owner (Q3 below).
+10. **"Delete my data" from the DM** (owner update of 20 Nov 2026). `request_data_deletion` stores a pending request in Redis (`app/agent/deletion_requests.py`, one key per user, expiring after `DATA_DELETION_CONFIRM_SECONDS`) and answers with the fixed `deletion_confirmation` template. `UserTools.begin_turn` takes the request out at the start of **every** turn, so only the user's next message can confirm it, a request made in the same turn never counts, and "no" or any other message cancels it. `confirm_data_deletion` takes no arguments; it reads the sender's platform ids, then runs `UserDataEraser` (`app/db/deletion.py`): every store outside Postgres in order (ingestion's Redis state and jobs, the pending request, the media store), then `delete_user_data`, in one transaction under the user's row lock. The answer is the fixed `deletion_done` template, sent to `AgentAnswer.deleted_recipients`. Both templates are new `ReplyWording` fields with built-in English and Turkish, and go through the same translation as the other fields for any other language.
+11. **Prompt wording** lives in `app/agent/prompts.py` as `AGENT_PROMPTS`, version `2026-11-20.2`, proposed and not yet approved by the owner (Q3 below).
 
 ## For Muhammed
 
@@ -29,11 +30,12 @@ Two parts of the ticket depend on tickets that have not started: `resolve_choice
 |---|---|---|
 | Q1 | `resolve_choice` is not built | Jarvis asked for a proposal first. Proposal: SAV-15 stores each pending "which one?" question with its item id and candidate ids, and the quick reply's payload is `choice:<item id>:<candidate number>`; `resolve_choice(item_id, option)` then links the chosen candidate as the item's entity, or marks "none of these". SAV-15 or a follow-up adds it |
 | Q2 | The working set is an input and an output of the agent (point 7) | Without SAV-18 the test passes the last results in. Another option: SAV-18 stores it in Redis and a tool reads it; the agent's contract would stay the same |
-| Q3 | Prompt wording version `2026-11-20.1` is new and not approved | There is no eval set for the agent yet (SAV-19/20), so there are no before/after numbers. The tests only use a fake model |
+| Q3 | Prompt wording version `2026-11-20.2` is new and not approved | There is no eval set for the agent yet (SAV-19/20), so there are no before/after numbers. The tests only use a fake model |
 | Q4 | A verified alias is "flagged" by a log line, counted by corrections, not by distinct users | §3.4 says "corrections from several users". Counting users needs a new table or column; the count is a first step. Review can query `status = 'verified' AND correction_count >= N` |
 | Q5 | No chat worker yet | Ingestion queues `answer_chat_message` jobs, but nothing runs them. The worker needs the history and working set (SAV-18) and the user's IGSID and last message time. Suggest it with SAV-18, or a small follow-up ticket |
 | Q6 | `set_status(item_id, status, entity_position?)` instead of §3.5's `set_status(entity_id, status)` | The model only sees item ids; a list post needs a position. Items without an entity (study posts) can't store a status: `USER_ENTITY` needs an entity. Should study items get a "done" status elsewhere? |
 | Q7 | Whether Instagram showed the quote cannot be seen | Meta answers 200 with a message id either way. Only a refused reply falls back. Record 0004 leaves old or deleted messages untested |
+| Q9 | The model decides whether a message means "delete my data" or "yes" | There is no keyword list (owner update). Code guarantees the two steps, the sender and the expiry; a model that misreads an unrelated message right after the question as "yes" could still confirm. A quick-reply "Yes, delete" button with a fixed payload would remove that risk; it needs the chat worker (Q5) to route the payload |
 | Q8 | `entity.data["link"]` as SAV-15's storage contract (point 9) | Alternative: build the Maps and TMDB URLs in code from `(source, external_id)`; that is resolver logic outside `app/resolvers/` |
 
 ## Alternatives considered
@@ -48,5 +50,6 @@ Two parts of the ticket depend on tickets that have not started: `resolve_choice
 
 - **SAV-15:** stores `entity.data["link"]`, and fetches the rows in `AgentAnswer.availability_gaps`. `resolve_choice` per Q1.
 - **SAV-18:** stores `AgentAnswer.working_set` and the conversation, passes them in `AgentTurn`, and stores the user's country once asked.
-- **New settings:** `AGENT_MAX_STEPS`, `AGENT_MAX_RESULTS_PER_ANSWER`, `AGENT_MAX_OUTPUT_TOKENS`, `VOCAB_ALIAS_REVIEW_MIN_CORRECTIONS`.
+- **New settings:** `AGENT_MAX_STEPS`, `AGENT_MAX_RESULTS_PER_ANSWER`, `AGENT_MAX_OUTPUT_TOKENS`, `VOCAB_ALIAS_REVIEW_MIN_CORRECTIONS`, `DATA_DELETION_CONFIRM_SECONDS`.
+- **SAV-18** adds its Redis keys (history, working set) to `UserDataEraser`'s stores.
 - **Costs:** one text-model call per step; one more per answer only for a language without built-in wording.

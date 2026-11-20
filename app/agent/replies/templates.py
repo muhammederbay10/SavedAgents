@@ -1,8 +1,9 @@
 """The fixed wording of the bot's DMs, in the user's language.
 
-Five messages have fixed wording: the save confirmation, the "which one?"
-question, import progress, the error message and one line per search result
-(`docs/ARCHITECTURE.md` §3.3 and §3.5, decision record 0004). Everything else
+Seven messages have fixed wording: the save confirmation, the "which one?"
+question, import progress, the error message, one line per search result
+(`docs/ARCHITECTURE.md` §3.3 and §3.5, decision record 0004), and the two
+messages of "delete my data": the confirmation question and the final "done". Everything else
 the bot says is written by the response agent (SAV-17).
 
 **Caller contract.** Every template takes a `ReplyWording`: the bot's own words
@@ -40,6 +41,7 @@ _PLACEHOLDERS: Final[dict[str, frozenset[str]]] = {
     "streaming_on": frozenset({"platforms"}),
     "import_progress": frozenset({"done", "total"}),
     "import_progress_with_counts": frozenset({"done", "total", "counts"}),
+    "deletion_confirmation": frozenset({"minutes"}),
 }
 
 
@@ -87,6 +89,11 @@ class ReplyWording:
         open_now: Said of a place that is open now.
         closed_now: Said of a place that is closed now.
         list_separator: Joins values in a list, e.g. ", " or "、".
+        deletion_confirmation: Asks the user to confirm "delete my data": it
+            names what goes (all saves, stored media, the conversation, the
+            profile), says it can't be undone, and how to confirm; `{minutes}`
+            is how long the request waits.
+        deletion_done: Says the data was deleted and that writing again starts fresh.
     """
 
     saved_named: str
@@ -100,6 +107,8 @@ class ReplyWording:
     open_now: str
     closed_now: str
     list_separator: str
+    deletion_confirmation: str
+    deletion_done: str
 
     def __post_init__(self) -> None:
         """Reject empty wording and wrong placeholders.
@@ -155,6 +164,12 @@ _BUILT_IN_WORDINGS: Final[dict[str, ReplyWording]] = {
         open_now="open now",
         closed_now="closed now",
         list_separator=", ",
+        deletion_confirmation=(
+            "This deletes all your saves, their stored media, our conversation and your "
+            'profile. It can\'t be undone. To confirm, reply "yes" within {minutes} minutes; '
+            "anything else cancels it."
+        ),
+        deletion_done=("Done: all your data is deleted. If you write again, you start fresh."),
     ),
     "tr": ReplyWording(
         saved_named="Kaydedildi: {item}",
@@ -168,6 +183,12 @@ _BUILT_IN_WORDINGS: Final[dict[str, ReplyWording]] = {
         open_now="şu an açık",
         closed_now="şu an kapalı",
         list_separator=", ",
+        deletion_confirmation=(
+            "Bu işlem tüm kayıtlarını, saklanan medyalarını, konuşmamızı ve profilini siler. "
+            'Geri alınamaz. Onaylamak için {minutes} dakika içinde "evet" yaz; başka bir '
+            "mesaj işlemi iptal eder."
+        ),
+        deletion_done=("Tamam: tüm verilerin silindi. Tekrar yazarsan sıfırdan başlarsın."),
     ),
 }
 
@@ -393,6 +414,31 @@ def error_message(wording: ReplyWording) -> OutgoingMessage:
         A short apology that asks the user to try again later.
     """
     return OutgoingMessage(text=wording.error)
+
+
+def deletion_confirmation(minutes: int, wording: ReplyWording) -> OutgoingMessage:
+    """Build the question that asks the user to confirm "delete my data".
+
+    Args:
+        minutes: How long the request waits for the confirmation.
+        wording: The bot's words in the user's language, from `reply_wording`.
+
+    Returns:
+        What is deleted, that it can't be undone, and how to confirm.
+    """
+    return OutgoingMessage(text=wording.deletion_confirmation.format(minutes=minutes))
+
+
+def deletion_done(wording: ReplyWording) -> OutgoingMessage:
+    """Build the last message after the user's data was deleted.
+
+    Args:
+        wording: The bot's words in the user's language, from `reply_wording`.
+
+    Returns:
+        That the data is gone and that writing again starts fresh.
+    """
+    return OutgoingMessage(text=wording.deletion_done)
 
 
 def result_reply(

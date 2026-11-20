@@ -10,11 +10,19 @@ searching and the writing:
 | `get_item` | One item's details: what it is, where, links, streaming in the user's country |
 | `update_item` | Correct one open value of one item; it never creates a synonym |
 | `set_status` | Mark the real thing behind an item as done (visited, watched…) or wanted |
+| `request_data_deletion` | Start "delete my data": store a request; the bot asks to confirm |
+| `confirm_data_deletion` | Delete everything of the sender, if their previous message asked |
 
 **Ownership comes from the DM, never from the model.** `Toolbox.for_user` binds
 the tools to the sender's `user_id` and country. No tool takes a user id as an
 argument, and an item id of another user is answered exactly like a missing
 one.
+
+**Deleting takes two steps, enforced here, not by the prompt.** A pending
+request is taken out at the start of every turn (`begin_turn`), so only the
+user's very next message can confirm it, within `DATA_DELETION_CONFIRM_SECONDS`;
+"no" or any other message cancels it. A request made in the same turn never
+counts, so the model can't delete in one go.
 
 **Arguments are checked** against each tool's schema, and search filters
 against the content type's declared filters (`plan_search`). A wrong argument
@@ -27,6 +35,7 @@ import logging
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Annotated, Final, Literal
 
@@ -35,6 +44,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.agent.deletion_requests import DeletionRequests
 from app.agent.replies.answers import ResultCard
 from app.agent.search.fallback import FallbackLevel
 from app.agent.search.normalization import NormalizationMethod
@@ -49,12 +59,14 @@ from app.agent.search.query import (
 # Re-exported, so the agent hands gaps on to the resolver without importing search itself.
 from app.agent.search.retrieval import AvailabilityGap as AvailabilityGap
 from app.agent.search.retrieval import HybridRetriever, SearchResult
+from app.db.deletion import UserDataEraser
 from app.db.models import (
     Entity,
     EntityAvailability,
     EntityStatus,
     ItemEntity,
     ItemStatus,
+    PlatformAccount,
     SavedItem,
     UserEntity,
 )
@@ -78,6 +90,8 @@ NEAR_TOOL: Final = "near"
 GET_ITEM_TOOL: Final = "get_item"
 UPDATE_ITEM_TOOL: Final = "update_item"
 SET_STATUS_TOOL: Final = "set_status"
+REQUEST_DATA_DELETION_TOOL: Final = "request_data_deletion"
+CONFIRM_DATA_DELETION_TOOL: Final = "confirm_data_deletion"
 
 _NOT_FOUND: Final = "The user has no saved item with that id."
 _ASK_USER_FOR: Final = "ask_user_for"
@@ -100,6 +114,35 @@ class Notice(StrEnum):
     BACKUP_MODE = "backup_mode"
     BROADER_RESULTS = "broader_results"
     MAY_BE_INCOMPLETE = "may_be_incomplete"
+
+
+class ReplyTemplate(StrEnum):
+    """A fixed message that replaces the model's reply, in the user's language.
+
+    Attributes:
+        DELETION_CONFIRMATION: Asks the user to confirm "delete my data".
+        DELETION_DONE: Says the user's data is deleted.
+    """
+
+    DELETION_CONFIRMATION = "deletion_confirmation"
+    DELETION_DONE = "deletion_done"
+
+
+@dataclass(frozen=True)
+class PlatformRecipient:
+    """Where the last DM goes after a user's data, platform accounts included, is deleted.
+
+    Attributes:
+        platform: e.g. `instagram`.
+        platform_user_id: The user's id on that platform, e.g. the IGSID.
+    """
+
+    platform: str
+    platform_user_id: str = field(repr=False)
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
 
 
 @dataclass(frozen=True)
@@ -126,12 +169,17 @@ class ToolOutcome:
             The answer may only list these and the working set.
         notices: What the reply must tell the user about the results.
         availability_gaps: Streaming availability for the resolver to fetch (SAV-15).
+        template: A fixed message that replaces the model's reply, if any.
+        deleted_recipients: Where to send the last DM, when the user was just
+            deleted; read before the deletion.
     """
 
     content: Mapping[str, object] = field(repr=False)
     offered_item_ids: tuple[uuid.UUID, ...] = ()
     notices: frozenset[Notice] = frozenset()
     availability_gaps: tuple[AvailabilityGap, ...] = ()
+    template: ReplyTemplate | None = None
+    deleted_recipients: tuple[PlatformRecipient, ...] = ()
 
     def as_json(self) -> str:
         """Return the content as the JSON text the model reads."""
@@ -228,6 +276,10 @@ class SetStatusArguments(_Arguments):
     )
 
 
+class NoArguments(_Arguments):
+    """The arguments of a tool that takes none. The user is always the DM's sender."""
+
+
 class Toolbox:
     """Everything the tools need, shared by every user; `for_user` binds it to one sender."""
 
@@ -238,6 +290,9 @@ class Toolbox:
         retriever: HybridRetriever,
         corrections: ItemCorrection,
         registry: ContentTypeRegistry,
+        deletion_requests: DeletionRequests,
+        eraser: UserDataEraser,
+        now: Callable[[], datetime] = _utc_now,
     ) -> None:
         """Create the toolbox.
 
@@ -246,11 +301,17 @@ class Toolbox:
             retriever: The hybrid search.
             corrections: Applies a user's correction to one item.
             registry: The built-in content types, for filters and schemas.
+            deletion_requests: Pending "delete my data" requests.
+            eraser: Erases a user everywhere.
+            now: The clock, for the requests' expiry.
         """
         self._sessions = sessions
         self._retriever = retriever
         self._corrections = corrections
         self._registry = registry
+        self._deletion_requests = deletion_requests
+        self._eraser = eraser
+        self._now = now
 
     def for_user(self, context: ToolContext) -> "UserTools":
         """Return the tools of one sender.
@@ -267,6 +328,9 @@ class Toolbox:
             retriever=self._retriever,
             corrections=self._corrections,
             registry=self._registry,
+            deletion_requests=self._deletion_requests,
+            eraser=self._eraser,
+            now=self._now,
         )
 
 
@@ -281,6 +345,9 @@ class UserTools:
         retriever: HybridRetriever,
         corrections: ItemCorrection,
         registry: ContentTypeRegistry,
+        deletion_requests: DeletionRequests,
+        eraser: UserDataEraser,
+        now: Callable[[], datetime],
     ) -> None:
         """Create the tools; use `Toolbox.for_user`.
 
@@ -290,12 +357,32 @@ class UserTools:
             retriever: The hybrid search.
             corrections: Applies a user's correction to one item.
             registry: The built-in content types.
+            deletion_requests: Pending "delete my data" requests.
+            eraser: Erases a user everywhere.
+            now: The clock.
         """
         self._context = context
         self._sessions = sessions
         self._retriever = retriever
         self._corrections = corrections
         self._registry = registry
+        self._deletion_requests = deletion_requests
+        self._eraser = eraser
+        self._now = now
+        self._deletion_confirmable = False
+
+    async def begin_turn(self) -> None:
+        """Take the user's pending deletion request out, before the turn's first tool call.
+
+        Only this turn can confirm it. Whatever the user wrote, the request is
+        gone afterwards, so "no" or any other message cancels it.
+
+        Raises:
+            redis.exceptions.RedisError: If Redis cannot be reached.
+        """
+        self._deletion_confirmable = await self._deletion_requests.take(
+            self._context.user_id, self._now()
+        )
 
     def definitions(self) -> tuple[ToolDefinition, ...]:
         """Describe every tool for the model.
@@ -333,6 +420,23 @@ class UserTools:
                     "item changes; no other item and no synonym."
                 ),
                 parameters=UpdateItemArguments.model_json_schema(),
+            ),
+            ToolDefinition(
+                name=REQUEST_DATA_DELETION_TOOL,
+                description=(
+                    "The user asks, in any words or language, to delete their data or "
+                    "account. Starts the deletion; the bot then asks them to confirm."
+                ),
+                parameters=NoArguments.model_json_schema(),
+            ),
+            ToolDefinition(
+                name=CONFIRM_DATA_DELETION_TOOL,
+                description=(
+                    "The user's message clearly confirms the deletion the bot just asked "
+                    "about. Deletes everything of theirs; it only works right after "
+                    "request_data_deletion was answered."
+                ),
+                parameters=NoArguments.model_json_schema(),
             ),
             ToolDefinition(
                 name=SET_STATUS_TOOL,
@@ -375,6 +479,12 @@ class UserTools:
             ),
             SET_STATUS_TOOL: lambda arguments: self._set_status(
                 SetStatusArguments.model_validate(arguments)
+            ),
+            REQUEST_DATA_DELETION_TOOL: lambda arguments: self._request_data_deletion(
+                NoArguments.model_validate(arguments)
+            ),
+            CONFIRM_DATA_DELETION_TOOL: lambda arguments: self._confirm_data_deletion(
+                NoArguments.model_validate(arguments)
             ),
         }
         handler = handlers.get(tool_call.name)
@@ -566,6 +676,49 @@ class UserTools:
             content={"item_id": str(item.id), "name": chosen.name, "status": arguments.status},
             offered_item_ids=(item.id,),
         )
+
+    async def _request_data_deletion(self, arguments: NoArguments) -> ToolOutcome:
+        await self._deletion_requests.save(self._context.user_id, self._now())
+        logger.info("data_deletion_requested", extra={"user_id": str(self._context.user_id)})
+        return ToolOutcome(
+            content={"pending": True, "confirm_with": "the user's next message"},
+            template=ReplyTemplate.DELETION_CONFIRMATION,
+        )
+
+    async def _confirm_data_deletion(self, arguments: NoArguments) -> ToolOutcome:
+        if not self._deletion_confirmable:
+            return _deletion_refused()
+        self._deletion_confirmable = False
+        async with self._sessions() as session:
+            recipients = await _platform_recipients(session, self._context.user_id)
+        deleted_items = await self._eraser.erase(self._context.user_id)
+        if deleted_items is None:
+            return _deletion_refused()
+        return ToolOutcome(
+            content={"deleted": True, "saved_items": deleted_items},
+            template=ReplyTemplate.DELETION_DONE,
+            deleted_recipients=recipients,
+        )
+
+
+def _deletion_refused() -> ToolOutcome:
+    return _error(
+        "Nothing was deleted: there is no deletion request from the user's previous message, "
+        "or it expired. Call request_data_deletion if they want to delete their data."
+    )
+
+
+async def _platform_recipients(
+    session: AsyncSession, user_id: uuid.UUID
+) -> tuple[PlatformRecipient, ...]:
+    rows = await session.execute(
+        select(PlatformAccount.platform, PlatformAccount.platform_user_id)
+        .where(PlatformAccount.user_id == user_id)
+        .order_by(PlatformAccount.platform)
+    )
+    return tuple(
+        PlatformRecipient(platform, platform_user_id) for platform, platform_user_id in rows
+    )
 
 
 def _error(message: str) -> ToolOutcome:
