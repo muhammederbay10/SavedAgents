@@ -485,8 +485,10 @@ Savely/
       migrations/           # Alembic environment and revisions
   evals/
     labeled_saves.jsonl     # ~100 hand-labeled saves for model comparison
+    normalization_cases.jsonl  # ~100 synthetic filter-normalization cases (SAV-30)
   extension/                # Phase 2 browser extension
   scripts/spikes/           # reproducible experiments behind decision records
+  scripts/run_normalization_evals.py  # scores filter normalization on those cases
   tests/
     fixtures/webhooks/      # real (anonymized) webhook payloads
     fixtures/openrouter/    # model responses written from the provider's documentation

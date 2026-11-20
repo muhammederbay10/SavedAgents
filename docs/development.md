@@ -551,6 +551,34 @@ A streaming filter matches a title only when it's watchable on that platform in 
 
 They are read through `RetrievalSettings` in [`app/config/retrieval.py`](../app/config/retrieval.py), with `get_retrieval_settings()`, with the same rules as the other settings classes.
 
+### Filter normalization evals
+
+[`scripts/run_normalization_evals.py`](../scripts/run_normalization_evals.py) measures how often normalization picks the value the user meant (SAV-30). [`evals/normalization_cases.jsonl`](../evals/normalization_cases.jsonl) holds about 100 synthetic cases, one per line: the filter slot, one user's saved values for it (near-misses included on purpose), what the user wrote, and the value they meant, or `null` when the right answer is "none of these". Each case also has a kind (`exact`, `typo`, `synonym`, `translation`, `granularity`, `no_match`, `large_list`) and the wording's language. A case may list `verified_aliases` (alias → saved value) that the shared vocabulary already holds.
+
+The runner creates a throwaway database `savely_eval_<random>` on the Postgres server of `DATABASE_URL`, migrates it, and drops it at the end; it never touches the tables of the database you develop against. Each case gets its own user, and its rows are rolled back before the next case. Normalization runs with the configured `FILTER_NORMALIZATION_MIN_PROBABILITY`, `FILTER_NORMALIZATION_MAX_OPTIONS` and prompt version, unchanged. The markdown report goes to standard output, ready to paste into a ticket:
+
+- correct, **wrong pick** (a different value was used), **missed** (a value was expected and the wording was kept) and **false match** (none was expected and a value was used), overall, per kind and per language;
+- **shortlist recall**: how often the expected value was among the options shown to the decision model;
+- how each case was resolved (`saved_value`, `vocabulary`, `decision`, `unchanged`) and how often the model was called;
+- a **threshold sweep** at 0.5–0.9, computed from the probabilities the model returned, so it needs no extra calls;
+- latency per case, and the cost the provider reported;
+- every case that was not correct.
+
+Run it from the repository root with `db` running and the settings in `.env` or the environment:
+
+```bash
+docker compose up --detach --wait db
+
+# Offline: fake models, no key, no cost. The decision model never answers, so this
+# checks the setup and shows what exact hits alone get right.
+python -m scripts.run_normalization_evals
+
+# Real models through OpenRouter: reads OPENROUTER_API_KEY and the model settings.
+python -m scripts.run_normalization_evals --live > normalization-report.md
+```
+
+A live run makes at most one decision call and one embedding call per case, plus a few calls to embed the vocabulary values first: well under $1 for the whole set. It needs the owner's approval like every live call. `--cases <file>` runs another case file, and `--database-url <url>` points at another Postgres server (any database on it; only `CREATE DATABASE` and `DROP DATABASE` run there).
+
 ## Project layout
 
 ```
