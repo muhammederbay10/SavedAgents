@@ -14,9 +14,9 @@ rest of the response payload"), not a copied example.
 Every value in them is invented: no caption, transcript, message, media, key
 or user id from a real account. Ids such as `gen-synthetic-0001` are made up.
 
-When a live smoke test (see the README, "Live smoke tests") shows that a real
-response differs from one of these files, update the file and the client
-together.
+When a live smoke test (see `docs/development.md`, "Live smoke tests") shows
+that a real response differs from one of these files, update the file and the
+client together.
 
 | File | Endpoint | What it shows |
 |---|---|---|

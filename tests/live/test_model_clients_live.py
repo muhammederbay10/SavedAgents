@@ -2,9 +2,9 @@
 
 They cost a fraction of a cent, send only the invented inputs below, and are
 skipped unless both `LIVE_MODEL_TESTS=1` and `OPENROUTER_API_KEY` are set in
-the process environment. Like every test, they do not read `.env`; the README
-("Live smoke tests") shows how to run them. A live run needs the owner's
-approval first (SAV-22 §8).
+the process environment. Like every test, they do not read `.env`;
+`docs/development.md` ("Live smoke tests") shows how to run them. A live run
+needs the owner's approval first (SAV-22 §8).
 """
 
 import io

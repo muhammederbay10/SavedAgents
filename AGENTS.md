@@ -113,7 +113,7 @@ pytest
 - **Keep docs in sync with code in the same change:**
   - Design change (approved, see §1) → update `docs/ARCHITECTURE.md`.
   - Significant decision (a new model, service or data-model change) → add a short decision record in `docs/decisions/NNNN-title.md`: context, decision, alternatives, consequences.
-  - New setup step, environment variable or command → update `README.md` and `.env.example`.
+  - New setup step, environment variable or command → update `docs/development.md` and `.env.example`.
 - Write in plain English. Short sentences, concrete examples, and no marketing language.
 
 ## 6. Security and privacy
@@ -135,6 +135,6 @@ pytest
 - [ ] The ticket's acceptance criteria are met.
 - [ ] `ruff format`, `ruff check`, `mypy` and `pytest` pass.
 - [ ] Tests were added or updated. Evals were run if model behaviour changed.
-- [ ] Docs were updated (docstrings, README, ARCHITECTURE, decision records, as needed).
+- [ ] Docs were updated (docstrings, `docs/development.md`, README, ARCHITECTURE, decision records, as needed).
 - [ ] There are no secrets, debug code or commented-out code.
 - [ ] The branch, SHA, summary and test results are posted on the ticket, and **approval to push was requested, not assumed**.
