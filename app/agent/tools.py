@@ -9,7 +9,7 @@ searching and the writing:
 | `near` | Search around a point, for the types with a location filter (places) |
 | `get_item` | One item's details: what it is, where, links, streaming in the user's country |
 | `update_item` | Correct one open value of one item; it never creates a synonym |
-| `set_status` | Mark the real thing behind an item as done (visited, watched…) or wanted |
+| `set_status` | Mark an item's place or title, or an item without one, as done or wanted |
 | `request_data_deletion` | Start "delete my data": the bot asks the user to confirm |
 | `confirm_data_deletion` | Delete everything of the sender, only on an explicit confirmation |
 
@@ -502,8 +502,9 @@ class UserTools:
             ToolDefinition(
                 name=SET_STATUS_TOOL,
                 description=(
-                    "Mark the place, title or other real thing behind a saved item as done "
-                    "(visited, watched, read) or as something the user wants to do."
+                    "Mark the place or title behind a saved item, or the item itself when it "
+                    "has none (e.g. a study video), as done (visited, watched, read, studied) "
+                    "or as something the user wants to do."
                 ),
                 parameters=SetStatusArguments.model_json_schema(),
             ),
@@ -660,8 +661,10 @@ class UserTools:
             if item is None:
                 return _error(_NOT_FOUND)
             entities = await _linked_entities(session, [item.id])
-            streaming = await _streaming(
-                session, [entity for _, entity in entities.get(item.id, [])], self._context.country
+            linked = [entity for _, entity in entities.get(item.id, [])]
+            streaming = await _streaming(session, linked, self._context.country)
+            statuses = await _entity_statuses(
+                session, self._context.user_id, [entity.id for entity in linked]
             )
         content = {
             "item_id": str(item.id),
@@ -675,6 +678,8 @@ class UserTools:
             "post_url": item.post_url,
             "saved_at": item.saved_at.isoformat(),
             "still_indexing": item.status != ItemStatus.DONE,
+            # Done or wanted, for an item without entities; see each entity otherwise.
+            "status": item.user_status,
             "entities": [
                 {
                     "position": position,
@@ -684,6 +689,7 @@ class UserTools:
                     "country": entity.country,
                     "link": _link(entity),
                     "streaming": streaming.get(entity.id),
+                    "status": statuses.get(entity.id),
                 }
                 for position, entity in entities.get(item.id, [])
             ],
@@ -716,6 +722,8 @@ class UserTools:
             if item is None:
                 return _error(_NOT_FOUND)
             entities = (await _linked_entities(session, [item.id])).get(item.id, [])
+            if not entities:
+                return _status_on_item(item, arguments)
             chosen = _chosen_entity(entities, arguments.entity_position)
             if isinstance(chosen, str):
                 return _error(chosen)
@@ -934,13 +942,35 @@ def _open_value_paths(registry: ContentTypeRegistry, item: SavedItem) -> list[st
     return [open_value.path for open_value in find_open_values(schema, document)]
 
 
+def _status_on_item(item: SavedItem, arguments: "SetStatusArguments") -> ToolOutcome:
+    """Keep the status on an item without an entity, e.g. a study post (record 0015, Q6).
+
+    The caller holds the owner's lock; the session's transaction commits it.
+    """
+    if arguments.entity_position is not None:
+        return _error("The item is not linked to a place or title; leave entity_position out.")
+    item.user_status = EntityStatus(arguments.status)
+    return ToolOutcome(
+        content={"item_id": str(item.id), "name": item.category, "status": arguments.status},
+        offered_item_ids=(item.id,),
+    )
+
+
+async def _entity_statuses(
+    session: AsyncSession, user_id: uuid.UUID, entity_ids: Sequence[uuid.UUID]
+) -> dict[uuid.UUID, str]:
+    if not entity_ids:
+        return {}
+    rows = await session.execute(
+        select(UserEntity.entity_id, UserEntity.status).where(
+            UserEntity.user_id == user_id, UserEntity.entity_id.in_(list(entity_ids))
+        )
+    )
+    return {entity_id: status for entity_id, status in rows}
+
+
 def _chosen_entity(entities: Sequence[tuple[int, Entity]], position: int | None) -> Entity | str:
     """Pick the entity a status is for; a string is an error for the model."""
-    if not entities:
-        return (
-            "This item is not linked to a place, title or other real thing, so its status "
-            "cannot be stored."
-        )
     if position is None:
         if len(entities) == 1:
             return entities[0][1]

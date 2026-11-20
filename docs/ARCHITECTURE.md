@@ -226,7 +226,7 @@ flowchart TD
 | `deep_look(item_ids, question)` | Fans out parallel subagents (see diagram) for questions the index can't answer |
 | `get_item(item_id)` | Full details: open values with their paths, entity info and links, original post link, streaming in the user's country |
 | `update_item(item_id, path, value)` | Fix one open value ("it's a travel video"). Changes only this item and never adds a synonym (§3.4). Re-resolving an entity ("no, it's the Bebek branch") and notes come with the resolvers (SAV-15) |
-| `set_status(item_id, status, entity_position?)` | Mark the item's place or title as visited / watched / read / done, or "want to" (`USER_ENTITY.status`); `entity_position` picks one of a list post's entities |
+| `set_status(item_id, status, entity_position?)` | Mark the item's place or title as visited / watched / read / done, or "want to" (`USER_ENTITY.status`); `entity_position` picks one of a list post's entities. An item with no entity (e.g. a study post) keeps its status on the item itself (`SAVED_ITEM.user_status`), deleted with it (record 0015, Q6) |
 | `resolve_choice(item_id, option)` | Handles the user's answer to a "which one?" question (with SAV-15's pending choices) |
 | `request_data_deletion()` | "Delete my data", in any words or language: the answer becomes a fixed confirmation question in the user's language. The request becomes confirmable only once that question was delivered, until `DATA_DELETION_CONFIRM_SECONDS` later |
 | `confirm_data_deletion()` | Deletes everything of the sender only when all of these hold, enforced in code: a delivered question, this is the **next** message (the request is taken out at the start of every turn, so "no" or any other message cancels it), the platform reports an **explicit confirmation** with this message (how is the owner's decision, record 0015 Q9; until then nothing is deleted), and the deadline, checked right before erasing. A successful erasure ends the turn with the fixed "done" DM, prepared in the user's language before, sent to the platform id read before the deletion |
@@ -336,7 +336,7 @@ erDiagram
     uuid id  uuid user_id  text platform  text platform_post_id  text post_url
     text media_type  text caption  text transcript  text summary
     text type  text category  text subtype  text[] tags  text collection  jsonb fields  jsonb raw_values  jsonb attributes
-    text status  vector embedding  timestamptz saved_at  text source_message_id
+    text status  text user_status  vector embedding  timestamptz saved_at  text source_message_id
   }
   ENTITY_AVAILABILITY { uuid entity_id  text country  jsonb providers  timestamptz refreshed_at }
   ENTITY {
@@ -360,6 +360,7 @@ erDiagram
 - **`ENTITY_AVAILABILITY`** holds TMDB watch providers for one movie or series in one country, primary key `(entity_id, country)`, with its own `refreshed_at`. Retrieval joins on the asking user's `country`. It holds no user data.
 - **`ITEM_ENTITY`** is many-to-many, because one list post can mention several entities.
 - **`USER_ENTITY.status`**: `want | done` (visited / watched / read), per user. Memory and ranking use it.
+- **`SAVED_ITEM.user_status`**: `want | done` for an item that has no entity, such as a study post, set by `set_status` (record 0015, Q6). It is the user's own mark, separate from `status` (the indexing lifecycle), and is deleted with the item.
 - `SAVED_ITEM.fields` holds the extracted type fields (e.g. `{"subject": "maths", "topic": "integrals", "format": "tutorial"}`). Open values inside nested objects, such as the cuisine of each place in a list post, are also listed once at the top under their vocabulary field (`"cuisine": ["korean barbecue", "specialty coffee"]`), where counting and filters find them. `attributes` holds facts learned later by deep look.
 - `SAVED_ITEM.status` goes `pending → enriching → needs_user → done | failed`. `indexing_attempts` counts the indexing runs started, across requeues, and `indexing_updated_at` is the last time a job or the sweeper worked on the item; the stuck-item sweeper uses both (§3.3, record 0012).
 - `SAVED_ITEM.source_message_id` is the Instagram message id (`mid`) of the DM or collection save that brought the item in. Answers reply to it so the saved reel shows again (§3.5). It's empty for items from imports.

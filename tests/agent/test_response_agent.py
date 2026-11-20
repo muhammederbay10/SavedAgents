@@ -19,6 +19,7 @@ from app.agent.tools import (
     UPDATE_ITEM_TOOL,
     Notice,
 )
+from app.db.deletion import UserDataEraser
 from app.db.models import (
     Entity,
     EntityStatus,
@@ -528,3 +529,83 @@ async def test_unusable_translated_wording_is_an_error_not_another_language(
 
     with pytest.raises(AgentWordingError):
         await under_test.agent.answer(turn(saves, "베식타시 식당"))
+
+
+async def test_an_item_without_an_entity_keeps_its_status_on_the_item(
+    session_factory: async_sessionmaker[AsyncSession], saves: Saves
+) -> None:
+    integrals, pending = saves.items["integrals"].id, saves.items["pending"].id
+    under_test = build_agent(
+        session_factory,
+        [
+            tool_calls(
+                (SET_STATUS_TOOL, {"item_id": str(integrals), "status": "done"}),
+                (SET_STATUS_TOOL, {"item_id": str(pending), "status": "want"}),
+                (
+                    SET_STATUS_TOOL,
+                    {"item_id": str(integrals), "status": "want", "entity_position": 0},
+                ),
+                (GET_ITEM_TOOL, {"item_id": str(integrals)}),
+            ),
+            final_answer("en", "Marked."),
+        ],
+    )
+
+    await under_test.agent.answer(turn(saves, "I studied the integrals one; want the other"))
+
+    done, wanted, with_position, details = tool_results(under_test.generator.requests[1])
+    assert (done["status"], wanted["status"]) == ("done", "want")
+    assert "entity_position" in str(with_position["error"])
+    assert details["status"] == "done"
+    async with session_factory() as session:
+        rows = {
+            row.id: (row.user_status, row.status)
+            for row in (
+                await session.execute(
+                    select(SavedItem).where(SavedItem.id.in_([integrals, pending]))
+                )
+            ).scalars()
+        }
+    # The user's status and the indexing lifecycle stay apart.
+    assert rows == {
+        integrals: (EntityStatus.DONE, ItemStatus.DONE),
+        pending: (EntityStatus.WANT, ItemStatus.PENDING),
+    }
+
+
+async def test_get_item_shows_the_users_status_of_each_entity(
+    session_factory: async_sessionmaker[AsyncSession], saves: Saves
+) -> None:
+    inception = saves.items["inception"].id
+    under_test = build_agent(
+        session_factory,
+        [tool_calls((GET_ITEM_TOOL, {"item_id": str(inception)})), final_answer("en", "…")],
+    )
+
+    await under_test.agent.answer(turn(saves, "did I watch Inception?"))
+
+    (details,) = tool_results(under_test.generator.requests[1])
+    assert details["status"] is None
+    assert [entity["status"] for entity in details["entities"]] == [EntityStatus.DONE]  # type: ignore[union-attr]
+
+
+async def test_an_items_status_is_deleted_with_the_item(
+    session_factory: async_sessionmaker[AsyncSession], saves: Saves
+) -> None:
+    integrals = saves.items["integrals"].id
+    under_test = build_agent(
+        session_factory,
+        [
+            tool_calls((SET_STATUS_TOOL, {"item_id": str(integrals), "status": "done"})),
+            final_answer("en", "Marked."),
+        ],
+    )
+    await under_test.agent.answer(turn(saves, "I studied the integrals video"))
+
+    assert await UserDataEraser(session_factory, ()).erase(saves.user.id) is not None
+
+    async with session_factory() as session:
+        left = await session.scalar(
+            select(func.count()).select_from(SavedItem).where(SavedItem.user_status.is_not(None))
+        )
+    assert left == 0

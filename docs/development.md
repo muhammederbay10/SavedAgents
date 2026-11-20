@@ -604,7 +604,7 @@ await send_answer(AnswerSender(messenger), toolbox, sender_id, recipient, answer
 | `near` | Search around a point, for the types that have a location filter (places) |
 | `get_item` | One item's details: open values with their paths, entities, links, streaming in the user's country |
 | `update_item` | Correct one open value of one item. Only that item changes; no synonym is created |
-| `set_status` | Mark the place or title behind an item as done (visited, watched, read) or wanted |
+| `set_status` | Mark the place or title behind an item as done (visited, watched, read) or wanted; an item without one (e.g. a study post) keeps the status on itself (`saved_item.user_status`) |
 | `request_data_deletion` | "Delete my data" in any words or language: the bot asks a fixed confirmation question |
 | `confirm_data_deletion` | Deletes everything of the sender, only on an explicit confirmation of a delivered question, in time |
 
