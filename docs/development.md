@@ -202,7 +202,7 @@ The dimension stays a setting, so another model can be tried on a fresh database
 
 ## Configuration
 
-All configuration comes from environment variables. Locally they live in `.env`, and `.env.example` lists every variable. The variables of the model clients have their own table under [Model settings](#model-settings), and those of search under [Search](#search).
+All configuration comes from environment variables. Locally they live in `.env`, and `.env.example` lists every variable. The variables of the model clients have their own table under [Model settings](#model-settings), those of search under [Search](#search), and those of the response agent under [Response agent](#response-agent).
 
 | Variable | Used by | Meaning |
 |---|---|---|
@@ -579,13 +579,60 @@ python -m scripts.run_normalization_evals --live > normalization-report.md
 
 A live run makes at most one decision call and one embedding call per case, plus a few calls to embed the vocabulary values first: well under $1 for the whole set. It needs the owner's approval like every live call. `--cases <file>` runs another case file, and `--database-url <url>` points at another Postgres server (any database on it; only `CREATE DATABASE` and `DROP DATABASE` run there).
 
+## Response agent
+
+The response agent answers a user's DM about their saves ([`ARCHITECTURE.md`](ARCHITECTURE.md) §3.5, decision record [0015](decisions/0015-response-agent.md)). It never queries the database: the text model (DeepSeek V4.1 Flash) calls the tools in [`app/agent/tools.py`](../app/agent/tools.py), and the tools search and write.
+
+```python
+eraser = UserDataEraser(sessions, [IngestionDataEraser(state, job_queue), deletion_requests,
+                                  media_store])
+toolbox = Toolbox(sessions=sessions, retriever=retriever, corrections=corrections,
+                  registry=CONTENT_TYPES, deletion_requests=deletion_requests, eraser=eraser,
+                  deletion_window=timedelta(seconds=settings.data_deletion_confirm_seconds))
+agent = ResponseAgent(generator=models.text_generator, toolbox=toolbox,
+                      prompts=AGENT_PROMPTS, settings=get_agent_settings())
+answer = await agent.answer(AgentTurn(user_id=sender_id, country=user.country,
+                                      text="horror movies on Netflix", working_set=last_ids))
+recipient = answer.deleted_recipients[0].platform_user_id if answer.deleted_recipients else igsid
+await send_answer(AnswerSender(messenger), toolbox, sender_id, recipient, answer,
+                  last_user_message_at)
+```
+
+| Tool | What it does |
+|---|---|
+| `search_items` | Hybrid search: collection, type, category, tags, the type's filters, text, platform, date |
+| `near` | Search around a point, for the types that have a location filter (places) |
+| `get_item` | One item's details: open values with their paths, entities, links, streaming in the user's country |
+| `update_item` | Correct one open value of one item. Only that item changes; no synonym is created |
+| `set_status` | Mark the place or title behind an item as done (visited, watched, read) or wanted |
+| `request_data_deletion` | "Delete my data" in any words or language: the bot asks a fixed confirmation question |
+| `confirm_data_deletion` | Deletes everything of the sender, only on an explicit confirmation of a delivered question, in time |
+
+- **Ownership comes from the DM.** `Toolbox.for_user` binds the tools to the sender's `user_id` and country. No tool takes a user id, and another user's item is answered like a missing one.
+- **The answer is checked** before it is sent: it may only list items the tools returned or the user's last results, it must carry a notice when a search fell back (`backup_mode`, `broader_results`, `may_be_incomplete`), and it must fit in one DM. A wrong answer goes back to the model, within `AGENT_MAX_STEPS`; the last call may not call tools.
+- **Any language.** The model replies in the language of the user's message and names it. For a language without built-in reply wording, the agent asks the model once for the bot's fixed words in it; unusable wording is an error, never another language.
+- **Sending** (`app/agent/replies/answers.py`): an intro, then one reply per result that quotes the saved reel, at most `AGENT_MAX_RESULTS_PER_ANSWER`. A refused quote falls back to the post link (a preview card), then to the name with its Maps or TMDB link (decision record 0004).
+- **"Delete my data" takes two steps, enforced in code; the model can never delete on its own word.** `request_data_deletion` makes the answer a fixed question in the user's language: what is deleted (saves, stored media, the conversation, the profile), that it can't be undone, and how to confirm. The fixed "done" message is prepared in the same language at the same time. `send_answer` (`app/agent/send.py`) stores the request in Redis (`app/agent/deletion_requests.py`) only after the whole answer was sent, with its deadline, `DATA_DELETION_CONFIRM_SECONDS` later. The request is taken out at the start of the user's next turn, so "no" or any other message cancels it. `confirm_data_deletion` erases only when that turn also carries the platform's explicit confirmation (`AgentTurn.deletion_confirmed`; its source is the owner's decision, record 0015 Q9, so nothing sets it yet) and the deadline has not passed, checked right before erasing. It then runs `UserDataEraser` (`app/db/deletion.py`): ingestion's Redis state and jobs, the pending request and the stored media first, then the Postgres rows. A failure outside Postgres leaves Postgres unchanged, and a repeat succeeds. A successful erasure ends the turn at once with the prepared "done" message, sent to `AgentAnswer.deleted_recipients` (read before the deletion); no model or tool runs after it. The log lines `data_deletion_requested`, `data_deletion_confirmation_delivered` and `user_data_deleted` hold only the event and the number of items, and the agent's own lines (`agent_tool_called`, `agent_answered`) hold no user id; `tests/agent/test_data_deletion.py` checks that no id or message text is logged during a deletion.
+- **Corrections** (`app/pipeline/vocabulary/corrections.py`) go through the vocabulary's normal steps, keep the user's wording marked as set by hand, and count against the alias that produced the wrong value (`correction_count`). A corrected candidate alias is never verified. Flagging a verified alias for review needs corrections from several users (ARCHITECTURE §3.4); how to keep that evidence is the owner's decision (record 0015, Q4), so nothing is flagged yet.
+
+The wording sent to the text model is `AGENT_PROMPTS` in [`app/agent/prompts.py`](../app/agent/prompts.py), version `2026-11-20.3`, not yet approved by the owner.
+
+| Variable | Meaning |
+|---|---|
+| `AGENT_MAX_STEPS` | The most model calls one answer may take, tool rounds included; at least 2 |
+| `AGENT_MAX_RESULTS_PER_ANSWER` | The most saved items one answer sends back; the rest are kept for "show more" |
+| `AGENT_MAX_OUTPUT_TOKENS` | The longest reply the text model may write per call |
+| `DATA_DELETION_CONFIRM_SECONDS` | How long a delivered "delete my data" question may be confirmed |
+
+They are read through `AgentSettings` in [`app/config/agent.py`](../app/config/agent.py), with `get_agent_settings()`, with the same rules as the other settings classes.
+
 ## Project layout
 
 ```
 app/
   main.py             # FastAPI app factory and GET /health
   config/             # settings from environment variables, one module per group:
-                      # base (the API's Settings), models, messenger, pipeline, retrieval
+                      # base (the API's Settings), models, messenger, pipeline, retrieval, agent
   logging_config.py   # JSON logging setup
   adapters/
     base.py           # CaptureEvent and ChatMessage: what every adapter outputs
@@ -608,6 +655,11 @@ app/
     openrouter/       # the shared HTTP transport, routing checks, JSON helpers
     clients/          # one client per model role
   agent/
+    agent.py          # the response agent's tool-calling loop and answer checks
+    tools.py          # search_items, near, get_item, update_item, set_status, deletion tools
+    send.py           # sends an answer; a delivered deletion question becomes confirmable
+    prompts.py        # versioned wording for the text model
+    deletion_requests.py # pending "delete my data" requests, with their deadline
     search/
       retrieval.py    # hybrid search: normalize, filter, rank, fallback L1–L2, time budget
       query.py        # SearchQuery, checked against the content types
@@ -619,6 +671,7 @@ app/
     replies/
       messenger.py    # Instagram Send API client: DMs, quick replies, replies to saved reels
       templates.py    # fixed DM wording in the user's language
+      answers.py      # an answer: the intro, then one reply per result, with fallbacks
   db/
     models.py         # SQLAlchemy models
     session.py        # the API's engine and session factory
