@@ -184,7 +184,7 @@ Values are stored in one canonical form (English, lower case) with aliases in an
 
 **Corrections move one item; synonyms need evidence.**
 - When a user corrects an item ("no, it's a travel video"), **only that item changes**: its category becomes "travel video", through the same steps as above. "Car review" and "travel video" are **not** made synonyms, and no other item, the user's or anyone else's, is touched. Values the user sets by hand are marked as such in `raw_values` and are never re-normalized.
-- The correction is counted against the alias that produced the wrong value (`correction_count`). A candidate alias that gets corrected is not verified. A verified alias that collects `VOCAB_ALIAS_REVIEW_MIN_CORRECTIONS` corrections is flagged for review (logged as `vocabulary_alias_flagged_for_review`).
+- The correction is counted against the alias that produced the wrong value. A candidate alias that gets corrected is not verified. A verified alias that collects corrections from several users is flagged for review.
 - **Undoing a wrong alias:** we mark it `rejected`, which stops future matches. Only the items that were matched through it (recorded in their `ENRICHMENT_RUN` normalize step) are re-normalized from their own `raw_values`. Items the user corrected by hand keep the user's choice, also when the correction arrives while the models are working: the result is applied under the owner's lock, only where the item's wording and provenance haven't changed.
 
 **Places are global.** Location fields come from Google Places' address components for any country: country, region or state, city, district, neighbourhood, plus coordinates. "Restaurants in Beşiktaş", "cafés in Brooklyn" and "bars in Shibuya" work the same way. A filter can match any of those levels.
@@ -228,8 +228,8 @@ flowchart TD
 | `update_item(item_id, path, value)` | Fix one open value ("it's a travel video"). Changes only this item and never adds a synonym (§3.4). Re-resolving an entity ("no, it's the Bebek branch") and notes come with the resolvers (SAV-15) |
 | `set_status(item_id, status, entity_position?)` | Mark the item's place or title as visited / watched / read / done, or "want to" (`USER_ENTITY.status`); `entity_position` picks one of a list post's entities |
 | `resolve_choice(item_id, option)` | Handles the user's answer to a "which one?" question (with SAV-15's pending choices) |
-| `request_data_deletion()` | "Delete my data", in any words or language: stores a pending request for the sender (`DATA_DELETION_CONFIRM_SECONDS`), and the bot sends a fixed confirmation question in the user's language |
-| `confirm_data_deletion()` | Deletes everything of the sender, only when **their previous message** made a request that hasn't expired. The request is taken out at the start of every turn, so "no" or any other message cancels it; enforced in code, not by the prompt. A final fixed "done" DM goes to the platform id read before the deletion |
+| `request_data_deletion()` | "Delete my data", in any words or language: the answer becomes a fixed confirmation question in the user's language. The request becomes confirmable only once that question was delivered, until `DATA_DELETION_CONFIRM_SECONDS` later |
+| `confirm_data_deletion()` | Deletes everything of the sender only when all of these hold, enforced in code: a delivered question, this is the **next** message (the request is taken out at the start of every turn, so "no" or any other message cancels it), the platform reports an **explicit confirmation** with this message (how is the owner's decision, record 0015 Q9; until then nothing is deleted), and the deadline, checked right before erasing. A successful erasure ends the turn with the fixed "done" DM, prepared in the user's language before, sent to the platform id read before the deletion |
 | `list_memories()` / `forget_memory(id)` | "What do you remember about me?" / "Forget that" (§3.7) |
 
 **How results are shown: the saved reels come back.** When an answer lists saved items, the bot sends a short intro ("3 places in Beşiktaş from your Food collection 🍽"), then **one message per result that replies to the user's original share** (`reply_to.mid` = the item's `source_message_id`). Instagram shows the saved reel or post quoted above the bot's line, e.g. "1/3 · Kronotrop, Beşiktaş · open now · Maps link". This works for DM shares and for saves into a collaborative collection alike (decision record 0004). If an item has no message id (for example a later browser import), the bot falls back to the post link, which Instagram shows as a preview card, or to the name and Maps or TMDB link. Results are capped (e.g. 5 per answer) with "show more" for the rest. Replies only work inside the 24-hour window, which is always true when answering a question the user just asked.
@@ -469,7 +469,8 @@ Savely/
       agent.py              # response-agent loop and answer checks
       tools.py              # search_items, near, get_item, update_item, set_status… (the only DB access)
       prompts.py            # versioned wording for the text model
-      deletion_requests.py  # pending "delete my data" requests (Redis), confirmed by the next message
+      deletion_requests.py  # pending "delete my data" requests (Redis), with their deadline
+      send.py               # sends an answer; a delivered deletion question becomes confirmable
       deep_look.py          # parallel subagents + write-back
       search/
         retrieval.py        # hybrid SQL + vector search, fallback ladder, time budget

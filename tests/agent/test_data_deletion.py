@@ -7,7 +7,7 @@ text and file is synthetic.
 
 import logging
 import uuid
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -18,9 +18,12 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.adapters.base import CaptureEvent, ChatMessage
-from app.agent.agent import AgentAnswer, AgentTurn
+from app.agent.agent import AgentAnswer, AgentTurn, AgentWordingError
 from app.agent.deletion_requests import RedisDeletionRequests
+from app.agent.replies.answers import AnswerSender, DeliveryReport
+from app.agent.replies.messenger import MessengerRequestError
 from app.agent.replies.templates import deletion_confirmation, deletion_done, reply_wording
+from app.agent.send import send_answer
 from app.agent.tools import (
     CONFIRM_DATA_DELETION_TOOL,
     REQUEST_DATA_DELETION_TOOL,
@@ -33,7 +36,9 @@ from app.ingestion.erasure import IngestionDataEraser
 from app.ingestion.jobs import CHAT_QUEUE, INDEXING_QUEUE, ArqJobQueue
 from app.ingestion.service import IngestionService
 from app.ingestion.session_state import RedisIngestionState
-from app.models.base import GenerationResult
+from app.models.base import GenerationRequest, GenerationResult, Generator
+from app.models.errors import ModelError, ModelUnavailableError
+from app.models.fakes import FakeGenerator
 from app.pipeline.media.storage import LocalMediaStore
 from tests.agent.agent_support import (
     CONFIRM_SECONDS,
@@ -46,6 +51,8 @@ from tests.agent.agent_support import (
     tool_results,
     translated_wording,
 )
+from tests.agent.support import NOW as MESSENGER_NOW
+from tests.agent.support import build_messenger, json_response, sent
 from tests.db_factories import INSTAGRAM
 from tests.redis_inspection import all_stored_bytes
 
@@ -57,6 +64,7 @@ VIDEO = b"synthetic video bytes"
 
 REQUEST = tool_calls((REQUEST_DATA_DELETION_TOOL, {}))
 CONFIRM = tool_calls((CONFIRM_DATA_DELETION_TOOL, {}))
+MODEL_DOWN = ModelUnavailableError("synthetic outage", operation="generate", model="fake/text")
 
 
 class FailingMediaStore:
@@ -86,13 +94,18 @@ class Stores:
             media or self.media,
         ]
 
-    def agent(self, script: Sequence[GenerationResult]) -> AgentUnderTest:
+    def agent(
+        self,
+        script: Sequence[GenerationResult | ModelError],
+        wrap_generator: Callable[[FakeGenerator], Generator] | None = None,
+    ) -> AgentUnderTest:
         return build_agent(
             self.sessions,
             script,
             deletion_requests=self.requests,
             outside_postgres=self.outside_postgres(),
             clock=self.clock,
+            wrap_generator=wrap_generator,
         )
 
 
@@ -118,7 +131,7 @@ async def stores(
         jobs=ArqJobQueue(ingestion_redis),
         media=LocalMediaStore(tmp_path / "media"),
         media_root=tmp_path / "media",
-        requests=RedisDeletionRequests(ingestion_redis, timedelta(seconds=CONFIRM_SECONDS)),
+        requests=RedisDeletionRequests(ingestion_redis),
         clock=FakeClock(),
     )
     yield stores
@@ -160,8 +173,35 @@ async def save_something(stores: Stores, sender_id: str) -> SavedUser:
     return SavedUser(user_id=user_id, sender_id=sender_id, item_id=item_id, marker=marker)
 
 
-async def answer(stores: Stores, agent: AgentUnderTest, user: SavedUser, text: str) -> AgentAnswer:
-    return await agent.agent.answer(AgentTurn(user_id=user.user_id, country=None, text=text))
+async def answer(
+    agent: AgentUnderTest, user: SavedUser, text: str, *, confirmed: bool = False
+) -> AgentAnswer:
+    return await agent.agent.answer(
+        AgentTurn(user_id=user.user_id, country=None, text=text, deletion_confirmed=confirmed)
+    )
+
+
+async def deliver(
+    agent: AgentUnderTest, user: SavedUser, result: AgentAnswer, *, refuse: bool = False
+) -> DeliveryReport:
+    """Send an answer as the chat worker will: through `send_answer`, to a mock Send API."""
+    reply = json_response("synthetic_error_invalid_parameter.json", 400) if refuse else sent()
+    under_test = build_messenger([reply])
+    return await send_answer(
+        AnswerSender(under_test.messenger),
+        agent.toolbox,
+        user.user_id,
+        user.sender_id,
+        result,
+        MESSENGER_NOW,
+    )
+
+
+async def request_deletion(agent: AgentUnderTest, user: SavedUser, text: str) -> AgentAnswer:
+    """Turn 1: the user asks, and the confirmation question is delivered."""
+    result = await answer(agent, user, text)
+    await deliver(agent, user, result)
+    return result
 
 
 async def user_exists(stores: Stores, user_id: uuid.UUID) -> bool:
@@ -199,46 +239,49 @@ async def test_a_request_in_any_language_gets_the_confirmation_question(
     stores: Stores, language: str, text: str
 ) -> None:
     user = await save_something(stores, LEAVING_SENDER_ID)
-    script = [REQUEST, final_answer(language, "…")]
+    script: list[GenerationResult | ModelError] = [REQUEST, final_answer(language, "…")]
     if language == "es":
         script.append(structured_reply(translated_wording("es")))
     agent = stores.agent(script)
 
     try:
-        result = await answer(stores, agent, user, text)
+        result = await answer(agent, user, text)
 
         if language == "es":
-            expected = translated_wording("es")["deletion_confirmation"].format(
-                minutes=CONFIRM_MINUTES
-            )
+            wording = translated_wording("es")
+            expected = wording["deletion_confirmation"].format(minutes=CONFIRM_MINUTES)
+            done = wording["deletion_done"]
         else:
             expected = deletion_confirmation(CONFIRM_MINUTES, reply_wording(language)).text
+            done = deletion_done(reply_wording(language)).text
         assert result.messages.intro == expected
         assert result.messages.results == ()
+        assert result.deletion_confirmation is not None
+        assert result.deletion_confirmation.done_text == done
+        assert result.deletion_confirmation.language == language
         assert result.deleted_recipients == ()
         assert await user_exists(stores, user.user_id)
     finally:
         await clean_up(stores, user)
 
 
-async def test_yes_on_the_next_message_erases_every_store_and_leaves_others_alone(
+async def test_an_explicit_yes_erases_every_store_and_ends_the_turn(
     stores: Stores, redis_url: str
 ) -> None:
     leaving = await save_something(stores, LEAVING_SENDER_ID)
     staying = await save_something(stores, STAYING_SENDER_ID)
-    agent = stores.agent(
-        [REQUEST, final_answer("en", "…"), CONFIRM, final_answer("en", "Deleted.")]
-    )
+    # After the erasure nothing else may be asked: the model is down by then.
+    agent = stores.agent([REQUEST, final_answer("en", "…"), CONFIRM, MODEL_DOWN])
 
     try:
-        await answer(stores, agent, leaving, "delete my data")
+        await request_deletion(agent, leaving, "delete my data")
         stores.clock.advance(CONFIRM_SECONDS - 1)
-        result = await answer(stores, agent, leaving, "yes")
+        result = await answer(agent, leaving, "yes", confirmed=True)
 
-        (confirmed,) = tool_results(agent.generator.requests[3])
-        assert confirmed == {"deleted": True, "saved_items": 1}
+        assert len(agent.generator.requests) == 3
         assert result.messages.intro == deletion_done(reply_wording("en")).text
         assert result.deleted_recipients == (PlatformRecipient(INSTAGRAM, LEAVING_SENDER_ID),)
+        assert result.deletion_confirmation is None
         assert not await user_exists(stores, leaving.user_id)
         async with stores.sessions() as session:
             leftover_accounts = await session.scalar(
@@ -261,29 +304,119 @@ async def test_yes_on_the_next_message_erases_every_store_and_leaves_others_alon
         await clean_up(stores, leaving, staying)
 
 
-@pytest.mark.parametrize(
-    ("reply", "next_turn"),
-    [
-        ("no", final_answer("en", "Okay, nothing was deleted.")),
-        ("cafés in Brooklyn?", tool_calls((SEARCH_ITEMS_TOOL, {"category": "café"}))),
-    ],
-)
-async def test_no_or_any_other_message_cancels_the_request(
-    stores: Stores, reply: str, next_turn: GenerationResult
+async def test_completion_needs_no_model_or_translation_after_the_erasure(
+    stores: Stores, caplog: pytest.LogCaptureFixture
 ) -> None:
     user = await save_something(stores, LEAVING_SENDER_ID)
-    script = [REQUEST, final_answer("en", "…"), next_turn]
-    if next_turn.tool_calls:
-        script.append(final_answer("en", "No cafés saved there."))
-    script.extend([CONFIRM, final_answer("en", "Nothing to confirm.")])
-    agent = stores.agent(script)
+    agent = stores.agent(
+        [
+            REQUEST,
+            final_answer("es", "…"),
+            structured_reply(translated_wording("es")),
+            # The model also asks for another tool in the same reply; it never runs.
+            tool_calls((CONFIRM_DATA_DELETION_TOOL, {}), (SEARCH_ITEMS_TOOL, {"category": "x"})),
+            MODEL_DOWN,
+        ]
+    )
 
     try:
-        await answer(stores, agent, user, "delete my data")
-        await answer(stores, agent, user, reply)
-        await answer(stores, agent, user, "yes")
+        await request_deletion(agent, user, "borra mis datos")
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            result = await answer(agent, user, "sí", confirmed=True)
 
-        assert "Nothing was deleted" in str(tool_results(agent.generator.requests[-1])[-1])
+        assert result.messages.intro == translated_wording("es")["deletion_done"]
+        assert result.language == "es"
+        assert result.deleted_recipients == (PlatformRecipient(INSTAGRAM, LEAVING_SENDER_ID),)
+        assert len(agent.generator.requests) == 4
+        tools_run = [r.tool for r in caplog.records if r.getMessage() == "agent_tool_called"]
+        assert tools_run == [CONFIRM_DATA_DELETION_TOOL]
+        assert not await user_exists(stores, user.user_id)
+    finally:
+        await clean_up(stores, user)
+
+
+@pytest.mark.parametrize("reply", ["no, keep my data", "cafés in Brooklyn?"])
+async def test_a_wrong_confirm_call_after_no_or_another_message_erases_nothing(
+    stores: Stores, reply: str
+) -> None:
+    user = await save_something(stores, LEAVING_SENDER_ID)
+    # The model calls the confirm tool although the user did not confirm.
+    agent = stores.agent(
+        [
+            REQUEST,
+            final_answer("en", "…"),
+            CONFIRM,
+            final_answer("en", "Nothing deleted."),
+            CONFIRM,
+            final_answer("en", "Nothing deleted."),
+        ]
+    )
+
+    try:
+        await request_deletion(agent, user, "delete my data")
+        await answer(agent, user, reply)
+        # The request was used up by that message, so a later explicit yes finds none.
+        await answer(agent, user, "yes", confirmed=True)
+
+        refusals = [tool_results(agent.generator.requests[i])[0] for i in (3, 5)]
+        assert all("Nothing was deleted" in str(refusal["error"]) for refusal in refusals)
+        assert await user_exists(stores, user.user_id)
+    finally:
+        await clean_up(stores, user)
+
+
+async def test_a_question_the_model_never_finished_is_not_executable(stores: Stores) -> None:
+    user = await save_something(stores, LEAVING_SENDER_ID)
+    agent = stores.agent([REQUEST, MODEL_DOWN, CONFIRM, final_answer("en", "…")])
+
+    try:
+        with pytest.raises(ModelUnavailableError):
+            await answer(agent, user, "delete my data")
+        await answer(agent, user, "yes", confirmed=True)
+
+        assert "Nothing was deleted" in str(tool_results(agent.generator.requests[3])[0])
+        assert await user_exists(stores, user.user_id)
+    finally:
+        await clean_up(stores, user)
+
+
+async def test_a_question_that_could_not_be_translated_is_not_executable(
+    stores: Stores,
+) -> None:
+    user = await save_something(stores, LEAVING_SENDER_ID)
+    agent = stores.agent(
+        [
+            REQUEST,
+            final_answer("ko", "…"),
+            structured_reply({"deletion_done": "incomplete wording"}),
+            CONFIRM,
+            final_answer("ko", "…"),
+        ]
+    )
+
+    try:
+        with pytest.raises(AgentWordingError):
+            await answer(agent, user, "내 데이터를 삭제해 줘")
+        await answer(agent, user, "네", confirmed=True)
+
+        assert "Nothing was deleted" in str(tool_results(agent.generator.requests[4])[0])
+        assert await user_exists(stores, user.user_id)
+    finally:
+        await clean_up(stores, user)
+
+
+async def test_a_question_that_was_not_sent_is_not_executable(stores: Stores) -> None:
+    user = await save_something(stores, LEAVING_SENDER_ID)
+    agent = stores.agent([REQUEST, final_answer("en", "…"), CONFIRM, final_answer("en", "…")])
+
+    try:
+        result = await answer(agent, user, "delete my data")
+        with pytest.raises(MessengerRequestError):
+            await deliver(agent, user, result, refuse=True)
+        await answer(agent, user, "yes", confirmed=True)
+
+        assert "Nothing was deleted" in str(tool_results(agent.generator.requests[3])[0])
         assert await user_exists(stores, user.user_id)
     finally:
         await clean_up(stores, user)
@@ -296,9 +429,46 @@ async def test_an_expired_request_deletes_nothing(stores: Stores) -> None:
     )
 
     try:
-        await answer(stores, agent, user, "delete my data")
+        await request_deletion(agent, user, "delete my data")
         stores.clock.advance(CONFIRM_SECONDS)
-        await answer(stores, agent, user, "yes")
+        await answer(agent, user, "yes", confirmed=True)
+
+        (refused,) = tool_results(agent.generator.requests[3])
+        assert "Nothing was deleted" in str(refused["error"])
+        assert await user_exists(stores, user.user_id)
+    finally:
+        await clean_up(stores, user)
+
+
+class SlowGenerator(Generator):
+    """Lets the clock pass a given number of seconds while one scripted call is answered."""
+
+    def __init__(self, inner: Generator, clock: FakeClock, delays: dict[int, float]) -> None:
+        self._inner = inner
+        self._clock = clock
+        self._delays = delays
+        self._calls = 0
+
+    async def generate(self, request: GenerationRequest) -> GenerationResult:
+        self._calls += 1
+        self._clock.advance(self._delays.get(self._calls, 0.0))
+        return await self._inner.generate(request)
+
+
+async def test_a_turn_that_starts_before_the_deadline_cannot_delete_after_it(
+    stores: Stores,
+) -> None:
+    user = await save_something(stores, LEAVING_SENDER_ID)
+    # The confirming turn starts one second before the deadline; the model takes two.
+    agent = stores.agent(
+        [REQUEST, final_answer("en", "…"), CONFIRM, final_answer("en", "It expired.")],
+        wrap_generator=lambda inner: SlowGenerator(inner, stores.clock, {3: 2.0}),
+    )
+
+    try:
+        await request_deletion(agent, user, "delete my data")
+        stores.clock.advance(CONFIRM_SECONDS - 1)
+        await answer(agent, user, "yes", confirmed=True)
 
         (refused,) = tool_results(agent.generator.requests[3])
         assert "Nothing was deleted" in str(refused["error"])
@@ -321,8 +491,8 @@ async def test_confirming_without_a_request_or_in_the_same_turn_deletes_nothing(
     )
 
     try:
-        await answer(stores, agent, user, "yes")
-        await answer(stores, agent, user, "delete my data, yes I'm sure")
+        await answer(agent, user, "yes", confirmed=True)
+        await answer(agent, user, "delete my data, yes I'm sure", confirmed=True)
 
         (no_request,) = tool_results(agent.generator.requests[1])
         _, same_turn = tool_results(agent.generator.requests[3])
@@ -348,9 +518,9 @@ async def test_another_users_request_never_lets_this_user_delete(stores: Stores)
     )
 
     try:
-        await answer(stores, agent, asking, "delete my data")
-        await answer(stores, agent, other, "yes")
-        await answer(stores, agent, other, "yes, delete them")
+        await request_deletion(agent, asking, "delete my data")
+        await answer(agent, other, "yes", confirmed=True)
+        await answer(agent, other, "yes, delete them", confirmed=True)
 
         (refused,) = tool_results(agent.generator.requests[3])
         (with_user_id,) = tool_results(agent.generator.requests[5])
@@ -359,7 +529,7 @@ async def test_another_users_request_never_lets_this_user_delete(stores: Stores)
         assert await user_exists(stores, asking.user_id)
         assert await user_exists(stores, other.user_id)
         # The asking user's own request is still waiting for their own next message.
-        assert await stores.requests.take(asking.user_id, stores.clock.now)
+        assert await stores.requests.take(asking.user_id) is not None
     finally:
         await clean_up(stores, asking, other)
 
@@ -410,15 +580,13 @@ async def test_deletion_logs_hold_only_events_and_counts(
     user = await save_something(stores, LEAVING_SENDER_ID)
     request_text = f"please erase everything {user.marker}"
     confirm_text = f"yes, I am sure {user.marker}"
-    agent = stores.agent(
-        [REQUEST, final_answer("en", "…"), CONFIRM, final_answer("en", "Deleted.")]
-    )
+    agent = stores.agent([REQUEST, final_answer("en", "…"), CONFIRM])
 
     try:
         caplog.clear()
         with caplog.at_level(logging.DEBUG):
-            await answer(stores, agent, user, request_text)
-            await answer(stores, agent, user, confirm_text)
+            await request_deletion(agent, user, request_text)
+            await answer(agent, user, confirm_text, confirmed=True)
 
         events = [record.getMessage() for record in caplog.records]
         assert "data_deletion_requested" in events

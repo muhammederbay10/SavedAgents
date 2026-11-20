@@ -106,6 +106,11 @@ class DeliveryReport:
     fallbacks: int
     outside_reply_window: bool
 
+    @property
+    def complete(self) -> bool:
+        """Return whether every message of the answer was sent."""
+        return not self.outside_reply_window
+
 
 @dataclass(frozen=True)
 class _Step:

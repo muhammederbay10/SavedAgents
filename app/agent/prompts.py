@@ -86,7 +86,7 @@ def _placeholders(field_name: str, template: str) -> frozenset[str]:
 # Proposed with SAV-17 and not yet approved by the owner. Change the version with
 # any change to the wording, and score the change on the eval set (SAV-19/20).
 AGENT_PROMPTS: Final = AgentPrompts(
-    version="2026-11-20.2",
+    version="2026-11-20.3",
     system=(
         "You are Savely, a chat assistant for the posts this user saved. You answer only "
         "from their own saves, and only through the tools: never invent an item, a place, a "
@@ -110,9 +110,10 @@ AGENT_PROMPTS: Final = AgentPrompts(
         "means, with update_item. 'Watched', 'visited', 'read' and 'done' are status "
         "done; 'want to' is status want.\n"
         "- If the user asks to delete their data or account, in any words or language, call "
-        "request_data_deletion. Call confirm_data_deletion only when this message clearly "
-        "says yes to the deletion question the bot just asked; otherwise never call it. For "
-        "both, a fixed message replaces your `reply`, so keep `reply` short."
+        "request_data_deletion; a fixed question replaces your `reply`, so keep it short. "
+        "Call confirm_data_deletion only when this message clearly says yes to the deletion "
+        "question the bot just asked; otherwise never call it. If it refuses, nothing was "
+        "deleted: tell the user so in one sentence."
     ),
     working_set="The results the user saw last, by number:\n{items}",
     invalid_answer=(

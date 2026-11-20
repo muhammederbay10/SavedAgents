@@ -11,7 +11,6 @@ AGENT_ENVIRONMENT = {
     "AGENT_MAX_STEPS": "6",
     "AGENT_MAX_RESULTS_PER_ANSWER": "5",
     "AGENT_MAX_OUTPUT_TOKENS": "600",
-    "VOCAB_ALIAS_REVIEW_MIN_CORRECTIONS": "3",
     "DATA_DELETION_CONFIRM_SECONDS": "600",
 }
 
@@ -35,7 +34,6 @@ def test_agent_settings_are_read_from_environment_variables(
     assert settings.agent_max_steps == 6
     assert settings.agent_max_results_per_answer == 5
     assert settings.agent_max_output_tokens == 600
-    assert settings.vocab_alias_review_min_corrections == 3
     assert settings.data_deletion_confirm_seconds == 600
 
 
@@ -56,7 +54,6 @@ def test_missing_agent_variable_fails_at_load(
         ("AGENT_MAX_STEPS", "1"),
         ("AGENT_MAX_RESULTS_PER_ANSWER", "0"),
         ("AGENT_MAX_OUTPUT_TOKENS", "0"),
-        ("VOCAB_ALIAS_REVIEW_MIN_CORRECTIONS", "0"),
         ("DATA_DELETION_CONFIRM_SECONDS", "0"),
     ],
 )

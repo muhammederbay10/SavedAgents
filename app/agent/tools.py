@@ -10,19 +10,31 @@ searching and the writing:
 | `get_item` | One item's details: what it is, where, links, streaming in the user's country |
 | `update_item` | Correct one open value of one item; it never creates a synonym |
 | `set_status` | Mark the real thing behind an item as done (visited, watched…) or wanted |
-| `request_data_deletion` | Start "delete my data": store a request; the bot asks to confirm |
-| `confirm_data_deletion` | Delete everything of the sender, if their previous message asked |
+| `request_data_deletion` | Start "delete my data": the bot asks the user to confirm |
+| `confirm_data_deletion` | Delete everything of the sender, only on an explicit confirmation |
 
 **Ownership comes from the DM, never from the model.** `Toolbox.for_user` binds
 the tools to the sender's `user_id` and country. No tool takes a user id as an
 argument, and an item id of another user is answered exactly like a missing
 one.
 
-**Deleting takes two steps, enforced here, not by the prompt.** A pending
-request is taken out at the start of every turn (`begin_turn`), so only the
-user's very next message can confirm it, within `DATA_DELETION_CONFIRM_SECONDS`;
-"no" or any other message cancels it. A request made in the same turn never
-counts, so the model can't delete in one go.
+**Deleting takes two steps, enforced here, not by the prompt.** The model can
+never delete on its own word. `confirm_data_deletion` erases only when all of
+these hold, and refuses otherwise:
+
+- the confirmation question was delivered: `Toolbox.confirmation_delivered`
+  stores the request only after the whole answer was sent;
+- this turn is the user's next message: `begin_turn` takes the request out, so
+  "no" or any other message uses it up, and a request of the same turn never counts;
+- the caller reports an explicit confirmation with this message
+  (`ToolContext.deletion_confirmed`). How the platform signals it is the owner's
+  decision (record 0015, Q9); until then nothing sets it, and nothing is deleted;
+- the deadline (`DATA_DELETION_CONFIRM_SECONDS` after delivery) has not passed,
+  checked right before erasing.
+
+A successful erasure ends the turn (`ToolOutcome.completion`): the "done"
+message was written in the user's language when the question was delivered, so
+no model or tool runs after the user is gone.
 
 **Arguments are checked** against each tool's schema, and search filters
 against the content type's declared filters (`plan_search`). A wrong argument
@@ -35,7 +47,7 @@ import logging
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Annotated, Final, Literal
 
@@ -44,7 +56,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.agent.deletion_requests import DeletionRequests
+from app.agent.deletion_requests import DeletionRequests, PendingDeletion
 from app.agent.replies.answers import ResultCard
 from app.agent.search.fallback import FallbackLevel
 from app.agent.search.normalization import NormalizationMethod
@@ -116,18 +128,6 @@ class Notice(StrEnum):
     MAY_BE_INCOMPLETE = "may_be_incomplete"
 
 
-class ReplyTemplate(StrEnum):
-    """A fixed message that replaces the model's reply, in the user's language.
-
-    Attributes:
-        DELETION_CONFIRMATION: Asks the user to confirm "delete my data".
-        DELETION_DONE: Says the user's data is deleted.
-    """
-
-    DELETION_CONFIRMATION = "deletion_confirmation"
-    DELETION_DONE = "deletion_done"
-
-
 @dataclass(frozen=True)
 class PlatformRecipient:
     """Where the last DM goes after a user's data, platform accounts included, is deleted.
@@ -139,6 +139,37 @@ class PlatformRecipient:
 
     platform: str
     platform_user_id: str = field(repr=False)
+
+
+@dataclass(frozen=True)
+class DeletionConfirmation:
+    """A confirmation question the bot asks; it counts only once delivered.
+
+    Attributes:
+        language: The BCP 47 tag of the language it is asked in.
+        done_text: The final "done" message in that language, prepared now so
+            nothing has to be written after the erasure.
+    """
+
+    language: str
+    done_text: str = field(repr=False)
+
+
+@dataclass(frozen=True)
+class DeletionCompletion:
+    """The end of a turn in which the user's data was deleted.
+
+    Attributes:
+        language: The language of `done_text`.
+        done_text: The final "done" message.
+        recipients: Where to send it, read before the deletion.
+        saved_items: How many saved items were deleted.
+    """
+
+    language: str
+    done_text: str = field(repr=False)
+    recipients: tuple[PlatformRecipient, ...]
+    saved_items: int
 
 
 def _utc_now() -> datetime:
@@ -153,10 +184,14 @@ class ToolContext:
         user_id: The sender of the DM.
         country: The sender's country (ISO 3166-1 alpha-2) from their profile;
             `None` if it is not known yet.
+        deletion_confirmed: The platform reported an explicit confirmation of
+            the bot's deletion question with this message. How is the owner's
+            decision (record 0015, Q9); without it no deletion runs.
     """
 
     user_id: uuid.UUID
     country: str | None
+    deletion_confirmed: bool = False
 
 
 @dataclass(frozen=True)
@@ -169,17 +204,17 @@ class ToolOutcome:
             The answer may only list these and the working set.
         notices: What the reply must tell the user about the results.
         availability_gaps: Streaming availability for the resolver to fetch (SAV-15).
-        template: A fixed message that replaces the model's reply, if any.
-        deleted_recipients: Where to send the last DM, when the user was just
-            deleted; read before the deletion.
+        asks_deletion_confirmation: The answer must be the fixed deletion
+            question instead of the model's reply.
+        completion: Set when the user's data was deleted; the turn ends with it.
     """
 
     content: Mapping[str, object] = field(repr=False)
     offered_item_ids: tuple[uuid.UUID, ...] = ()
     notices: frozenset[Notice] = frozenset()
     availability_gaps: tuple[AvailabilityGap, ...] = ()
-    template: ReplyTemplate | None = None
-    deleted_recipients: tuple[PlatformRecipient, ...] = ()
+    asks_deletion_confirmation: bool = False
+    completion: DeletionCompletion | None = None
 
     def as_json(self) -> str:
         """Return the content as the JSON text the model reads."""
@@ -292,6 +327,7 @@ class Toolbox:
         registry: ContentTypeRegistry,
         deletion_requests: DeletionRequests,
         eraser: UserDataEraser,
+        deletion_window: timedelta,
         now: Callable[[], datetime] = _utc_now,
     ) -> None:
         """Create the toolbox.
@@ -303,7 +339,9 @@ class Toolbox:
             registry: The built-in content types, for filters and schemas.
             deletion_requests: Pending "delete my data" requests.
             eraser: Erases a user everywhere.
-            now: The clock, for the requests' expiry.
+            deletion_window: How long a delivered question may be confirmed
+                (`DATA_DELETION_CONFIRM_SECONDS`).
+            now: The clock, for the requests' deadlines.
         """
         self._sessions = sessions
         self._retriever = retriever
@@ -311,7 +349,31 @@ class Toolbox:
         self._registry = registry
         self._deletion_requests = deletion_requests
         self._eraser = eraser
+        self._deletion_window = deletion_window
         self._now = now
+
+    async def confirmation_delivered(
+        self, user_id: uuid.UUID, confirmation: DeletionConfirmation
+    ) -> None:
+        """Make a delivered deletion question confirmable by the user's next message.
+
+        Call it only after the whole answer was sent (`app.agent.send.send_answer`).
+
+        Args:
+            user_id: The DM's sender the question was sent to.
+            confirmation: The question's language and prepared "done" message.
+
+        Raises:
+            redis.exceptions.RedisError: If Redis cannot be reached.
+        """
+        now = self._now()
+        pending = PendingDeletion(
+            deadline=now + self._deletion_window,
+            language=confirmation.language,
+            done_text=confirmation.done_text,
+        )
+        await self._deletion_requests.save(user_id, pending, now)
+        logger.info("data_deletion_confirmation_delivered")
 
     def for_user(self, context: ToolContext) -> "UserTools":
         """Return the tools of one sender.
@@ -369,7 +431,7 @@ class UserTools:
         self._deletion_requests = deletion_requests
         self._eraser = eraser
         self._now = now
-        self._deletion_confirmable = False
+        self._pending_deletion: PendingDeletion | None = None
 
     async def begin_turn(self) -> None:
         """Take the user's pending deletion request out, before the turn's first tool call.
@@ -380,9 +442,7 @@ class UserTools:
         Raises:
             redis.exceptions.RedisError: If Redis cannot be reached.
         """
-        self._deletion_confirmable = await self._deletion_requests.take(
-            self._context.user_id, self._now()
-        )
+        self._pending_deletion = await self._deletion_requests.take(self._context.user_id)
 
     def definitions(self) -> tuple[ToolDefinition, ...]:
         """Describe every tool for the model.
@@ -433,8 +493,8 @@ class UserTools:
                 name=CONFIRM_DATA_DELETION_TOOL,
                 description=(
                     "The user's message clearly confirms the deletion the bot just asked "
-                    "about. Deletes everything of theirs; it only works right after "
-                    "request_data_deletion was answered."
+                    "about. Deletes everything of theirs only if the platform also reports "
+                    "an explicit confirmation; otherwise nothing happens."
                 ),
                 parameters=NoArguments.model_json_schema(),
             ),
@@ -676,34 +736,43 @@ class UserTools:
         )
 
     async def _request_data_deletion(self, arguments: NoArguments) -> ToolOutcome:
-        await self._deletion_requests.save(self._context.user_id, self._now())
+        # Nothing is stored yet: the request becomes confirmable only once the
+        # question was delivered (`Toolbox.confirmation_delivered`).
         # The event only, never who asked (owner update of 20 Nov 2026).
         logger.info("data_deletion_requested")
         return ToolOutcome(
-            content={"pending": True, "confirm_with": "the user's next message"},
-            template=ReplyTemplate.DELETION_CONFIRMATION,
+            content={"question": "the bot asks the user to confirm"},
+            asks_deletion_confirmation=True,
         )
 
     async def _confirm_data_deletion(self, arguments: NoArguments) -> ToolOutcome:
-        if not self._deletion_confirmable:
+        pending, self._pending_deletion = self._pending_deletion, None
+        if pending is None or not self._context.deletion_confirmed:
             return _deletion_refused()
-        self._deletion_confirmable = False
         async with self._sessions() as session:
             recipients = await _platform_recipients(session, self._context.user_id)
+        # Checked last, right before the erasure, so time spent in this turn counts.
+        if self._now() >= pending.deadline:
+            return _deletion_refused()
         deleted_items = await self._eraser.erase(self._context.user_id)
         if deleted_items is None:
             return _deletion_refused()
         return ToolOutcome(
             content={"deleted": True, "saved_items": deleted_items},
-            template=ReplyTemplate.DELETION_DONE,
-            deleted_recipients=recipients,
+            completion=DeletionCompletion(
+                language=pending.language,
+                done_text=pending.done_text,
+                recipients=recipients,
+                saved_items=deleted_items,
+            ),
         )
 
 
 def _deletion_refused() -> ToolOutcome:
     return _error(
-        "Nothing was deleted: there is no deletion request from the user's previous message, "
-        "or it expired. Call request_data_deletion if they want to delete their data."
+        "Nothing was deleted: there is no delivered deletion question that this message "
+        "explicitly confirms in time. Call request_data_deletion if the user wants to "
+        "delete their data."
     )
 
 

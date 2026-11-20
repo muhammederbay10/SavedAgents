@@ -24,9 +24,6 @@ class AgentSettings(BaseSettings):
             decision record 0004). The rest are kept for "show more".
         agent_max_output_tokens: The longest reply the model may write per
             call (`AGENT_MAX_OUTPUT_TOKENS`).
-        vocab_alias_review_min_corrections: A verified vocabulary alias with at
-            least this many user corrections against it is flagged for review
-            (`VOCAB_ALIAS_REVIEW_MIN_CORRECTIONS`, ARCHITECTURE §3.4).
         data_deletion_confirm_seconds: How long a "delete my data" request
             waits for the user's confirmation (`DATA_DELETION_CONFIRM_SECONDS`).
             Only the user's next message can confirm it, and only within this time.
@@ -41,7 +38,6 @@ class AgentSettings(BaseSettings):
     agent_max_steps: int = Field(ge=2)
     agent_max_results_per_answer: int = Field(ge=1)
     agent_max_output_tokens: int = Field(ge=1)
-    vocab_alias_review_min_corrections: int = Field(ge=1)
     data_deletion_confirm_seconds: int = Field(ge=1)
 
 

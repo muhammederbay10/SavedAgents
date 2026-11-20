@@ -8,9 +8,10 @@
 2. The item keeps the user's wording in `raw_values`, marked as set by hand, so
    rejecting an alias later never normalizes it again.
 3. The correction is counted against the alias that produced the old value, if
-   one did. A corrected candidate is never verified; a verified alias that
-   collects `VOCAB_ALIAS_REVIEW_MIN_CORRECTIONS` corrections is flagged for
-   review in the logs.
+   one did (`correction_count`). A corrected candidate is never verified.
+   Flagging a verified alias for review needs corrections from several users
+   (ARCHITECTURE §3.4); how to keep that evidence is the owner's decision
+   (record 0015, Q4), so nothing is flagged here yet.
 
 A correction is **not** evidence that the old and new values mean the same:
 no alias links them, and no other item, the user's or anyone else's, changes.
@@ -22,7 +23,7 @@ from dataclasses import dataclass, field
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.db.models import AliasStatus, SavedItem
+from app.db.models import SavedItem
 from app.ingestion.repository import lock_user
 from app.pipeline.vocabulary import store as vocabulary
 from app.pipeline.vocabulary.normalize import (
@@ -95,7 +96,6 @@ class ItemCorrection:
         registry: ContentTypeRegistry,
         *,
         alias_min_probability: float,
-        review_min_corrections: int,
     ) -> None:
         """Create the service.
 
@@ -105,13 +105,11 @@ class ItemCorrection:
             registry: The built-in types, to read each item's schema.
             alias_min_probability: `VOCAB_ALIAS_MIN_PROBABILITY`, for verifying
                 the alias the new value went through.
-            review_min_corrections: `VOCAB_ALIAS_REVIEW_MIN_CORRECTIONS`.
         """
         self._sessions = sessions
         self._normalizer = normalizer
         self._registry = registry
         self._alias_min_probability = alias_min_probability
-        self._review_min_corrections = review_min_corrections
 
     async def correct(
         self, user_id: uuid.UUID, item_id: uuid.UUID, path: str, wording: str
@@ -220,19 +218,8 @@ class ItemCorrection:
             await self._count_against_alias(session, old_entry.get(PROVENANCE_ALIAS_ID))
 
     async def _count_against_alias(self, session: AsyncSession, alias_id: object) -> None:
-        if not isinstance(alias_id, str):
-            return
-        counted = await vocabulary.count_correction(session, uuid.UUID(alias_id))
-        if counted is None:
-            return
-        if (
-            counted.status == AliasStatus.VERIFIED
-            and counted.correction_count >= self._review_min_corrections
-        ):
-            logger.warning(
-                "vocabulary_alias_flagged_for_review",
-                extra={"alias_id": alias_id, "corrections": counted.correction_count},
-            )
+        if isinstance(alias_id, str):
+            await vocabulary.count_correction(session, uuid.UUID(alias_id))
 
 
 async def _owned_item(

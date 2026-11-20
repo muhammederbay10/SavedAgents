@@ -29,6 +29,7 @@ AGENT_MODULES = sorted(
     [
         AGENT_DIRECTORY / "agent.py",
         AGENT_DIRECTORY / "prompts.py",
+        AGENT_DIRECTORY / "send.py",
         *(AGENT_DIRECTORY / "replies").glob("*.py"),
     ]
 )

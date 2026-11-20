@@ -13,13 +13,13 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.agent.agent import ResponseAgent
-from app.agent.deletion_requests import DeletionRequests
+from app.agent.deletion_requests import DeletionRequests, PendingDeletion
 from app.agent.prompts import AGENT_PROMPTS
 from app.agent.search.retrieval import HybridRetriever
 from app.agent.tools import Toolbox
 from app.config.agent import AgentSettings
 from app.db.deletion import UserDataEraser, UserDataOutsidePostgres
-from app.models.base import GenerationRequest, GenerationResult, ToolCall
+from app.models.base import GenerationRequest, GenerationResult, Generator, ToolCall
 from app.models.errors import ModelError
 from app.models.fakes import FakeEmbedder, FakeGenerator
 from app.pipeline.vocabulary.corrections import ItemCorrection
@@ -34,7 +34,6 @@ from tests.pipeline.support import ScriptedClassifier
 TEXT_MODEL = "fake/text"
 MAX_STEPS = 5
 MAX_RESULTS = 5
-REVIEW_MIN_CORRECTIONS = 2
 CONFIRM_SECONDS = 600
 TURN_TIME = datetime(2026, 11, 20, 12, 0, tzinfo=UTC)
 
@@ -54,17 +53,15 @@ class FakeClock:
 
 @dataclass
 class MemoryDeletionRequests(DeletionRequests):
-    """Pending deletion requests in memory, with the same rules as the Redis store."""
+    """Pending deletion requests in memory, with the same behaviour as the Redis store."""
 
-    lifetime: timedelta = timedelta(seconds=CONFIRM_SECONDS)
-    requests: dict[uuid.UUID, datetime] = field(default_factory=dict)
+    requests: dict[uuid.UUID, PendingDeletion] = field(default_factory=dict)
 
-    async def save(self, user_id: uuid.UUID, requested_at: datetime) -> None:
-        self.requests[user_id] = requested_at
+    async def save(self, user_id: uuid.UUID, pending: PendingDeletion, now: datetime) -> None:
+        self.requests[user_id] = pending
 
-    async def take(self, user_id: uuid.UUID, now: datetime) -> bool:
-        requested_at = self.requests.pop(user_id, None)
-        return requested_at is not None and now - requested_at < self.lifetime
+    async def take(self, user_id: uuid.UUID) -> PendingDeletion | None:
+        return self.requests.pop(user_id, None)
 
 
 def agent_settings(**overrides: int) -> AgentSettings:
@@ -72,7 +69,6 @@ def agent_settings(**overrides: int) -> AgentSettings:
         "agent_max_steps": MAX_STEPS,
         "agent_max_results_per_answer": MAX_RESULTS,
         "agent_max_output_tokens": 400,
-        "vocab_alias_review_min_corrections": REVIEW_MIN_CORRECTIONS,
         "data_deletion_confirm_seconds": CONFIRM_SECONDS,
     }
     return AgentSettings(_env_file=None, **{**values, **overrides})  # type: ignore[arg-type]
@@ -149,6 +145,7 @@ class AgentUnderTest:
     agent: ResponseAgent
     generator: FakeGenerator
     classifier: ScriptedClassifier
+    toolbox: Toolbox
 
 
 def build_agent(
@@ -160,6 +157,7 @@ def build_agent(
     deletion_requests: DeletionRequests | None = None,
     outside_postgres: Sequence[UserDataOutsidePostgres] = (),
     clock: Callable[[], datetime] | None = None,
+    wrap_generator: Callable[[FakeGenerator], Generator] | None = None,
     **settings: int,
 ) -> AgentUnderTest:
     """The agent with real tools on the test database and a scripted text model."""
@@ -180,17 +178,19 @@ def build_agent(
             normalizer,
             CONTENT_TYPES,
             alias_min_probability=RULES.alias_min_probability,
-            review_min_corrections=REVIEW_MIN_CORRECTIONS,
         ),
         registry=CONTENT_TYPES,
         deletion_requests=deletion_requests or MemoryDeletionRequests(),
         eraser=UserDataEraser(sessions, outside_postgres),
+        deletion_window=timedelta(seconds=CONFIRM_SECONDS),
         now=clock or FakeClock(),
     )
     agent = ResponseAgent(
-        generator=generator,
+        generator=wrap_generator(generator) if wrap_generator else generator,
         toolbox=toolbox,
         prompts=AGENT_PROMPTS,
         settings=agent_settings(**settings),
     )
-    return AgentUnderTest(agent=agent, generator=generator, classifier=vocabulary_classifier)
+    return AgentUnderTest(
+        agent=agent, generator=generator, classifier=vocabulary_classifier, toolbox=toolbox
+    )

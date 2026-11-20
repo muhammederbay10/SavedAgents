@@ -14,9 +14,12 @@ One answer is a loop of at most `AGENT_MAX_STEPS` model calls:
 4. The last call may not call tools, so the loop ends with an answer or an
    explicit error.
 
-**Fixed messages.** The "delete my data" tools ask for a fixed message in the
-user's language (`ReplyTemplate`). It replaces the model's reply, so the
-confirmation question and the "done" message always say the same thing.
+**"Delete my data".** `request_data_deletion` makes the answer the fixed
+confirmation question in the user's language, and prepares the fixed "done"
+message in the same language (`AgentAnswer.deletion_confirmation`); the caller
+makes it confirmable only after delivering it (`app.agent.send.send_answer`).
+A successful `confirm_data_deletion` ends the turn at once with that "done"
+message: no model call, translation or other tool runs after the erasure.
 
 The items are capped at `AGENT_MAX_RESULTS_PER_ANSWER`; the rest are kept for
 "show more". Each shown item becomes a reply quoting the saved post
@@ -49,9 +52,10 @@ from app.agent.replies.templates import (
 )
 from app.agent.tools import (
     AvailabilityGap,
+    DeletionCompletion,
+    DeletionConfirmation,
     Notice,
     PlatformRecipient,
-    ReplyTemplate,
     Toolbox,
     ToolContext,
     UserTools,
@@ -99,6 +103,10 @@ class AgentTurn:
         history: The conversation before this message, oldest first.
         working_set: The items of the user's last answer, in the order they
             were numbered, so "the second one" can be resolved.
+        deletion_confirmed: The platform reported an explicit confirmation of
+            the bot's deletion question with this message. How is the owner's
+            decision (record 0015, Q9); nothing sets it yet, and without it no
+            deletion runs, whatever the model does.
     """
 
     user_id: uuid.UUID
@@ -106,6 +114,7 @@ class AgentTurn:
     text: str = field(repr=False)
     history: Sequence[Message] = ()
     working_set: Sequence[uuid.UUID] = ()
+    deletion_confirmed: bool = False
 
 
 @dataclass(frozen=True)
@@ -118,6 +127,8 @@ class AgentAnswer:
         notices: What the intro had to say about how results were found.
         more_item_ids: Results beyond the cap, for "show more".
         availability_gaps: Streaming availability the resolver should fetch (SAV-15).
+        deletion_confirmation: Set when `messages` is the deletion question;
+            pass it to `Toolbox.confirmation_delivered` once it was sent.
         deleted_recipients: Set when the user's data was deleted in this turn:
             where to send `messages`, read before the deletion, because the
             user's platform accounts are gone now.
@@ -128,6 +139,7 @@ class AgentAnswer:
     notices: frozenset[Notice]
     more_item_ids: tuple[uuid.UUID, ...]
     availability_gaps: tuple[AvailabilityGap, ...]
+    deletion_confirmation: DeletionConfirmation | None = None
     deleted_recipients: tuple[PlatformRecipient, ...] = ()
 
     @property
@@ -191,8 +203,7 @@ class _Turn:
     allowed_item_ids: set[uuid.UUID]
     notices: set[Notice] = field(default_factory=set)
     availability_gaps: dict[tuple[uuid.UUID, str], AvailabilityGap] = field(default_factory=dict)
-    template: ReplyTemplate | None = None
-    deleted_recipients: tuple[PlatformRecipient, ...] = ()
+    asks_deletion_confirmation: bool = False
 
 
 class ResponseAgent:
@@ -235,7 +246,13 @@ class ResponseAgent:
             ModelError: If a model call failed.
             sqlalchemy.exc.SQLAlchemyError: If the database failed behind a tool.
         """
-        tools = self._toolbox.for_user(ToolContext(user_id=turn.user_id, country=turn.country))
+        tools = self._toolbox.for_user(
+            ToolContext(
+                user_id=turn.user_id,
+                country=turn.country,
+                deletion_confirmed=turn.deletion_confirmed,
+            )
+        )
         await tools.begin_turn()
         state = _Turn(tools=tools, allowed_item_ids=set(turn.working_set))
         messages = self._opening_messages(turn)
@@ -251,7 +268,12 @@ class ResponseAgent:
                 )
             )
             if result.tool_calls:
-                messages.extend(await self._run_tools(result, state))
+                tool_messages, completion = await self._run_tools(result, state)
+                if completion is not None:
+                    answer = _completed_answer(completion)
+                    self._log_answer(step, answer)
+                    return answer
+                messages.extend(tool_messages)
                 continue
             final, problem = self._check_answer(result, state)
             if final is not None:
@@ -279,22 +301,24 @@ class ResponseAgent:
         messages.append(Message(role="user", content=turn.text))
         return messages
 
-    async def _run_tools(self, result: GenerationResult, state: _Turn) -> list[Message]:
+    async def _run_tools(
+        self, result: GenerationResult, state: _Turn
+    ) -> tuple[list[Message], DeletionCompletion | None]:
+        """Run the reply's tool calls in order; stop at once if one deleted the user."""
         messages = [Message(role="assistant", content=result.text, tool_calls=result.tool_calls)]
         for tool_call in result.tool_calls:
             outcome = await state.tools.call(tool_call)
+            if outcome.completion is not None:
+                return messages, outcome.completion
             state.allowed_item_ids.update(outcome.offered_item_ids)
             state.notices.update(outcome.notices)
             for gap in outcome.availability_gaps:
                 state.availability_gaps[(gap.entity_id, gap.country)] = gap
-            if outcome.template is not None:
-                state.template = outcome.template
-            if outcome.deleted_recipients:
-                state.deleted_recipients = outcome.deleted_recipients
+            state.asks_deletion_confirmation |= outcome.asks_deletion_confirmation
             messages.append(
                 Message(role="tool", content=outcome.as_json(), tool_call_id=tool_call.id)
             )
-        return messages
+        return messages, None
 
     def _check_answer(
         self, result: GenerationResult, state: _Turn
@@ -313,8 +337,8 @@ class ResponseAgent:
         return final, ""
 
     async def _finish(self, final: _FinalAnswer, state: _Turn) -> AgentAnswer:
-        if state.template is not None:
-            return await self._fixed_answer(final.language, state)
+        if state.asks_deletion_confirmation:
+            return await self._deletion_question(final.language)
         cards = await state.tools.result_cards(final.item_ids)
         cap = self._settings.agent_max_results_per_answer
         shown: tuple[ResultCard, ...] = cards[:cap]
@@ -327,21 +351,21 @@ class ResponseAgent:
             availability_gaps=tuple(state.availability_gaps.values()),
         )
 
-    async def _fixed_answer(self, language: str, state: _Turn) -> AgentAnswer:
-        """Answer with the fixed message a tool asked for, in the user's language."""
+    async def _deletion_question(self, language: str) -> AgentAnswer:
+        """Ask the fixed deletion question, and prepare the "done" message in the same words."""
         wording = await self._wording(language)
-        if state.template is ReplyTemplate.DELETION_CONFIRMATION:
-            minutes = math.ceil(self._settings.data_deletion_confirm_seconds / _SECONDS_PER_MINUTE)
-            text = deletion_confirmation(minutes, wording).text
-        else:
-            text = deletion_done(wording).text
+        minutes = math.ceil(self._settings.data_deletion_confirm_seconds / _SECONDS_PER_MINUTE)
         return AgentAnswer(
             language=language,
-            messages=AnswerMessages(intro=text, results=(), wording=wording),
+            messages=AnswerMessages(
+                intro=deletion_confirmation(minutes, wording).text, results=(), wording=wording
+            ),
             notices=frozenset(),
             more_item_ids=(),
             availability_gaps=(),
-            deleted_recipients=state.deleted_recipients,
+            deletion_confirmation=DeletionConfirmation(
+                language=language, done_text=deletion_done(wording).text
+            ),
         )
 
     async def _wording(self, language: str) -> ReplyWording:
@@ -387,3 +411,15 @@ class ResponseAgent:
                 "language": answer.language,
             },
         )
+
+
+def _completed_answer(completion: DeletionCompletion) -> AgentAnswer:
+    """End a turn in which the user's data was deleted, with the prepared "done" message."""
+    return AgentAnswer(
+        language=completion.language,
+        messages=AnswerMessages(intro=completion.done_text, results=(), wording=None),
+        notices=frozenset(),
+        more_item_ids=(),
+        availability_gaps=(),
+        deleted_recipients=completion.recipients,
+    )

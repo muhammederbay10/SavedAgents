@@ -31,7 +31,6 @@ from tests.pipeline.support import capture_event, place_extraction, structured_r
 
 WORDING = "Kore mutfağı"
 CUISINE_PATH = "entities.0.cuisine"
-REVIEW_MIN_CORRECTIONS = 2
 
 
 @pytest.fixture
@@ -48,7 +47,6 @@ def corrections(pipeline: Pipeline) -> ItemCorrection:
         pipeline.normalizer(),
         CONTENT_TYPES,
         alias_min_probability=RULES.alias_min_probability,
-        review_min_corrections=REVIEW_MIN_CORRECTIONS,
     )
 
 
@@ -137,30 +135,25 @@ async def test_a_corrected_candidate_alias_is_never_verified(pipeline: Pipeline)
     assert alias.correction_count == 1
 
 
-async def test_repeated_corrections_flag_a_verified_alias_for_review(
+async def test_one_users_repeated_corrections_never_flag_a_verified_alias(
     pipeline: Pipeline, caplog: pytest.LogCaptureFixture
 ) -> None:
+    # ARCHITECTURE §3.4 asks for corrections from several users. Corrections by
+    # one user are not that evidence, however many there are (record 0015, Q4).
     await add_korean(pipeline)
     first_user, second_user = await add_user(pipeline.sessions), await add_user(pipeline.sessions)
-    first = await index_place(pipeline, first_user, WORDING)
-    second = await index_place(pipeline, second_user, WORDING)
+    await index_place(pipeline, second_user, WORDING)
+    corrected = [await index_place(pipeline, first_user, WORDING) for _ in range(3)]
     alias = await the_alias(pipeline)
     assert alias.status == AliasStatus.VERIFIED
 
-    with caplog.at_level(logging.WARNING):
-        await corrections(pipeline).correct(first_user, first, CUISINE_PATH, "japanese")
-        assert not [
-            r for r in caplog.records if r.getMessage() == "vocabulary_alias_flagged_for_review"
-        ]
-        await corrections(pipeline).correct(second_user, second, CUISINE_PATH, "chinese")
+    with caplog.at_level(logging.INFO):
+        for item_id in corrected:
+            await corrections(pipeline).correct(first_user, item_id, CUISINE_PATH, "japanese")
 
-    (flagged,) = [
-        record
-        for record in caplog.records
-        if record.getMessage() == "vocabulary_alias_flagged_for_review"
-    ]
-    assert flagged.alias_id == str(alias.id)
-    assert (await the_alias(pipeline)).status == AliasStatus.VERIFIED
+    assert [r for r in caplog.records if "flagged" in r.getMessage()] == []
+    counted = await the_alias(pipeline)
+    assert (counted.status, counted.correction_count) == (AliasStatus.VERIFIED, 3)
 
 
 @pytest.mark.parametrize("generic_probability", [0.1, 0.5])

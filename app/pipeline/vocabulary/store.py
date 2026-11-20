@@ -326,39 +326,20 @@ async def verify_alias(session: AsyncSession, alias_id: uuid.UUID) -> bool:
     return result.first() is not None
 
 
-@dataclass(frozen=True)
-class CountedCorrection:
-    """An alias after a user's correction was counted against it.
-
-    Attributes:
-        status: The alias's status, e.g. `verified`.
-        correction_count: How many corrections it has now.
-    """
-
-    status: str
-    correction_count: int
-
-
-async def count_correction(session: AsyncSession, alias_id: uuid.UUID) -> CountedCorrection | None:
+async def count_correction(session: AsyncSession, alias_id: uuid.UUID) -> None:
     """Count one user correction against the alias that produced the corrected value.
+
+    Nothing happens if the alias is gone.
 
     Args:
         session: The session to work in.
         alias_id: The alias.
-
-    Returns:
-        The alias's status and new count, or `None` if the alias is gone.
     """
-    result = await session.execute(
+    await session.execute(
         update(VocabularyAlias)
         .where(VocabularyAlias.id == alias_id)
         .values(correction_count=VocabularyAlias.correction_count + 1)
-        .returning(VocabularyAlias.status, VocabularyAlias.correction_count)
     )
-    row = result.first()
-    if row is None:
-        return None
-    return CountedCorrection(status=row.status, correction_count=row.correction_count)
 
 
 async def reject_alias(session: AsyncSession, alias_id: uuid.UUID) -> bool:
