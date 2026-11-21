@@ -20,7 +20,8 @@ later (short-term memory, SAV-18) joins it.
 
 import logging
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from datetime import UTC, datetime
 from typing import Protocol
 
 from sqlalchemy import delete, select, text
@@ -126,8 +127,7 @@ async def delete_user_data(
     """
     # Without this lock, a second request that starts before the first one
     # commits still sees the user's items and lowers the counts a second time.
-    locked_user = await session.execute(select(User.id).where(User.id == user_id).with_for_update())
-    if locked_user.scalar_one_or_none() is None:
+    if not await _lock_user_row(session, user_id):
         return None
     saved_item_ids = list(
         (await session.execute(select(SavedItem.id).where(SavedItem.user_id == user_id))).scalars()
@@ -144,6 +144,23 @@ async def delete_user_data(
     )
     await session.execute(delete(User).where(User.id == user_id))
     return len(saved_item_ids)
+
+
+class ErasureDeadlinePassedError(Exception):
+    """The deadline passed while the erasure waited for the user's row lock; nothing was erased."""
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+async def _lock_user_row(session: AsyncSession, user_id: uuid.UUID) -> bool:
+    """Lock the user's row for deletion; return whether the user exists.
+
+    Ingestion and indexing hold the same row while they work, so this can wait.
+    """
+    locked_user = await session.execute(select(User.id).where(User.id == user_id).with_for_update())
+    return locked_user.scalar_one_or_none() is not None
 
 
 class UserDataEraser:
@@ -170,21 +187,40 @@ class UserDataEraser:
         self._sessions = sessions
         self._outside_postgres = tuple(outside_postgres)
 
-    async def erase(self, user_id: uuid.UUID) -> int | None:
+    async def erase(
+        self,
+        user_id: uuid.UUID,
+        *,
+        deadline: datetime | None = None,
+        now: Callable[[], datetime] = _utc_now,
+    ) -> int | None:
         """Erase one user and everything they left anywhere.
 
         Args:
             user_id: The user.
+            deadline: When set, the erasure runs only if it is still before this
+                moment once the user's row is locked, checked before any store
+                is erased. Taking the lock can wait for ingestion or indexing.
+            now: The clock for the deadline.
 
         Returns:
             How many saved items were deleted; `None` if there is no such user.
 
         Raises:
+            ErasureDeadlinePassedError: If the deadline passed while waiting for
+                the lock; nothing was erased anywhere.
             redis.exceptions.RedisError: If Redis failed; nothing in Postgres changed.
             OSError: If the media store failed; nothing in Postgres changed.
             sqlalchemy.exc.SQLAlchemyError: If the database failed.
         """
         async with self._sessions() as session, session.begin():
+            if deadline is not None:
+                # `delete_user_data` takes the same lock again in this transaction,
+                # so nothing can change between this check and the erasure.
+                if not await _lock_user_row(session, user_id):
+                    return None
+                if now() >= deadline:
+                    raise ErasureDeadlinePassedError("the deletion deadline passed")
             deleted_items = await delete_user_data(session, user_id, self)
         if deleted_items is not None:
             # Counts only: the user is gone, and nothing about them is logged.

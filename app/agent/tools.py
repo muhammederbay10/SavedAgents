@@ -72,7 +72,7 @@ from app.agent.search.query import (
 # Re-exported, so the agent hands gaps on to the resolver without importing search itself.
 from app.agent.search.retrieval import AvailabilityGap as AvailabilityGap
 from app.agent.search.retrieval import HybridRetriever, SearchResult
-from app.db.deletion import UserDataEraser
+from app.db.deletion import ErasureDeadlinePassedError, UserDataEraser
 from app.db.models import (
     Entity,
     EntityAvailability,
@@ -768,10 +768,16 @@ class UserTools:
             return _deletion_refused()
         async with self._sessions() as session:
             recipients = await _platform_recipients(session, self._context.user_id)
-        # Checked last, right before the erasure, so time spent in this turn counts.
+        # Checked right before the erasure, so time spent in this turn counts, and
+        # again by the eraser once it holds the user's lock, which it may wait for.
         if self._now() >= pending.deadline:
             return _deletion_refused()
-        deleted_items = await self._eraser.erase(self._context.user_id)
+        try:
+            deleted_items = await self._eraser.erase(
+                self._context.user_id, deadline=pending.deadline, now=self._now
+            )
+        except ErasureDeadlinePassedError:
+            return _deletion_refused()
         if deleted_items is None:
             return _deletion_refused()
         return ToolOutcome(
