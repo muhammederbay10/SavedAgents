@@ -13,9 +13,10 @@ really contain is written up in decision records 0002 (shares by DM) and 0003
 
 A public page link becomes the `post_url`. A signed link becomes the
 `media_url` and never the `post_url`. A message with text and no share is a
-chat message. Everything else Meta sends (read receipts, reactions, echoes of
-the bot's own messages, other attachment types) is ignored and logged without
-its content.
+chat message. A tap on a quick reply arrives as a text (the button's label)
+with `message.quick_reply.payload`, which the chat message keeps. Everything
+else Meta sends (read receipts, reactions, echoes of the bot's own messages,
+other attachment types) is ignored and logged without its content.
 """
 
 import hashlib
@@ -92,13 +93,15 @@ class InstagramText:
         sender_id: The sender's app-scoped Instagram id.
         message_id: The message's id (`mid`).
         sent_at: When the user sent the message.
-        text: What the user wrote.
+        text: What the user wrote, or the label of the button they tapped.
+        quick_reply_payload: The tapped button's payload; `None` for typed text.
     """
 
     sender_id: str
     message_id: str
     sent_at: datetime
     text: str
+    quick_reply_payload: str | None = None
 
 
 InstagramMessage = InstagramShare | InstagramText
@@ -130,9 +133,14 @@ class _Attachment(BaseModel):
     payload: _AttachmentPayload | None = None
 
 
+class _QuickReply(BaseModel):
+    payload: str | None = None
+
+
 class _Message(BaseModel):
     mid: str
     text: str | None = None
+    quick_reply: _QuickReply | None = None
     attachments: list[_Attachment] = []
     is_echo: bool = False
     is_deleted: bool = False
@@ -245,6 +253,7 @@ def to_chat_message(text: InstagramText, user_id: UUID) -> ChatMessage:
         text=text.text,
         message_id=text.message_id,
         received_at=text.sent_at,
+        quick_reply_payload=text.quick_reply_payload,
     )
 
 
@@ -324,8 +333,13 @@ def _text_in(event: _MessagingEvent, message: _Message) -> InstagramText | None:
     text = _text_or_none(message.text)
     if text is None:
         return None
+    payload = message.quick_reply.payload if message.quick_reply is not None else None
     return InstagramText(
-        sender_id=event.sender.id, message_id=message.mid, sent_at=event.timestamp, text=text
+        sender_id=event.sender.id,
+        message_id=message.mid,
+        sent_at=event.timestamp,
+        text=text,
+        quick_reply_payload=_text_or_none(payload),
     )
 
 

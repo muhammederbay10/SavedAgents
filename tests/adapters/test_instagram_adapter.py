@@ -446,3 +446,43 @@ def test_chat_message_carries_the_text_and_the_message_id() -> None:
     assert message.text == "Restaurants in beşiktaş"
     assert message.message_id == text.message_id
     assert message.received_at == text.sent_at
+
+
+def test_a_tapped_quick_reply_keeps_its_payload_on_the_chat_message() -> None:
+    # The shape Meta documents for a tap on a quick reply: the label as text,
+    # and the button's payload under `quick_reply` (synthetic ids).
+    message = {
+        "mid": "aWdfZAGFAKEMIDQUICKREPLY01",
+        "text": "Yes, delete",
+        "quick_reply": {"payload": "savely:delete_my_data:confirm"},
+    }
+
+    (text,) = parse_webhook(webhook_with_message(message))
+
+    assert isinstance(text, InstagramText)
+    assert text.quick_reply_payload == "savely:delete_my_data:confirm"
+    chat = to_chat_message(text, USER_ID)
+    assert chat.quick_reply_payload == "savely:delete_my_data:confirm"
+    assert chat.text == "Yes, delete"
+
+
+@pytest.mark.parametrize("name", TEXT_FIXTURES)
+def test_typed_text_has_no_quick_reply_payload(name: str) -> None:
+    text = only_text(name)
+
+    assert text.quick_reply_payload is None
+    assert to_chat_message(text, USER_ID).quick_reply_payload is None
+
+
+@pytest.mark.parametrize("payload", ["", "   "])
+def test_a_blank_quick_reply_payload_counts_as_none(payload: str) -> None:
+    message = {
+        "mid": "aWdfZAGFAKEMIDQUICKREPLY02",
+        "text": "yes",
+        "quick_reply": {"payload": payload},
+    }
+
+    (text,) = parse_webhook(webhook_with_message(message))
+
+    assert isinstance(text, InstagramText)
+    assert text.quick_reply_payload is None

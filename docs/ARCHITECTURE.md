@@ -184,7 +184,7 @@ Values are stored in one canonical form (English, lower case) with aliases in an
 
 **Corrections move one item; synonyms need evidence.**
 - When a user corrects an item ("no, it's a travel video"), **only that item changes**: its category becomes "travel video", through the same steps as above. "Car review" and "travel video" are **not** made synonyms, and no other item, the user's or anyone else's, is touched. Values the user sets by hand are marked as such in `raw_values` and are never re-normalized.
-- The correction is counted against the alias that produced the wrong value. A candidate alias that gets corrected is not verified. A verified alias that collects corrections from several users is flagged for review.
+- The correction is counted against the alias that produced the wrong value. A candidate alias that gets corrected is not verified. A verified alias that collects corrections from several users is flagged for review (`VOCAB_ALIAS_REVIEW_MIN_USERS` different users, counted from the corrected items' normalize-step provenance, so one user's repeated corrections count once; record 0015, Q4).
 - **Undoing a wrong alias:** we mark it `rejected`, which stops future matches. Only the items that were matched through it (recorded in their `ENRICHMENT_RUN` normalize step) are re-normalized from their own `raw_values`. Items the user corrected by hand keep the user's choice, also when the correction arrives while the models are working: the result is applied under the owner's lock, only where the item's wording and provenance haven't changed.
 
 **Places are global.** Location fields come from Google Places' address components for any country: country, region or state, city, district, neighbourhood, plus coordinates. "Restaurants in Beşiktaş", "cafés in Brooklyn" and "bars in Shibuya" work the same way. A filter can match any of those levels.
@@ -222,15 +222,19 @@ flowchart TD
 | Tool | What it does |
 |---|---|
 | `search_items(collection?, type?, category?, tags?, filters?, text?, platform?, saved_after?)` | Hybrid search. `filters` is checked against the type's fields (e.g. `{"area": "Beşiktaş"}`, `{"area": "Brooklyn"}`, `{"genre": "horror", "streaming": "Netflix"}`, `{"subject": "maths"}`); `category` and `tags` work for every item (e.g. `category="car review"`) |
-| `near(lat, lng, radius_m, subtype?, open_now?)` | PostGIS search around a point (places only) |
+| `near(lat, lng, radius_m, category?, tags?, text?, open_now?)` | PostGIS search around a point, for the types with a location filter (places only) |
 | `deep_look(item_ids, question)` | Fans out parallel subagents (see diagram) for questions the index can't answer |
-| `get_item(id)` | Full details: entity info, original post link, why we matched it |
-| `update_item(id, fields)` | Fix mistakes ("no, it's the Bebek branch", "it's a travel video"), add notes. Changes only this item and never adds a synonym (§3.4) |
-| `set_status(entity_id, status)` | Mark as visited / watched / read / done, or "want to" |
-| `resolve_choice(item_id, option)` | Handles the user's answer to a "which one?" question |
+| `get_item(item_id)` | Full details: open values with their paths, entity info and links, original post link, streaming in the user's country |
+| `update_item(item_id, path, value)` | Fix one open value ("it's a travel video"). Changes only this item and never adds a synonym (§3.4). Re-resolving an entity ("no, it's the Bebek branch") and notes come with the resolvers (SAV-15) |
+| `set_status(item_id, status, entity_position?)` | Mark the item's place or title as visited / watched / read / done, or "want to" (`USER_ENTITY.status`); `entity_position` picks one of a list post's entities. An item with no entity (e.g. a study post) keeps its status on the item itself (`SAVED_ITEM.user_status`), deleted with it (record 0015, Q6) |
+| `resolve_choice(item_id, option)` | Handles the user's answer to a "which one?" question (with SAV-15's pending choices) |
+| `request_data_deletion()` | "Delete my data", in any words or language: the answer becomes a fixed confirmation question in the user's language. The request becomes confirmable only once that question was delivered, until `DATA_DELETION_CONFIRM_SECONDS` later |
+| `confirm_data_deletion()` | Deletes everything of the sender only when all of these hold, enforced in code: a delivered question, this is the **next** message (the request is taken out at the start of every turn, so "no" or any other message cancels it), the message is a tap on the question's **"Yes, delete" button** (its fixed quick-reply payload, which the adapter reads and the chat worker turns into `deletion_confirmed`; a typed "yes" shows the question again), and the deadline, checked right before erasing and again by the eraser once it holds the user's row lock, which it may have to wait for. A successful erasure ends the turn with the fixed "done" DM, prepared in the user's language before, sent to the platform id read before the deletion |
 | `list_memories()` / `forget_memory(id)` | "What do you remember about me?" / "Forget that" (§3.7) |
 
 **How results are shown: the saved reels come back.** When an answer lists saved items, the bot sends a short intro ("3 places in Beşiktaş from your Food collection 🍽"), then **one message per result that replies to the user's original share** (`reply_to.mid` = the item's `source_message_id`). Instagram shows the saved reel or post quoted above the bot's line, e.g. "1/3 · Kronotrop, Beşiktaş · open now · Maps link". This works for DM shares and for saves into a collaborative collection alike (decision record 0004). If an item has no message id (for example a later browser import), the bot falls back to the post link, which Instagram shows as a preview card, or to the name and Maps or TMDB link. Results are capped (e.g. 5 per answer) with "show more" for the rest. Replies only work inside the 24-hour window, which is always true when answering a question the user just asked.
+
+**The agent never touches the database.** Every tool is bound to the DM sender's `user_id` and country; no tool takes a user id from the model, and another user's item is answered like a missing one. The model's final answer is JSON (language, reply, notice, item ids) and is checked before it is sent: it may list only items the tools returned or the user's last results, it must carry a notice when search fell back (L1 "backup mode", L2 "broader results", or an incomplete search), and it must fit in one DM. The loop is capped at `AGENT_MAX_STEPS` model calls, and the last one may not call tools (decision record [0015](decisions/0015-response-agent.md)).
 
 Location for places in Phase 1: the user can type an area ("I'm in Beşiktaş") or share their location in the DM. Real "near me" alerts come with the mobile app.
 
@@ -332,7 +336,7 @@ erDiagram
     uuid id  uuid user_id  text platform  text platform_post_id  text post_url
     text media_type  text caption  text transcript  text summary
     text type  text category  text subtype  text[] tags  text collection  jsonb fields  jsonb raw_values  jsonb attributes
-    text status  vector embedding  timestamptz saved_at  text source_message_id
+    text status  text user_status  vector embedding  timestamptz saved_at  text source_message_id
   }
   ENTITY_AVAILABILITY { uuid entity_id  text country  jsonb providers  timestamptz refreshed_at }
   ENTITY {
@@ -356,6 +360,7 @@ erDiagram
 - **`ENTITY_AVAILABILITY`** holds TMDB watch providers for one movie or series in one country, primary key `(entity_id, country)`, with its own `refreshed_at`. Retrieval joins on the asking user's `country`. It holds no user data.
 - **`ITEM_ENTITY`** is many-to-many, because one list post can mention several entities.
 - **`USER_ENTITY.status`**: `want | done` (visited / watched / read), per user. Memory and ranking use it.
+- **`SAVED_ITEM.user_status`**: `want | done` for an item that has no entity, such as a study post, set by `set_status` (record 0015, Q6). It is the user's own mark, separate from `status` (the indexing lifecycle), and is deleted with the item.
 - `SAVED_ITEM.fields` holds the extracted type fields (e.g. `{"subject": "maths", "topic": "integrals", "format": "tutorial"}`). Open values inside nested objects, such as the cuisine of each place in a list post, are also listed once at the top under their vocabulary field (`"cuisine": ["korean barbecue", "specialty coffee"]`), where counting and filters find them. `attributes` holds facts learned later by deep look.
 - `SAVED_ITEM.status` goes `pending → enriching → needs_user → done | failed`. `indexing_attempts` counts the indexing runs started, across requeues, and `indexing_updated_at` is the last time a job or the sweeper worked on the item; the stuck-item sweeper uses both (§3.3, record 0012).
 - `SAVED_ITEM.source_message_id` is the Instagram message id (`mid`) of the DM or collection save that brought the item in. Answers reply to it so the saved reel shows again (§3.5). It's empty for items from imports.
@@ -364,7 +369,7 @@ erDiagram
 - **`ENRICHMENT_RUN`** has one row per step of an item (`fetch`, `classify`, `transcribe`, `extract`, `normalize`, `embed`, `confirm`), with `status` `done`, `failed` or `skipped`. A failed step keeps an `error` with no content in it. The normalize step's `output` records, per path, the vocabulary field, the outcome (`exact_value`, `exact_alias`, `matched`, `new`, `private` or `undecided`), the value and alias it went through, and the match probability.
 - **`VOCABULARY`** holds one canonical value per `field` (category, tag, cuisine, genre, subject, exam…) in English lower case, with an `embedding` for matching new wordings; `(field, value)` is unique. It's shared by all users, grows from real saves, and holds only wording that passed the privacy gate (§3.4).
 - **`VOCABULARY_ALIAS`** holds other wordings of a value, in any language, each with a `status`: `candidate` (one decision-model match), `verified` (confirmed, used for exact hits) or `rejected` (a wrong match, never used again). `probability` is the best match confidence seen, and `correction_count` counts user corrections against it. Which items matched through an alias is recorded in their `ENRICHMENT_RUN` normalize step, not here.
-- **"Delete my data"** removes the user's items with their `raw_values` and enrichment runs, and lowers each value's `item_count`. The vocabulary keeps only gated, generic wording with no link to any user. A value no item uses any more can be cleaned up.
+- **"Delete my data"** goes through one eraser (`app/db/deletion.UserDataEraser`): first every store outside Postgres (ingestion's Redis state and queued jobs, a pending deletion request, stored media files), then the rows. If a store outside Postgres fails, Postgres is unchanged and the erasure can be repeated. Any new store of user data (short-term memory, SAV-18) joins this eraser. It removes the user's items with their `raw_values` and enrichment runs, and lowers each value's `item_count`. The vocabulary keeps only gated, generic wording with no link to any user. A value no item uses any more can be cleaned up.
 - Opening hours and ratings go out of date, so refresh `ENTITY.data` regularly (e.g. every 30 days), and also when the user asks for `open_now`. Streaming availability is refreshed per country (`ENTITY_AVAILABILITY`).
 - **Dedupe keys on `SAVED_ITEM`** (decision record 0007). A user's item is stored once per `(user_id, platform, platform_post_id)` and once per `(user_id, source_message_id)`, whichever of the two ids it has. `platform_post_id` and `post_url` may be empty: a reel saved into a collaborative collection has neither. Every item has at least a post id, a message id or a post link, and a missing value is never stored as empty text. The message-id key tells **messages apart, not reels**: the same reel saved through two messages (saved twice, or saved and also shared by DM) becomes two items, because nothing in the payloads links them.
 - Column-level choices (which columns may be empty, defaults, what is deleted with a user, index types) are in decision record 0007. The `MEMORY` table is created in Phase 2.
@@ -395,6 +400,7 @@ Savely/
       messenger.py          # MessengerSettings
       pipeline.py           # PipelineSettings
       retrieval.py          # RetrievalSettings
+      agent.py              # AgentSettings
     logging_config.py       # structured (JSON) logging setup
     adapters/
       base.py               # CaptureEvent and ChatMessage
@@ -456,12 +462,16 @@ Savely/
         normalize.py        # vocabulary: exact hit, privacy gate, match-or-new
         open_values.py      # paths of open values; extraction → item columns
         renormalize.py      # reject an alias and re-normalize only its items
+        corrections.py      # a user's correction of one value of one item
       recovery/
         runs.py             # the item's row, status and steps in ENRICHMENT_RUN
         sweeper.py          # stuck-item sweeper: requeues or fails unfinished items, from Postgres
     agent/
-      agent.py              # response-agent loop
-      tools.py              # search_items, near, deep_look, set_status…
+      agent.py              # response-agent loop and answer checks
+      tools.py              # search_items, near, get_item, update_item, set_status… (the only DB access)
+      prompts.py            # versioned wording for the text model
+      deletion_requests.py  # pending "delete my data" requests (Redis), with their deadline
+      send.py               # sends an answer; a delivered deletion question becomes confirmable
       deep_look.py          # parallel subagents + write-back
       search/
         retrieval.py        # hybrid SQL + vector search, fallback ladder, time budget
@@ -474,6 +484,7 @@ Savely/
       replies/
         messenger.py        # send DM replies, incl. replies that quote a saved reel (reply_to)
         templates.py        # fixed DM wording: confirmation, "which one?", progress, error, result line
+        answers.py          # an answer: the intro, then one reply per result, with fallbacks
     memory/
       session.py            # short-term: history + working set (Redis)
       longterm.py           # extract → gate → consolidate → retrieve
@@ -481,7 +492,7 @@ Savely/
       models.py             # SQLAlchemy models for the tables in §4
       session.py            # the API's engine and session factory
       types.py              # column types for pgvector and PostGIS
-      deletion.py           # "delete my data": removes a user's rows, lowers vocabulary counts
+      deletion.py           # "delete my data": the one eraser of every store, then the user's rows
       migrations/           # Alembic environment and revisions
   evals/
     labeled_saves.jsonl     # ~100 hand-labeled saves for model comparison

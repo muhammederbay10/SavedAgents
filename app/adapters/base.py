@@ -67,6 +67,8 @@ class ChatMessage(BaseModel):
         text: What the user wrote.
         message_id: The platform's id of the message.
         received_at: When the user sent the text.
+        quick_reply_payload: The payload of the button the user tapped, when
+            the text is a tap on a quick reply; `None` for typed text.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -76,3 +78,4 @@ class ChatMessage(BaseModel):
     text: NonEmptyText
     message_id: NonEmptyText
     received_at: datetime
+    quick_reply_payload: NonEmptyText | None = None

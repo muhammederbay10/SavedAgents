@@ -150,6 +150,11 @@ class SavedItem(Base):
     every requeue, and `indexing_updated_at` is when an indexing job or the
     stuck-item sweeper last worked on it (record 0012).
 
+    `user_status` is what the user did with an item that has no entity, such as
+    a study post: `want` or `done` (record 0015, Q6). Items with entities keep
+    it per entity in `user_entity`. It is independent of `status`, the
+    indexing lifecycle.
+
     A user's item is stored once per post id and once per message id, whichever
     it has. Every item has a post id, a message id or a post link, so it can
     always be shown back to the user (decision record 0007).
@@ -173,6 +178,7 @@ class SavedItem(Base):
         CheckConstraint(_not_empty("source_message_id"), name="source_message_id_is_not_empty"),
         CheckConstraint(_not_empty("post_url"), name="post_url_is_not_empty"),
         CheckConstraint(_one_of("status", ItemStatus), name="status_is_known"),
+        CheckConstraint(_one_of("user_status", EntityStatus), name="user_status_is_known"),
         Index("ix_saved_item_fields", "fields", postgresql_using="gin"),
         Index(
             "ix_saved_item_unfinished_since",
@@ -214,6 +220,7 @@ class SavedItem(Base):
     indexing_updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+    user_status: Mapped[str | None] = mapped_column(Text)
 
 
 def saved_item_search_vector() -> ColumnElement[str]:

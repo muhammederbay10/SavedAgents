@@ -41,6 +41,21 @@ _CONFIDENT_USERS = text(
     """
 )
 
+# The users who corrected a value that came through one alias, read from the
+# provenance their items' normalize step keeps per corrected path (record 0015, Q4).
+_CORRECTING_USERS = text(
+    """
+    SELECT count(DISTINCT saved_item.user_id)
+    FROM enrichment_run
+    JOIN saved_item ON saved_item.id = enrichment_run.saved_item_id
+    CROSS JOIN LATERAL jsonb_each(enrichment_run.output -> 'values') AS provenance(path, entry)
+    WHERE enrichment_run.step = :step
+      AND enrichment_run.status = :status
+      AND provenance.entry -> CAST(:corrected_key AS text)
+          @> jsonb_build_array(CAST(:alias_id AS text))
+    """
+)
+
 _ITEMS_MATCHED_THROUGH = text(
     """
     SELECT DISTINCT enrichment_run.saved_item_id
@@ -51,6 +66,12 @@ _ITEMS_MATCHED_THROUGH = text(
       AND provenance.entry ->> 'alias_id' = :alias_id
     """
 )
+
+
+# The key, in a corrected path's provenance, of the aliases whose value the user
+# corrected on that path. It belongs to the item's normalize step, so it is
+# deleted with the item.
+PROVENANCE_CORRECTED_ALIAS_IDS: Final = "corrected_alias_ids"
 
 
 def canonical_form(wording: str) -> str:
@@ -303,20 +324,84 @@ async def confident_user_count(
 async def verify_alias(session: AsyncSession, alias_id: uuid.UUID) -> bool:
     """Mark a candidate alias verified, so it counts for exact hits.
 
+    A candidate that a user's correction counted against is never verified
+    (ARCHITECTURE §3.4).
+
     Args:
         session: The session to work in.
         alias_id: The alias.
 
     Returns:
-        Whether it changed; a verified or rejected alias stays as it is.
+        Whether it changed; a verified, rejected or corrected alias stays as it is.
     """
     result = await session.execute(
         update(VocabularyAlias)
-        .where(VocabularyAlias.id == alias_id, VocabularyAlias.status == AliasStatus.CANDIDATE)
+        .where(
+            VocabularyAlias.id == alias_id,
+            VocabularyAlias.status == AliasStatus.CANDIDATE,
+            VocabularyAlias.correction_count == 0,
+        )
         .values(status=AliasStatus.VERIFIED)
         .returning(VocabularyAlias.id)
     )
     return result.first() is not None
+
+
+async def count_correction(session: AsyncSession, alias_id: uuid.UUID) -> None:
+    """Count one user correction against the alias that produced the corrected value.
+
+    Nothing happens if the alias is gone.
+
+    Args:
+        session: The session to work in.
+        alias_id: The alias.
+    """
+    await session.execute(
+        update(VocabularyAlias)
+        .where(VocabularyAlias.id == alias_id)
+        .values(correction_count=VocabularyAlias.correction_count + 1)
+    )
+
+
+async def correcting_user_count(session: AsyncSession, alias_id: uuid.UUID) -> int:
+    """Count the different users who corrected a value that came through an alias.
+
+    Several corrections by one user count once: only different users are
+    evidence that an alias is wrong (ARCHITECTURE §3.4).
+
+    Args:
+        session: The session to work in.
+        alias_id: The alias.
+
+    Returns:
+        How many different users.
+    """
+    result = await session.execute(
+        _CORRECTING_USERS,
+        {
+            "step": NORMALIZE_STEP,
+            "status": DONE_STATUS,
+            "corrected_key": PROVENANCE_CORRECTED_ALIAS_IDS,
+            "alias_id": str(alias_id),
+        },
+    )
+    return int(result.scalar_one())
+
+
+async def alias_status(session: AsyncSession, alias_id: uuid.UUID) -> str | None:
+    """Return an alias's status.
+
+    Args:
+        session: The session to work in.
+        alias_id: The alias.
+
+    Returns:
+        `candidate`, `verified` or `rejected`; `None` if the alias is gone.
+    """
+    result = await session.execute(
+        select(VocabularyAlias.status).where(VocabularyAlias.id == alias_id)
+    )
+    return result.scalar_one_or_none()
 
 
 async def reject_alias(session: AsyncSession, alias_id: uuid.UUID) -> bool:
